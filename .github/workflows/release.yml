@@ -40,14 +40,14 @@ jobs:
         run: cargo test --workspace --all-features
 
       - name: Package workspace
-        run: cargo package --workspace --allow-dirty
+        run: cargo package --workspace --allow-dirty --no-verify
 
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           cargo publish -p tsql-core --token "$CARGO_REGISTRY_TOKEN"
-          cargo publish -p tsql-db --token "$CARGO_REGISTRY_TOKEN"
           cargo publish -p tsql-sql --token "$CARGO_REGISTRY_TOKEN"
+          cargo publish -p tsql-db --token "$CARGO_REGISTRY_TOKEN"
           cargo publish -p tsql-tui --token "$CARGO_REGISTRY_TOKEN"
           cargo publish -p tsql --token "$CARGO_REGISTRY_TOKEN"

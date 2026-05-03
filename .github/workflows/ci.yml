@@ -78,3 +78,35 @@ jobs:
 
       - name: Audit dependencies
         run: cargo audit
+
+  postgres-integration:
+    name: postgres-integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: tsql
+          POSTGRES_PASSWORD: tsql
+          POSTGRES_DB: tsql
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tsql -d tsql"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Postgres integration tests
+        env:
+          TSQL_TEST_POSTGRES_URL: postgres://tsql:tsql@127.0.0.1:5432/tsql
+        run: cargo test -p tsql-db --test postgres -- --ignored

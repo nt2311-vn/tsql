@@ -1,0 +1,12 @@
+[editor]
+tab_width = 4
+indent = "spaces"
+theme = "catppuccin-mocha"
+
+[connections.local_sqlite]
+driver = "sqlite"
+url = "sqlite::memory:"
+
+[connections.local_postgres]
+driver = "postgres"
+url = "${TSQL_POSTGRES_URL}"
