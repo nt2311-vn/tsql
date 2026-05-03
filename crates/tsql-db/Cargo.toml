@@ -1,0 +1,17 @@
+[package]
+name = "tsql-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Database driver boundaries for TSQL."
+readme = "../../README.md"
+keywords = ["sql", "database", "terminal", "tui"]
+categories = ["command-line-utilities", "database"]
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/tsql-app",
+    "crates/tsql-core",
+    "crates/tsql-db",
+    "crates/tsql-sql",
+    "crates/tsql-tui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["nt2311"]
+repository = "https://github.com/nt2311-vn/tsql"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "deny"
