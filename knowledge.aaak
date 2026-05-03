@@ -42,6 +42,7 @@ contracts:
 - release only from version tags
 - keep workflow permissions least-privilege
 - assume pasted SQL and DB output are untrusted
+- upgrade vulnerable transitive dependencies instead of suppressing scanners when possible
 
 ## 0.1.0 Acceptance
 
@@ -51,3 +52,4 @@ contracts:
 - multi-statement SQL split handles strings, comments, and postgres dollar quotes
 - minimal TUI can paste/type SQL, run with Ctrl+R, quit with Esc/Ctrl+C
 - README, CHANGELOG, justfile, graph, Vault are updated before PR
+- cargo audit and Trivy should be clean for HIGH/CRITICAL findings before merge
