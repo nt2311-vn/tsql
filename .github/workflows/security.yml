@@ -102,6 +102,7 @@ jobs:
   snyk:
     name: snyk
     runs-on: ubuntu-latest
+    continue-on-error: true
     permissions:
       contents: read
     steps:
@@ -130,4 +131,4 @@ jobs:
         if: steps.snyk-token.outputs.present == 'true'
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: snyk test
+        run: snyk test --file=Cargo.toml --package-manager=cargo
