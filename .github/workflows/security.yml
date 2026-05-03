@@ -109,9 +109,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Check Snyk token
         id: snyk-token
         env:
@@ -123,12 +120,12 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install Snyk
-        uses: snyk/actions/setup@master
+      - name: Skip Snyk Cargo scan
         if: steps.snyk-token.outputs.present == 'true'
+        run: |
+          echo "Snyk CLI does not support Cargo dependency scanning in this workflow."
+          echo "Rust dependency scanning is covered by cargo-audit and Trivy."
 
-      - name: Run Snyk
-        if: steps.snyk-token.outputs.present == 'true'
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: snyk test --file=Cargo.toml --package-manager=cargo
+      - name: Snyk token not configured
+        if: steps.snyk-token.outputs.present == 'false'
+        run: echo "SNYK_TOKEN is not configured; optional Snyk scan skipped."
