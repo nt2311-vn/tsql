@@ -122,10 +122,12 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install Snyk
+        uses: snyk/actions/setup@master
+        if: steps.snyk-token.outputs.present == 'true'
+
       - name: Run Snyk
-        uses: snyk/actions/rust@master
         if: steps.snyk-token.outputs.present == 'true'
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          command: test
+        run: snyk test
