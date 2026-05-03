@@ -20,6 +20,7 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 - `just smoke-sqlite` and `just release-check` automation.
 - README roadmap for post-`0.1.0` work.
 - `ratatui` 0.30 upgrade to clear Trivy/cargo-audit transitive dependency findings.
+- Event-aware TruffleHog scanning so pushes to `main` do not compare identical refs.
 - Initial Cargo workspace skeleton.
 - Minimal Rust crates for app, core, database, SQL, and TUI boundaries.
 - `.mise.toml` using Rust stable.

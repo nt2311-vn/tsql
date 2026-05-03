@@ -28,12 +28,29 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Scan secrets
+      - name: Scan pull request secrets
         uses: trufflesecurity/trufflehog@main
+        if: github.event_name == 'pull_request'
         with:
           path: ./
-          base: ${{ github.event.repository.default_branch }}
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          extra_args: --only-verified
+
+      - name: Scan pushed secrets
+        uses: trufflesecurity/trufflehog@main
+        if: github.event_name == 'push'
+        with:
+          path: ./
+          base: ${{ github.event.before }}
           head: HEAD
+          extra_args: --only-verified
+
+      - name: Scan repository secrets
+        uses: trufflesecurity/trufflehog@main
+        if: github.event_name != 'pull_request' && github.event_name != 'push'
+        with:
+          path: ./
           extra_args: --only-verified
 
   gitleaks:

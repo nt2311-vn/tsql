@@ -43,6 +43,7 @@ contracts:
 - keep workflow permissions least-privilege
 - assume pasted SQL and DB output are untrusted
 - upgrade vulnerable transitive dependencies instead of suppressing scanners when possible
+- secret scanning must use event-aware commit ranges to avoid empty scans on main pushes
 
 ## 0.1.0 Acceptance
 
