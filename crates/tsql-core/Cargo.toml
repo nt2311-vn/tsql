@@ -12,6 +12,10 @@ keywords = ["sql", "database", "terminal", "tui"]
 categories = ["command-line-utilities", "database"]
 
 [dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

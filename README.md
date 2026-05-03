@@ -15,9 +15,9 @@ The project starts with a minimal foundation: a Cargo workspace, strict CI/CD, s
 
 ## Current Status
 
-This repository is in the project scaffold phase.
+This repository is preparing the `0.1.0` MVP.
 
-Implemented foundation:
+Implemented:
 
 - Cargo workspace skeleton.
 - Rust stable toolchain configuration through `.mise.toml`.
@@ -25,14 +25,16 @@ Implemented foundation:
 - GitHub Actions for CI, security scanning, and manual release.
 - Branch protection documentation.
 - Changelog.
+- TOML config loading with environment-variable expansion.
+- SQLite and Postgres script execution.
+- Multi-statement SQL splitting for pasted SQL scripts.
+- Hybrid CLI plus minimal Ratatui TUI.
 
 Planned next:
 
-- Ratatui application shell.
-- Paste-safe SQL editor.
-- SQLite and Postgres connection support.
-- TOML configuration loader.
-- SQL statement splitting, formatting, linting, and autocomplete boundaries.
+- Rich SQL autocomplete, linting, and formatting.
+- More database drivers.
+- More advanced TUI navigation and result browsing.
 
 ## Workspace Layout
 
@@ -75,9 +77,68 @@ just fmt
 just fmt-check
 just lint
 just test
+just smoke-sqlite
+just up
+just test-integration
+just down
 just audit
 just security
+just release-check
 ```
+
+## Usage
+
+Validate a config file:
+
+```sh
+tsql config check --config examples/tsql.toml
+```
+
+Execute a SQL file against SQLite:
+
+```sh
+tsql exec --url sqlite::memory: --file examples/query.sql
+```
+
+Execute a SQL file through a named TOML connection:
+
+```sh
+TSQL_POSTGRES_URL=postgres://tsql:tsql@127.0.0.1:54329/tsql \
+  tsql exec --config examples/tsql.toml --connection local_postgres --file examples/query.sql
+```
+
+Open the minimal TUI:
+
+```sh
+tsql tui --config examples/tsql.toml --connection local_sqlite
+```
+
+Inside the TUI:
+
+- **Type or paste SQL** into the editor.
+- **Run SQL** with `Ctrl+R`.
+- **Quit** with `Esc` or `Ctrl+C`.
+
+## Configuration
+
+TSQL uses TOML for named connections and editor preferences:
+
+```toml
+[editor]
+tab_width = 4
+indent = "spaces"
+theme = "catppuccin-mocha"
+
+[connections.local_sqlite]
+driver = "sqlite"
+url = "sqlite::memory:"
+
+[connections.local_postgres]
+driver = "postgres"
+url = "${TSQL_POSTGRES_URL}"
+```
+
+Use environment variables for secrets. Do not commit database passwords.
 
 ## CI and Security
 
@@ -86,11 +147,12 @@ Pull requests are expected to pass:
 - Rust formatting check.
 - Clippy linting with warnings denied.
 - Workspace tests.
+- SQLite and Postgres integration tests.
 - Cargo dependency vulnerability audit.
 - Secret scanning with TruffleHog and Gitleaks.
 - Semgrep OSS scan.
 - Trivy filesystem vulnerability scan.
-- Optional Snyk scan when `SNYK_TOKEN` is configured.
+- Snyk is documented as skipped for Cargo because Snyk CLI does not support Rust dependency scanning.
 
 Workflow permissions are intentionally narrow by default.
 
@@ -106,6 +168,47 @@ Recommended policy:
 - Required CI and security checks.
 - No force pushes.
 - Manual release approval through a protected environment.
+
+## Knowledge Base
+
+Project knowledge is tracked in repository files so design context survives across sessions:
+
+- `knowledge.aaak`: compact project knowledge and acceptance criteria.
+- `graph.md`: architecture and workflow graph.
+- `Vault/Journal`: implementation journal entries.
+- `Vault/Spec`: versioned product and release specs.
+
+## Roadmap
+
+### 0.1.0
+
+- Hybrid CLI/TUI MVP.
+- SQLite and Postgres execution.
+- TOML config with environment-variable expansion.
+- Multi-statement pasted SQL support.
+- Catppuccin Mocha Ratatui shell.
+- CI-backed integration tests.
+
+### 0.2.0
+
+- Better TUI navigation and result table interactions.
+- Safer terminal restoration and panic handling.
+- Config discovery from platform config paths.
+- Connection health checks.
+
+### 0.3.0
+
+- SQL formatting.
+- SQL linting.
+- Driver-aware autocomplete.
+- Schema browser.
+
+### Later
+
+- MySQL and MariaDB.
+- MSSQL.
+- Oracle.
+- Plugin or driver feature architecture.
 
 ## Release
 
