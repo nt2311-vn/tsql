@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncReadExt;
-use tsql_core::{AppConfig, ConnectionConfig, DriverKind, ProjectInfo};
+use tsql_core::{AppConfig, ConnectionConfig, DriverKind};
 use tsql_db::{execute_script, QueryOutput};
 use tsql_sql::SqlDocument;
 
@@ -92,12 +92,7 @@ async fn main() -> Result<()> {
             let connection = resolve_connection(config, connection, url, driver).await?;
             tsql_tui::run(connection.driver, connection.url).await
         }
-        None => {
-            let info = ProjectInfo::default();
-            println!("{} {}", info.name, info.version);
-            println!("Run `tsql --help` for usage.");
-            Ok(())
-        }
+        None => tsql_tui::run_connect().await,
     }
 }
 

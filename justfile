@@ -26,6 +26,9 @@ test-integration:
 smoke-sqlite:
     cargo run -p tsql -- exec --url sqlite::memory: --file examples/query.sql
 
+smoke-metadata:
+    TSQL_TEST_POSTGRES_URL=postgres://tsql:tsql@127.0.0.1:54329/tsql cargo test -p tsql-db --test metadata -- --ignored
+
 up:
     {{docker_compose}} up -d --wait
 

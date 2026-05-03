@@ -8,6 +8,11 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ### Added
 
+- Expanded `0.1.0` scope: TUI database browser with Vim navigation and ERD.
+- Database introspection APIs in `tsql-db` for SQLite and Postgres.
+- `fetch_overview`, `fetch_table_info`, and `fetch_records` metadata loaders.
+- `fetch_relationships` loader for schema-scoped ERD views.
+- `just smoke-metadata` task for introspection verification.
 - Hybrid CLI/TUI `0.1.0` MVP work.
 - `tsql config check` for TOML configuration validation.
 - `tsql exec` for executing SQL files or stdin against SQLite and Postgres.

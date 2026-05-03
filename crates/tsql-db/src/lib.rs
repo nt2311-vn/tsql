@@ -1,5 +1,7 @@
+use std::str::FromStr;
+
 use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 use thiserror::Error;
 use tsql_core::DriverKind;
@@ -43,6 +45,71 @@ pub struct StatementOutput {
     pub rows_affected: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseOverview {
+    pub schemas: Vec<SchemaInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaInfo {
+    pub name: String,
+    pub tables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableInfo {
+    pub name: String,
+    pub schema: String,
+    pub columns: Vec<ColumnInfo>,
+    pub indexes: Vec<IndexInfo>,
+    pub primary_key: Option<PrimaryKeyInfo>,
+    pub foreign_keys: Vec<ForeignKeyInfo>,
+    pub constraints: Vec<ConstraintInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub data_type: String,
+    pub is_nullable: bool,
+    pub default_value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexInfo {
+    pub name: String,
+    pub column_names: Vec<String>,
+    pub is_unique: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimaryKeyInfo {
+    pub name: String,
+    pub column_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyInfo {
+    pub name: String,
+    pub column_names: Vec<String>,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintInfo {
+    pub name: String,
+    pub definition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationshipEdge {
+    pub from_table: String,
+    pub from_columns: Vec<String>,
+    pub to_table: String,
+    pub to_columns: Vec<String>,
+}
+
 pub async fn execute_script(
     driver: DriverKind,
     url: &str,
@@ -51,6 +118,313 @@ pub async fn execute_script(
     match driver {
         DriverKind::Postgres => execute_postgres(url, &document.statements()).await,
         DriverKind::Sqlite => execute_sqlite(url, &document.statements()).await,
+    }
+}
+
+pub async fn fetch_overview(driver: DriverKind, url: &str) -> Result<DatabaseOverview, DbError> {
+    match driver {
+        DriverKind::Postgres => fetch_postgres_overview(url).await,
+        DriverKind::Sqlite => fetch_sqlite_overview(url).await,
+    }
+}
+
+pub async fn fetch_table_info(
+    driver: DriverKind,
+    url: &str,
+    schema: &str,
+    table: &str,
+) -> Result<TableInfo, DbError> {
+    match driver {
+        DriverKind::Postgres => fetch_postgres_table_info(url, schema, table).await,
+        DriverKind::Sqlite => fetch_sqlite_table_info(url, schema, table).await,
+    }
+}
+
+pub async fn fetch_records(
+    driver: DriverKind,
+    url: &str,
+    schema: &str,
+    table: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<StatementOutput, DbError> {
+    let sql = match driver {
+        DriverKind::Postgres => format!(
+            "SELECT * FROM \"{}\".\"{}\" LIMIT {} OFFSET {}",
+            schema, table, limit, offset
+        ),
+        DriverKind::Sqlite => {
+            format!("SELECT * FROM \"{}\" LIMIT {} OFFSET {}", table, limit, offset)
+        }
+    };
+
+    let document = SqlDocument::new(sql);
+    let output = execute_script(driver, url, &document).await?;
+
+    output
+        .statements
+        .into_iter()
+        .next()
+        .ok_or_else(|| DbError::Sqlx(sqlx::Error::RowNotFound))
+}
+
+type PragmaFkRow = (i64, i64, String, String, String, String, String, String);
+
+async fn sqlite_pool(url: &str) -> Result<SqlitePool, DbError> {
+    let opts = SqliteConnectOptions::from_str(url)
+        .map_err(DbError::Sqlx)?
+        .create_if_missing(true);
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .map_err(DbError::Sqlx)
+}
+
+async fn fetch_sqlite_overview(url: &str) -> Result<DatabaseOverview, DbError> {
+    let pool = sqlite_pool(url).await?;
+
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    Ok(DatabaseOverview {
+        schemas: vec![SchemaInfo {
+            name: "main".to_owned(),
+            tables: tables.into_iter().map(|(t,)| t).collect(),
+        }],
+    })
+}
+
+async fn fetch_sqlite_table_info(
+    url: &str,
+    _schema: &str,
+    table: &str,
+) -> Result<TableInfo, DbError> {
+    let pool = sqlite_pool(url).await?;
+
+    // Columns
+    let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+        sqlx::query_as(&format!("PRAGMA table_info(\"{}\")", table))
+            .fetch_all(&pool)
+            .await?;
+
+    let column_infos = columns
+        .into_iter()
+        .map(|(_, name, data_type, notnull, dflt_value, _)| ColumnInfo {
+            name,
+            data_type,
+            is_nullable: notnull == 0,
+            default_value: dflt_value,
+        })
+        .collect();
+
+    // Primary Key
+    let pk_columns: Vec<String> = sqlx::query_as(&format!("PRAGMA table_info(\"{}\")", table))
+        .fetch_all(&pool)
+        .await?
+        .into_iter()
+        .filter(|row: &(i64, String, String, i64, Option<String>, i64)| row.5 > 0)
+        .map(|row| row.1)
+        .collect();
+
+    let primary_key = if pk_columns.is_empty() {
+        None
+    } else {
+        Some(PrimaryKeyInfo {
+            name: "PRIMARY KEY".to_owned(),
+            column_names: pk_columns,
+        })
+    };
+
+    // Foreign Keys
+    let fks: Vec<PragmaFkRow> =
+        sqlx::query_as(&format!("PRAGMA foreign_key_list(\"{}\")", table))
+            .fetch_all(&pool)
+            .await?;
+
+    let mut foreign_keys = Vec::new();
+    for (_, _, ref_table, from, to, _, _, _) in fks {
+        foreign_keys.push(ForeignKeyInfo {
+            name: format!("FK_{}_{}", table, ref_table),
+            column_names: vec![from],
+            referenced_table: ref_table,
+            referenced_columns: vec![to],
+        });
+    }
+
+    // Indexes
+    let index_list: Vec<(i64, String, i64, String, i64)> =
+        sqlx::query_as(&format!("PRAGMA index_list(\"{}\")", table))
+            .fetch_all(&pool)
+            .await?;
+
+    let mut indexes = Vec::new();
+    for (_, index_name, unique, _, _) in index_list {
+        let index_info: Vec<(i64, i64, String)> =
+            sqlx::query_as(&format!("PRAGMA index_info(\"{}\")", index_name))
+                .fetch_all(&pool)
+                .await?;
+
+        indexes.push(IndexInfo {
+            name: index_name,
+            column_names: index_info.into_iter().map(|(_, _, name)| name).collect(),
+            is_unique: unique == 1,
+        });
+    }
+
+    Ok(TableInfo {
+        name: table.to_owned(),
+        schema: "main".to_owned(),
+        columns: column_infos,
+        indexes,
+        primary_key,
+        foreign_keys,
+        constraints: Vec::new(),
+    })
+}
+
+async fn fetch_postgres_overview(url: &str) -> Result<DatabaseOverview, DbError> {
+    let pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
+
+    let schemas: Vec<(String,)> = sqlx::query_as(
+        "SELECT schema_name FROM information_schema.schemata 
+         WHERE schema_name NOT IN ('information_schema', 'pg_catalog') 
+         ORDER BY schema_name",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    let mut schema_infos = Vec::with_capacity(schemas.len());
+    for (schema_name,) in schemas {
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT table_name FROM information_schema.tables 
+             WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+             ORDER BY table_name",
+        )
+        .bind(&schema_name)
+        .fetch_all(&pool)
+        .await?;
+
+        schema_infos.push(SchemaInfo {
+            name: schema_name,
+            tables: tables.into_iter().map(|(t,)| t).collect(),
+        });
+    }
+
+    Ok(DatabaseOverview {
+        schemas: schema_infos,
+    })
+}
+
+async fn fetch_postgres_table_info(
+    url: &str,
+    schema: &str,
+    table: &str,
+) -> Result<TableInfo, DbError> {
+    let pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
+
+    // Columns
+    let columns: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable, column_default 
+         FROM information_schema.columns 
+         WHERE table_schema = $1 AND table_name = $2
+         ORDER BY ordinal_position",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(&pool)
+    .await?;
+
+    let column_infos = columns
+        .into_iter()
+        .map(|(name, data_type, is_nullable, default_value)| ColumnInfo {
+            name,
+            data_type,
+            is_nullable: is_nullable == "YES",
+            default_value,
+        })
+        .collect();
+
+    // Primary Key
+    let pk_columns: Vec<(String,)> = sqlx::query_as(
+        "SELECT kcu.column_name 
+         FROM information_schema.table_constraints tc 
+         JOIN information_schema.key_column_usage kcu 
+           ON tc.constraint_name = kcu.constraint_name 
+           AND tc.table_schema = kcu.table_schema 
+         WHERE tc.constraint_type = 'PRIMARY KEY' 
+           AND tc.table_schema = $1 AND tc.table_name = $2
+         ORDER BY kcu.ordinal_position",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(&pool)
+    .await?;
+
+    let primary_key = if pk_columns.is_empty() {
+        None
+    } else {
+        Some(PrimaryKeyInfo {
+            name: "PRIMARY KEY".to_owned(),
+            column_names: pk_columns.into_iter().map(|(c,)| c).collect(),
+        })
+    };
+
+    // Foreign Keys
+    let fks: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT
+            kcu.column_name, 
+            ccu.table_name AS foreign_table_name,
+            ccu.column_name AS foreign_column_name,
+            tc.constraint_name
+        FROM 
+            information_schema.table_constraints AS tc 
+            JOIN information_schema.key_column_usage AS kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage AS ccu
+              ON ccu.constraint_name = tc.constraint_name
+              AND ccu.table_schema = tc.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY' 
+          AND tc.table_schema = $1 AND tc.table_name = $2",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(&pool)
+    .await?;
+
+    let foreign_keys = fks
+        .into_iter()
+        .map(|(col, ref_table, ref_col, name)| ForeignKeyInfo {
+            name,
+            column_names: vec![col],
+            referenced_table: ref_table,
+            referenced_columns: vec![ref_col],
+        })
+        .collect();
+
+    Ok(TableInfo {
+        name: table.to_owned(),
+        schema: schema.to_owned(),
+        columns: column_infos,
+        indexes: Vec::new(), // TODO: implement Postgres indexes
+        primary_key,
+        foreign_keys,
+        constraints: Vec::new(),
+    })
+}
+
+pub async fn fetch_relationships(
+    driver: DriverKind,
+    url: &str,
+    schema: &str,
+) -> Result<Vec<RelationshipEdge>, DbError> {
+    match driver {
+        DriverKind::Postgres => fetch_postgres_relationships(url, schema).await,
+        DriverKind::Sqlite => fetch_sqlite_relationships(url, schema).await,
     }
 }
 
@@ -77,10 +451,7 @@ async fn execute_postgres(url: &str, statements: &[String]) -> Result<QueryOutpu
 }
 
 async fn execute_sqlite(url: &str, statements: &[String]) -> Result<QueryOutput, DbError> {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect(url)
-        .await?;
+    let pool = sqlite_pool(url).await?;
     let mut output = Vec::with_capacity(statements.len());
 
     for statement in statements {
@@ -209,6 +580,73 @@ fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
+async fn fetch_sqlite_relationships(
+    url: &str,
+    _schema: &str,
+) -> Result<Vec<RelationshipEdge>, DbError> {
+    let pool = sqlite_pool(url).await?;
+
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    let mut edges = Vec::new();
+    for (table,) in tables {
+        let fks: Vec<PragmaFkRow> =
+            sqlx::query_as(&format!("PRAGMA foreign_key_list(\"{}\")", table))
+                .fetch_all(&pool)
+                .await?;
+
+        for (_, _, ref_table, from, to, _, _, _) in fks {
+            edges.push(RelationshipEdge {
+                from_table: table.clone(),
+                from_columns: vec![from],
+                to_table: ref_table,
+                to_columns: vec![to],
+            });
+        }
+    }
+
+    Ok(edges)
+}
+
+async fn fetch_postgres_relationships(
+    url: &str,
+    schema: &str,
+) -> Result<Vec<RelationshipEdge>, DbError> {
+    let pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
+
+    let fks: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT
+            tc.table_name, kcu.column_name, 
+            ccu.table_name AS foreign_table_name,
+            ccu.column_name AS foreign_column_name 
+        FROM 
+            information_schema.table_constraints AS tc 
+            JOIN information_schema.key_column_usage AS kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage AS ccu
+              ON ccu.constraint_name = tc.constraint_name
+              AND ccu.table_schema = tc.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1",
+    )
+    .bind(schema)
+    .fetch_all(&pool)
+    .await?;
+
+    Ok(fks
+        .into_iter()
+        .map(|(table, col, ref_table, ref_col)| RelationshipEdge {
+            from_table: table,
+            from_columns: vec![col],
+            to_table: ref_table,
+            to_columns: vec![ref_col],
+        })
+        .collect())
+}
 #[cfg(test)]
 mod tests {
     use super::{returns_rows, DatabaseDriver};

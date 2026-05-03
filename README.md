@@ -15,7 +15,7 @@ The project starts with a minimal foundation: a Cargo workspace, strict CI/CD, s
 
 ## Current Status
 
-This repository is preparing the `0.1.0` MVP.
+This repository is preparing the `0.1.0` MVP. The goal is a usable terminal database browser (releasing to crates.io is deferred until the browser is mature).
 
 Implemented:
 
@@ -29,12 +29,14 @@ Implemented:
 - SQLite and Postgres script execution.
 - Multi-statement SQL splitting for pasted SQL scripts.
 - Hybrid CLI plus minimal Ratatui TUI.
+- **Database Introspection APIs** for schemas, tables, columns, indexes, keys, and constraints.
 
-Planned next:
+Planned for 0.1.0:
 
-- Rich SQL autocomplete, linting, and formatting.
-- More database drivers.
-- More advanced TUI navigation and result browsing.
+- **Richer TUI Browser**: Vim-style navigation (`h/j/k/l`).
+- **Metadata Explorer**: Drill down from connection -> schema -> table -> details.
+- **Record Browser**: Paginated record viewing with `y` to copy.
+- **Schema ERD**: Relationship graph view within schema scopes.
 
 ## Workspace Layout
 
