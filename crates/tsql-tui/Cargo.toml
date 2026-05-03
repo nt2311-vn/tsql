@@ -1,0 +1,17 @@
+[package]
+name = "tsql-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Terminal UI and theme boundaries for TSQL."
+readme = "../../README.md"
+keywords = ["sql", "database", "terminal", "tui"]
+categories = ["command-line-utilities", "database"]
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+/target/
+/.mise.local.toml
+/.env
+/.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3

@@ -1,0 +1,25 @@
+[package]
+name = "tsql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "A Rust terminal database client focused on reliable SQL editing."
+readme = "../../README.md"
+keywords = ["sql", "database", "terminal", "tui"]
+categories = ["command-line-utilities", "database"]
+
+[[bin]]
+name = "tsql"
+path = "src/main.rs"
+
+[dependencies]
+tsql-core = { path = "../tsql-core", version = "0.1.0" }
+tsql-db = { path = "../tsql-db", version = "0.1.0" }
+tsql-sql = { path = "../tsql-sql", version = "0.1.0" }
+tsql-tui = { path = "../tsql-tui", version = "0.1.0" }
+
+[lints]
+workspace = true
