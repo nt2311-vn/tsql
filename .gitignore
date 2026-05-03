@@ -6,3 +6,6 @@
 *.db
 *.sqlite
 *.sqlite3
+*.aaak
+Vault/
+graph.md
