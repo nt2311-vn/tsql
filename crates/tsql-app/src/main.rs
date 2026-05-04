@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncReadExt;
-use tsql_core::{AppConfig, ConnectionConfig, DriverKind, ProjectInfo};
+use tsql_core::{AppConfig, ConnectionConfig, DriverKind};
 use tsql_db::{execute_script, QueryOutput};
 use tsql_sql::SqlDocument;
 
@@ -89,14 +89,17 @@ async fn main() -> Result<()> {
             url,
             driver,
         }) => {
-            let connection = resolve_connection(config, connection, url, driver).await?;
-            tsql_tui::run(connection.driver, connection.url).await
+            if url.is_some() || connection.is_some() {
+                let conn = resolve_connection(config, connection, url, driver).await?;
+                tsql_tui::run(conn.driver, conn.url).await
+            } else {
+                let saved = load_saved_connections(config).await;
+                tsql_tui::run_connect(saved).await
+            }
         }
         None => {
-            let info = ProjectInfo::default();
-            println!("{} {}", info.name, info.version);
-            println!("Run `tsql --help` for usage.");
-            Ok(())
+            let saved = load_saved_connections(None).await;
+            tsql_tui::run_connect(saved).await
         }
     }
 }
@@ -163,6 +166,16 @@ async fn read_sql(file: Option<PathBuf>) -> Result<String> {
             .context("failed to read SQL from stdin")?;
         Ok(input)
     }
+}
+
+async fn load_saved_connections(config: Option<PathBuf>) -> Vec<(String, ConnectionConfig)> {
+    let cfg = if let Some(path) = config {
+        AppConfig::load(path).await.ok()
+    } else {
+        AppConfig::load_default().await.ok().flatten()
+    };
+    cfg.map(|c| c.connections.into_iter().collect())
+        .unwrap_or_default()
 }
 
 fn print_output(output: &QueryOutput) {

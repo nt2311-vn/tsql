@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -91,6 +91,25 @@ impl AppConfig {
             .cloned()
             .ok_or_else(|| ConfigError::MissingConnection(name.to_owned()))
     }
+
+    pub async fn load_default() -> Result<Option<Self>, ConfigError> {
+        let path = default_config_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        Self::load(&path).await.map(Some)
+    }
+}
+
+pub fn default_config_path() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".config")
+        });
+    base.join("tsql").join("config.toml")
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -153,7 +172,9 @@ pub fn expand_environment_variables(input: &str) -> Result<String, ConfigError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_environment_variables, AppConfig, DriverKind, ProjectInfo};
+    use super::{
+        default_config_path, expand_environment_variables, AppConfig, DriverKind, ProjectInfo,
+    };
 
     #[test]
     fn default_project_info_has_name() {
@@ -178,6 +199,17 @@ mod tests {
         assert_eq!(connection.driver, DriverKind::Sqlite);
         assert_eq!(connection.url, "sqlite::memory:");
         assert_eq!(config.editor.theme, "catppuccin-mocha");
+    }
+
+    #[test]
+    fn default_config_uses_xdg() {
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/tsql_xdg_test");
+        let path = default_config_path();
+        assert_eq!(
+            path.to_str().unwrap(),
+            "/tmp/tsql_xdg_test/tsql/config.toml"
+        );
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]
