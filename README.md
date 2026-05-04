@@ -1,129 +1,35 @@
 # TSQL
 
-TSQL is a Rust-based terminal database client for people who want a fast, reliable, keyboard-first SQL workspace that treats pasted SQL files correctly.
+A fast, keyboard-first terminal database client for Postgres and SQLite, built in Rust.
 
-The project starts with a minimal foundation: a Cargo workspace, strict CI/CD, security scanning, and a small Rust skeleton. The first product milestone will focus on a Ratatui query editor that preserves multi-line pasted SQL and supports SQLite and Postgres execution.
+Just run `tsql` to launch the TUI — it auto-loads saved connections from `~/.config/tsql/config.toml` and opens a connection picker. No flags needed.
 
-## Goals
+## Features
 
-- **Reliable SQL editing**: preserve pasted SQL files, multi-line statements, comments, and driver-specific syntax.
-- **Terminal-first UI**: build a modern Ratatui interface with Catppuccin Mocha as the default dark theme.
-- **Driver-aware behavior**: support SQLite and Postgres first, then MySQL, MariaDB, Oracle, and MSSQL.
-- **TOML configuration**: declare named database connections, editor behavior, indentation, theme, and autocomplete preferences in config files.
-- **Zero-trust development**: use least-privilege CI permissions, mandatory tests, linting, formatting, dependency checks, secret scanning, and vulnerability scanning.
-- **Open-source release discipline**: publish manually from protected tags only.
+- **Connection picker** — saved connections from config, or paste a new URL to connect instantly.
+- **Database browser** — schemas, tables, and 6 detail tabs: Records, Columns, Indexes, Keys, Constraints, ERD.
+- **Vim navigation** — `j/k` up/down, `l/Enter` drill in, `h` back, `g/G` top/bottom, `Tab` switch panes.
+- **SQL editor** — `e` or `i` to open, paste multi-line SQL, `Ctrl+R` to execute.
+- **Records viewer** — paginated (50 rows), `y` yank cell, `Y` yank row, `[/]` scroll columns.
+- **ERD view** — schema-scoped FK relationship tree.
+- **Catppuccin Mocha** — dark theme with PK/FK column coloring, NULL dimming, active highlights.
+- **XDG config** — auto-loads `~/.config/tsql/config.toml` with `${ENV_VAR}` expansion for secrets.
+- **Postgres + SQLite** — full metadata introspection (indexes, constraints, FKs) for both drivers.
 
-## Current Status
-
-This repository is preparing the `0.1.0` MVP. The goal is a usable terminal database browser (releasing to crates.io is deferred until the browser is mature).
-
-Implemented:
-
-- Cargo workspace skeleton.
-- Rust stable toolchain configuration through `.mise.toml`.
-- `justfile` automation.
-- GitHub Actions for CI, security scanning, and manual release.
-- Branch protection documentation.
-- Changelog.
-- TOML config loading with environment-variable expansion.
-- SQLite and Postgres script execution.
-- Multi-statement SQL splitting for pasted SQL scripts.
-- Hybrid CLI plus minimal Ratatui TUI.
-- **Database Introspection APIs** for schemas, tables, columns, indexes, keys, and constraints.
-
-Planned for 0.1.0:
-
-- **Richer TUI Browser**: Vim-style navigation (`h/j/k/l`).
-- **Metadata Explorer**: Drill down from connection -> schema -> table -> details.
-- **Record Browser**: Paginated record viewing with `y` to copy.
-- **Schema ERD**: Relationship graph view within schema scopes.
-
-## Workspace Layout
-
-```text
-.
-├── crates
-│   ├── tsql-app
-│   ├── tsql-core
-│   ├── tsql-db
-│   ├── tsql-sql
-│   └── tsql-tui
-├── docs
-├── .github
-│   └── workflows
-├── .mise.toml
-├── justfile
-├── Cargo.toml
-├── CHANGELOG.md
-└── README.md
-```
-
-## Development
-
-Install tools with `mise`:
+## Quick Start
 
 ```sh
-mise install
+# Launch TUI (reads ~/.config/tsql/config.toml if it exists)
+tsql
+
+# Or connect directly
+tsql tui --url postgres://user:pass@localhost/mydb
+tsql tui --url sqlite:./local.db
 ```
-
-Run the local CI checks:
-
-```sh
-just ci
-```
-
-Useful commands:
-
-```sh
-just fmt
-just fmt-check
-just lint
-just test
-just smoke-sqlite
-just up
-just test-integration
-just down
-just audit
-just security
-just release-check
-```
-
-## Usage
-
-Validate a config file:
-
-```sh
-tsql config check --config examples/tsql.toml
-```
-
-Execute a SQL file against SQLite:
-
-```sh
-tsql exec --url sqlite::memory: --file examples/query.sql
-```
-
-Execute a SQL file through a named TOML connection:
-
-```sh
-TSQL_POSTGRES_URL=postgres://tsql:tsql@127.0.0.1:54329/tsql \
-  tsql exec --config examples/tsql.toml --connection local_postgres --file examples/query.sql
-```
-
-Open the minimal TUI:
-
-```sh
-tsql tui --config examples/tsql.toml --connection local_sqlite
-```
-
-Inside the TUI:
-
-- **Type or paste SQL** into the editor.
-- **Run SQL** with `Ctrl+R`.
-- **Quit** with `Esc` or `Ctrl+C`.
 
 ## Configuration
 
-TSQL uses TOML for named connections and editor preferences:
+Create `~/.config/tsql/config.toml`:
 
 ```toml
 [editor]
@@ -131,97 +37,98 @@ tab_width = 4
 indent = "spaces"
 theme = "catppuccin-mocha"
 
-[connections.local_sqlite]
-driver = "sqlite"
-url = "sqlite::memory:"
-
-[connections.local_postgres]
+[connections.prod]
 driver = "postgres"
-url = "${TSQL_POSTGRES_URL}"
+url = "${DATABASE_URL}"
+
+[connections.local]
+driver = "sqlite"
+url = "sqlite:./dev.db"
 ```
 
-Use environment variables for secrets. Do not commit database passwords.
+Use environment variables for secrets. Never commit database passwords.
+
+## CLI Commands
+
+```sh
+# Open TUI with connection picker
+tsql
+
+# Open TUI with a specific connection
+tsql tui --url sqlite::memory:
+tsql tui --config my.toml --connection prod
+
+# Execute SQL from a file
+tsql exec --url sqlite::memory: --file query.sql
+
+# Validate a config file
+tsql config check --config examples/tsql.toml
+```
+
+## Keyboard Shortcuts
+
+| Mode | Key | Action |
+|------|-----|--------|
+| **All** | `q` | Quit (except when typing) |
+| **All** | `Ctrl+C` | Force quit |
+| **Connect** | `j/k` | Navigate saved connections |
+| **Connect** | `Enter` | Connect to selected |
+| **Connect** | `n` | New connection (paste URL) |
+| **Connect** | `Tab` | Toggle driver (Postgres/SQLite) |
+| **Browser** | `j/k` | Navigate sidebar / records |
+| **Browser** | `l/Enter` | Expand schema or select table |
+| **Browser** | `h` | Collapse / go back |
+| **Browser** | `Tab` | Switch sidebar ↔ detail pane |
+| **Browser** | `l/h` (detail) | Cycle detail tabs |
+| **Browser** | `e` or `i` | Open SQL editor |
+| **Browser** | `y` | Yank cell value |
+| **Browser** | `Y` | Yank entire row (TSV) |
+| **Editor** | `Ctrl+R` | Execute SQL |
+| **Editor** | `Esc` | Back to browser |
+
+## Development
+
+```sh
+mise install        # Install toolchain
+just ci             # Full local CI (fmt, clippy, test, audit)
+just test           # Run tests
+just lint           # Clippy
+just fmt            # Format
+just smoke-sqlite   # Quick SQLite smoke test
+```
 
 ## CI and Security
 
-Pull requests are expected to pass:
+Pull requests must pass:
 
-- Rust formatting check.
-- Clippy linting with warnings denied.
-- Workspace tests.
-- SQLite and Postgres integration tests.
-- Cargo dependency vulnerability audit.
-- Secret scanning with TruffleHog and Gitleaks.
-- Semgrep OSS scan.
-- Trivy filesystem vulnerability scan.
-- Snyk is documented as skipped for Cargo because Snyk CLI does not support Rust dependency scanning.
-
-Workflow permissions are intentionally narrow by default.
-
-## Branch Protection
-
-The repository owner should protect `main` with the rules described in `docs/branch-protection.md`.
-
-Recommended policy:
-
-- No direct pushes to `main`.
-- Pull requests required before merge.
-- Required owner review.
-- Required CI and security checks.
-- No force pushes.
-- Manual release approval through a protected environment.
-
-## Knowledge Base
-
-Project knowledge is tracked in repository files so design context survives across sessions:
-
-- `knowledge.aaak`: compact project knowledge and acceptance criteria.
-- `graph.md`: architecture and workflow graph.
-- `Vault/Journal`: implementation journal entries.
-- `Vault/Spec`: versioned product and release specs.
+- `cargo fmt` check
+- `cargo clippy -D warnings`
+- Workspace tests (SQLite + Postgres integration)
+- `cargo audit`
+- Secret scanning (TruffleHog, Gitleaks)
+- Semgrep and Trivy vulnerability scans
 
 ## Roadmap
 
-### 0.1.0
-
-- Hybrid CLI/TUI MVP.
-- SQLite and Postgres execution.
-- TOML config with environment-variable expansion.
-- Multi-statement pasted SQL support.
-- Catppuccin Mocha Ratatui shell.
-- CI-backed integration tests.
-
 ### 0.2.0
 
-- Better TUI navigation and result table interactions.
-- Safer terminal restoration and panic handling.
-- Config discovery from platform config paths.
-- Connection health checks.
-
-### 0.3.0
-
-- SQL formatting.
-- SQL linting.
-- Driver-aware autocomplete.
-- Schema browser.
+- Connection pool reuse (hold pool in AppState)
+- System clipboard for yank (`arboard`)
+- Views and row counts in sidebar
+- `/` search filter for tables and records
+- Async DB calls with loading spinner
+- MySQL / MariaDB driver
 
 ### Later
 
-- MySQL and MariaDB.
-- MSSQL.
-- Oracle.
-- Plugin or driver feature architecture.
+- SQL syntax highlighting
+- SQL formatting and linting
+- Driver-aware autocomplete
+- MSSQL and Oracle drivers
 
 ## Release
 
-Crates.io publication is manual and tag-based.
-
-Expected release flow:
-
-1. Create a version tag.
-2. Trigger the release workflow manually.
-3. Approve the protected `crates-io-release` environment.
-4. Publish with `CARGO_REGISTRY_TOKEN`.
+Tag-based manual release to crates.io via GitHub Actions protected environment.
 
 ## License
 
