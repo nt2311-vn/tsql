@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use sqlx::postgres::{PgPoolOptions, PgRow};
@@ -154,7 +155,10 @@ pub async fn fetch_records(
             schema, table, limit, offset
         ),
         DriverKind::Sqlite => {
-            format!("SELECT * FROM \"{}\" LIMIT {} OFFSET {}", table, limit, offset)
+            format!(
+                "SELECT * FROM \"{}\" LIMIT {} OFFSET {}",
+                table, limit, offset
+            )
         }
     };
 
@@ -240,10 +244,9 @@ async fn fetch_sqlite_table_info(
     };
 
     // Foreign Keys
-    let fks: Vec<PragmaFkRow> =
-        sqlx::query_as(&format!("PRAGMA foreign_key_list(\"{}\")", table))
-            .fetch_all(&pool)
-            .await?;
+    let fks: Vec<PragmaFkRow> = sqlx::query_as(&format!("PRAGMA foreign_key_list(\"{}\")", table))
+        .fetch_all(&pool)
+        .await?;
 
     let mut foreign_keys = Vec::new();
     for (_, _, ref_table, from, to, _, _, _) in fks {
@@ -406,14 +409,67 @@ async fn fetch_postgres_table_info(
         })
         .collect();
 
+    // Indexes
+    let idx_rows: Vec<(String, String, bool)> = sqlx::query_as(
+        "SELECT i.relname AS index_name,
+                a.attname AS column_name,
+                ix.indisunique
+         FROM pg_class t
+         JOIN pg_index ix ON t.oid = ix.indrelid
+         JOIN pg_class i ON i.oid = ix.indexrelid
+         JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+         JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = $1 AND t.relname = $2 AND NOT ix.indisprimary
+         ORDER BY i.relname, a.attnum",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(&pool)
+    .await?;
+
+    let mut idx_map: BTreeMap<String, (Vec<String>, bool)> = BTreeMap::new();
+    for (idx_name, col_name, is_unique) in idx_rows {
+        idx_map
+            .entry(idx_name)
+            .or_insert_with(|| (Vec::new(), is_unique))
+            .0
+            .push(col_name);
+    }
+    let indexes = idx_map
+        .into_iter()
+        .map(|(name, (column_names, is_unique))| IndexInfo {
+            name,
+            column_names,
+            is_unique,
+        })
+        .collect();
+
+    // Constraints (CHECK + UNIQUE)
+    let constraint_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT tc.constraint_name, tc.constraint_type
+         FROM information_schema.table_constraints tc
+         WHERE tc.table_schema = $1 AND tc.table_name = $2
+           AND tc.constraint_type IN ('CHECK', 'UNIQUE')
+         ORDER BY tc.constraint_name",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(&pool)
+    .await?;
+
+    let constraints = constraint_rows
+        .into_iter()
+        .map(|(name, definition)| ConstraintInfo { name, definition })
+        .collect();
+
     Ok(TableInfo {
         name: table.to_owned(),
         schema: schema.to_owned(),
         columns: column_infos,
-        indexes: Vec::new(), // TODO: implement Postgres indexes
+        indexes,
         primary_key,
         foreign_keys,
-        constraints: Vec::new(),
+        constraints,
     })
 }
 

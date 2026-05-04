@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tsql_core::DriverKind;
-use tsql_db::{execute_script, fetch_overview, fetch_records, fetch_relationships, fetch_table_info};
+use tsql_db::{
+    execute_script, fetch_overview, fetch_records, fetch_relationships, fetch_table_info,
+};
 use tsql_sql::SqlDocument;
 
 static DB_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -33,7 +35,6 @@ async fn executes_sqlite_script() {
     assert_eq!(output.statements[2].rows[0], ["1", "ada"]);
     assert_eq!(output.statements[2].rows[1], ["2", "grace"]);
 }
-
 
 #[tokio::test]
 async fn sqlite_overview_lists_tables() {
@@ -102,7 +103,9 @@ async fn sqlite_table_info_foreign_keys() {
     let _ = std::fs::remove_file(path);
     assert_eq!(info.foreign_keys.len(), 1);
     assert_eq!(info.foreign_keys[0].referenced_table, "users");
-    assert!(info.foreign_keys[0].column_names.contains(&"user_id".to_owned()));
+    assert!(info.foreign_keys[0]
+        .column_names
+        .contains(&"user_id".to_owned()));
 }
 
 #[tokio::test]

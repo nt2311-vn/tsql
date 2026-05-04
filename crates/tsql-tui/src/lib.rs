@@ -12,11 +12,11 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table,
-    TableState, Tabs, Wrap,
+    Block, BorderType, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
-use tsql_core::DriverKind;
+use tsql_core::{ConnectionConfig, DriverKind};
 use tsql_db::{
     execute_script, fetch_overview, fetch_records, fetch_relationships, fetch_table_info,
     DatabaseOverview, RelationshipEdge, StatementOutput, TableInfo,
@@ -70,6 +70,12 @@ enum AppMode {
     Connect,
     Browser,
     Editor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectFocus {
+    Picker,
+    NewUrl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +152,9 @@ impl SidebarEntry {
 struct AppState {
     driver: DriverKind,
     url: String,
+    saved_connections: Vec<(String, ConnectionConfig)>,
+    connect_idx: usize,
+    connect_focus: ConnectFocus,
     connect_input: String,
     theme: Theme,
     mode: AppMode,
@@ -179,6 +188,9 @@ impl AppState {
             driver,
             connect_input: url.clone(),
             url,
+            saved_connections: Vec::new(),
+            connect_idx: 0,
+            connect_focus: ConnectFocus::Picker,
             theme: Theme::catppuccin_mocha(),
             mode: AppMode::Browser,
             pane: BrowserPane::Sidebar,
@@ -269,12 +281,19 @@ pub async fn run(driver: DriverKind, url: String) -> Result<()> {
     result
 }
 
-pub async fn run_connect() -> Result<()> {
+pub async fn run_connect(connections: Vec<(String, ConnectionConfig)>) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = AppState::new(DriverKind::Postgres, String::new());
     app.mode = AppMode::Connect;
+    app.saved_connections = connections;
     app.connect_input = String::new();
-    app.status = "Enter connection URL and press Enter to connect  q quit".to_owned();
+    if app.saved_connections.is_empty() {
+        app.connect_focus = ConnectFocus::NewUrl;
+        app.status = "Paste connection URL  Tab toggle driver  Enter connect  q quit".to_owned();
+    } else {
+        app.connect_focus = ConnectFocus::Picker;
+        app.status = "j/k navigate  Enter connect  n new connection  q quit".to_owned();
+    }
     let result = run_loop(&mut terminal, &mut app).await;
     restore_terminal(&mut terminal)?;
     result
@@ -310,7 +329,8 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(true),
         // q quits from any non-text-entry mode
         (KeyCode::Char('q'), KeyModifiers::NONE)
-            if app.mode != AppMode::Editor =>
+            if app.mode != AppMode::Editor
+                && !(app.mode == AppMode::Connect && app.connect_focus == ConnectFocus::NewUrl) =>
         {
             return Ok(true);
         }
@@ -325,12 +345,42 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 }
 
 async fn handle_connect_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    match app.connect_focus {
+        ConnectFocus::Picker => handle_picker_key(app, key).await,
+        ConnectFocus::NewUrl => handle_new_url_key(app, key).await,
+    }
+}
+
+async fn handle_picker_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     match key.code {
-        KeyCode::Char(ch) => {
-            app.connect_input.push(ch);
+        KeyCode::Char('j') | KeyCode::Down => {
+            let max = app.saved_connections.len().saturating_sub(1);
+            app.connect_idx = (app.connect_idx + 1).min(max);
         }
-        KeyCode::Backspace => {
-            app.connect_input.pop();
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.connect_idx = app.connect_idx.saturating_sub(1);
+        }
+        KeyCode::Char('n') => {
+            app.connect_focus = ConnectFocus::NewUrl;
+            app.connect_input.clear();
+            app.status = "Paste URL  Tab toggle driver  Enter connect  Esc back to list".to_owned();
+        }
+        KeyCode::Enter => {
+            if let Some((_, conn)) = app.saved_connections.get(app.connect_idx).cloned() {
+                app.driver = conn.driver;
+                try_connect(app, conn.url).await;
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+async fn handle_new_url_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc if !app.saved_connections.is_empty() => {
+            app.connect_focus = ConnectFocus::Picker;
+            app.status = "j/k navigate  Enter connect  n new connection  q quit".to_owned();
         }
         KeyCode::Tab => {
             app.driver = match app.driver {
@@ -338,33 +388,44 @@ async fn handle_connect_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 DriverKind::Sqlite => DriverKind::Postgres,
             };
         }
+        KeyCode::Backspace => {
+            app.connect_input.pop();
+        }
         KeyCode::Enter => {
             let url = app.connect_input.trim().to_owned();
             if url.is_empty() {
-                app.status = "URL cannot be empty.  Tab toggles driver  Enter connect  q quit"
-                    .to_owned();
+                app.status = "URL cannot be empty".to_owned();
                 return Ok(false);
             }
-            app.url = url;
-            app.last_error = None;
-            app.status = format!("Connecting to {}…", app.url);
-            match fetch_overview(app.driver, &app.url).await {
-                Ok(ov) => {
-                    rebuild_sidebar(app, &ov);
-                    app.overview = Some(ov);
-                    app.mode = AppMode::Browser;
-                    app.status = nav_hint();
-                }
-                Err(e) => {
-                    app.last_error = Some(e.to_string());
-                    app.status = "Connection failed — check URL and driver  Tab toggle driver  q quit"
-                        .to_owned();
-                }
+            if let Ok(detected) = DriverKind::from_url(&url) {
+                app.driver = detected;
             }
+            try_connect(app, url).await;
+        }
+        KeyCode::Char(ch) => {
+            app.connect_input.push(ch);
         }
         _ => {}
     }
     Ok(false)
+}
+
+async fn try_connect(app: &mut AppState, url: String) {
+    app.url = url;
+    app.last_error = None;
+    app.status = format!("Connecting to {}…", app.url);
+    match fetch_overview(app.driver, &app.url).await {
+        Ok(ov) => {
+            rebuild_sidebar(app, &ov);
+            app.overview = Some(ov);
+            app.mode = AppMode::Browser;
+            app.status = nav_hint();
+        }
+        Err(e) => {
+            app.last_error = Some(e.to_string());
+            app.status = format!("Connection failed: {e}");
+        }
+    }
 }
 
 async fn handle_editor_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
@@ -417,16 +478,14 @@ async fn handle_browser_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
             app.mode = AppMode::Editor;
             app.status = "Ctrl+R run  Esc back".to_owned();
         }
-        _ => {
-            match app.pane {
-                BrowserPane::Sidebar => {
-                    sidebar_key(app, key).await?;
-                }
-                BrowserPane::Detail => {
-                    detail_key(app, key).await?;
-                }
+        _ => match app.pane {
+            BrowserPane::Sidebar => {
+                sidebar_key(app, key).await?;
             }
-        }
+            BrowserPane::Detail => {
+                detail_key(app, key).await?;
+            }
+        },
     }
     Ok(false)
 }
@@ -457,17 +516,14 @@ async fn sidebar_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                     SidebarEntry::Schema { name, expanded } => {
                         for e in &mut app.sidebar {
                             if let SidebarEntry::Schema {
-                                expanded: ex, name: en
+                                expanded: ex,
+                                name: en,
                             } = e
                             {
                                 *ex = !expanded && *en == name;
                             }
                         }
-                        app.current_schema = if expanded {
-                            String::new()
-                        } else {
-                            name
-                        };
+                        app.current_schema = if expanded { String::new() } else { name };
                         if let Some(ov) = app.overview.clone() {
                             rebuild_sidebar(app, &ov);
                         }
@@ -526,9 +582,7 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         KeyCode::Char('h') | KeyCode::Left => {
             app.detail_tab = app.detail_tab.prev();
         }
-        KeyCode::Char('j') | KeyCode::Down
-            if app.detail_tab == DetailTab::Records =>
-        {
+        KeyCode::Char('j') | KeyCode::Down if app.detail_tab == DetailTab::Records => {
             if let Some(rec) = &app.records {
                 let max = rec.rows.len().saturating_sub(1);
                 if app.record_row < max {
@@ -542,9 +596,7 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 }
             }
         }
-        KeyCode::Char('k') | KeyCode::Up
-            if app.detail_tab == DetailTab::Records =>
-        {
+        KeyCode::Char('k') | KeyCode::Up if app.detail_tab == DetailTab::Records => {
             if app.record_row > 0 {
                 app.record_row -= 1;
                 app.record_table_state.select(Some(app.record_row));
@@ -555,17 +607,13 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 load_records_page(app, &s, &t).await;
             }
         }
-        KeyCode::Char(']')
-            if app.detail_tab == DetailTab::Records =>
-        {
+        KeyCode::Char(']') if app.detail_tab == DetailTab::Records => {
             if let Some(rec) = &app.records {
                 let max = rec.columns.len().saturating_sub(1);
                 app.record_col = (app.record_col + 1).min(max);
             }
         }
-        KeyCode::Char('[')
-            if app.detail_tab == DetailTab::Records =>
-        {
+        KeyCode::Char('[') if app.detail_tab == DetailTab::Records => {
             app.record_col = app.record_col.saturating_sub(1);
         }
         KeyCode::Char('y') => match app.detail_tab {
@@ -583,9 +631,7 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
             }
             _ => {}
         },
-        KeyCode::Char('Y')
-            if app.detail_tab == DetailTab::Records =>
-        {
+        KeyCode::Char('Y') if app.detail_tab == DetailTab::Records => {
             if let Some(tsv) = app.selected_row_tsv() {
                 app.status = format!("yanked row: {tsv}");
             }
@@ -641,10 +687,7 @@ fn draw(f: &mut Frame<'_>, app: &AppState) {
     let area = f.area();
     let th = app.theme;
 
-    f.render_widget(
-        Block::default().style(Style::default().bg(th.bg)),
-        area,
-    );
+    f.render_widget(Block::default().style(Style::default().bg(th.bg)), area);
 
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -678,45 +721,142 @@ fn draw(f: &mut Frame<'_>, app: &AppState) {
 fn draw_connect(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let th = app.theme;
 
+    let has_saved = !app.saved_connections.is_empty();
+    let list_height = if has_saved {
+        (app.saved_connections.len() as u16 + 2).min(area.height.saturating_sub(6))
+    } else {
+        0
+    };
+
+    let constraints = if has_saved {
+        vec![
+            Constraint::Length(list_height),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ]
+    } else {
+        vec![
+            Constraint::Percentage(30),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ]
+    };
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Percentage(30),
-        ])
+        .constraints(constraints)
         .split(area);
 
+    let (list_area, driver_area, url_area) = if has_saved {
+        (Some(layout[0]), layout[2], layout[3])
+    } else {
+        (None, layout[1], layout[2])
+    };
+
+    // ── Saved connections list ──
+    if let Some(list_area) = list_area {
+        let items: Vec<ListItem> = app
+            .saved_connections
+            .iter()
+            .enumerate()
+            .map(|(i, (name, conn))| {
+                let driver_badge = match conn.driver {
+                    DriverKind::Postgres => "PG",
+                    DriverKind::Sqlite => "SQ",
+                };
+                let sel = i == app.connect_idx && app.connect_focus == ConnectFocus::Picker;
+                let st = if sel {
+                    Style::default().fg(th.bg).bg(th.accent)
+                } else {
+                    Style::default().fg(th.fg)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(" [{driver_badge}] "),
+                        if sel {
+                            Style::default()
+                                .fg(th.bg)
+                                .bg(th.accent)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(th.accent2).add_modifier(Modifier::BOLD)
+                        },
+                    ),
+                    Span::styled(format!("{name}  "), st.add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        truncate_url(&conn.url, 50),
+                        if sel {
+                            Style::default().fg(th.bg).bg(th.accent)
+                        } else {
+                            Style::default().fg(th.muted)
+                        },
+                    ),
+                ]))
+            })
+            .collect();
+
+        let picker_border = if app.connect_focus == ConnectFocus::Picker {
+            th.active_border
+        } else {
+            th.border
+        };
+
+        f.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .title(Span::styled(
+                        "  Saved Connections  ",
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(picker_border))
+                    .style(Style::default().bg(th.bg)),
+            ),
+            list_area,
+        );
+    }
+
+    // ── Driver toggle ──
     let driver_label = match app.driver {
         DriverKind::Postgres => "Postgres",
         DriverKind::Sqlite => "SQLite",
     };
 
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                format!("  Driver: {driver_label}  (Tab to toggle)"),
-                Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
-            )),
-        ])
+        Paragraph::new(vec![Line::from(Span::styled(
+            format!("  Driver: {driver_label}  (Tab to toggle)"),
+            Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
+        ))])
         .block(
             Block::default()
-                .title(Span::styled(
-                    "  Driver  ",
-                    Style::default().fg(th.muted),
-                ))
+                .title(Span::styled("  Driver  ", Style::default().fg(th.muted)))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.border))
                 .style(Style::default().bg(th.bg)),
         ),
-        layout[1],
+        driver_area,
     );
 
-    let url_display = if app.connect_input.is_empty() {
+    // ── URL input ──
+    let url_border = if app.connect_focus == ConnectFocus::NewUrl {
+        th.active_border
+    } else {
+        th.border
+    };
+
+    let url_display = if app.connect_input.is_empty() && app.connect_focus == ConnectFocus::NewUrl {
         Span::styled(
             "  e.g. postgres://user:pass@localhost/db  or  sqlite:./my.db",
+            Style::default().fg(th.muted),
+        )
+    } else if app.connect_input.is_empty() {
+        Span::styled(
+            "  press n for new connection",
             Style::default().fg(th.muted),
         )
     } else {
@@ -726,21 +866,34 @@ fn draw_connect(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         )
     };
 
+    let url_title = if has_saved {
+        "  New Connection (n)  "
+    } else {
+        "  Connection URL  "
+    };
+
     f.render_widget(
-        Paragraph::new(Line::from(url_display))
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        "  Connection URL  ",
-                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(th.active_border))
-                    .style(Style::default().bg(th.bg)),
-            ),
-        layout[2],
+        Paragraph::new(Line::from(url_display)).block(
+            Block::default()
+                .title(Span::styled(
+                    url_title,
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(url_border))
+                .style(Style::default().bg(th.bg)),
+        ),
+        url_area,
     );
+}
+
+fn truncate_url(url: &str, max: usize) -> String {
+    if url.len() <= max {
+        url.to_owned()
+    } else {
+        format!("{}…", &url[..max - 1])
+    }
 }
 
 fn draw_header(f: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -769,10 +922,7 @@ fn draw_header(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .bg(th.accent2)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            mode_badge,
-            Style::default().fg(th.muted).bg(th.bg),
-        ),
+        Span::styled(mode_badge, Style::default().fg(th.muted).bg(th.bg)),
         Span::styled(
             format!(" {}", app.url),
             Style::default().fg(th.muted).bg(th.bg),
@@ -894,9 +1044,7 @@ fn draw_detail(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                 Block::default()
                     .title(Span::styled(
                         format!("  {}.{}  ", app.current_schema, app.current_table),
-                        Style::default()
-                            .fg(th.accent2)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
                     ))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -938,10 +1086,7 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 
     if rec.columns.is_empty() {
         f.render_widget(
-            muted_para(
-                &format!("  {} rows affected.", rec.rows_affected),
-                th,
-            ),
+            muted_para(&format!("  {} rows affected.", rec.rows_affected), th),
             area,
         );
         return;
@@ -961,9 +1106,7 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .fg(th.accent)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
-            Style::default()
-                .fg(th.accent)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
         };
         Cell::from(name.as_str()).style(st)
     }))
@@ -1027,8 +1170,7 @@ fn draw_columns(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         Cell::from("Type").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
         Cell::from("PK").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
         Cell::from("FK").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Nullable")
-            .style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+        Cell::from("Nullable").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
         Cell::from("Default").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
     ])
     .style(Style::default().bg(th.sel_bg));
@@ -1040,9 +1182,7 @@ fn draw_columns(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             let is_pk = pk_set.contains(col.name.as_str());
             let is_fk = fk_set.contains(col.name.as_str());
             let name_st = if is_pk {
-                Style::default()
-                    .fg(th.warning)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(th.warning).add_modifier(Modifier::BOLD)
             } else if is_fk {
                 Style::default().fg(th.accent2)
             } else {
@@ -1051,13 +1191,15 @@ fn draw_columns(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             Row::new(vec![
                 Cell::from(col.name.as_str()).style(name_st),
                 Cell::from(col.data_type.as_str()).style(Style::default().fg(th.accent2)),
-                Cell::from(if is_pk { "✓" } else { "" })
-                    .style(Style::default().fg(th.warning)),
-                Cell::from(if is_fk { "✓" } else { "" })
-                    .style(Style::default().fg(th.accent2)),
-                Cell::from(if col.is_nullable { "yes" } else { "no" }).style(
-                    Style::default().fg(if col.is_nullable { th.muted } else { th.success }),
-                ),
+                Cell::from(if is_pk { "✓" } else { "" }).style(Style::default().fg(th.warning)),
+                Cell::from(if is_fk { "✓" } else { "" }).style(Style::default().fg(th.accent2)),
+                Cell::from(if col.is_nullable { "yes" } else { "no" }).style(Style::default().fg(
+                    if col.is_nullable {
+                        th.muted
+                    } else {
+                        th.success
+                    },
+                )),
                 Cell::from(col.default_value.as_deref().unwrap_or("—"))
                     .style(Style::default().fg(th.muted)),
             ])
@@ -1107,11 +1249,9 @@ fn draw_indexes(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .map(|idx| {
             Row::new(vec![
                 Cell::from(idx.name.as_str()).style(Style::default().fg(th.fg)),
-                Cell::from(idx.column_names.join(", "))
-                    .style(Style::default().fg(th.accent2)),
-                Cell::from(if idx.is_unique { "✓" } else { "—" }).style(
-                    Style::default().fg(if idx.is_unique { th.success } else { th.muted }),
-                ),
+                Cell::from(idx.column_names.join(", ")).style(Style::default().fg(th.accent2)),
+                Cell::from(if idx.is_unique { "✓" } else { "—" })
+                    .style(Style::default().fg(if idx.is_unique { th.success } else { th.muted })),
             ])
         })
         .collect();
@@ -1180,22 +1320,14 @@ fn draw_keys(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         ]));
         lines.push(Line::from(vec![
             Span::raw("       "),
-            Span::styled(
-                fk.column_names.join(", "),
-                Style::default().fg(th.fg),
-            ),
+            Span::styled(fk.column_names.join(", "), Style::default().fg(th.fg)),
             Span::styled("  →  ", Style::default().fg(th.muted)),
             Span::styled(
                 &fk.referenced_table,
-                Style::default()
-                    .fg(th.accent)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
             ),
             Span::styled(".", Style::default().fg(th.muted)),
-            Span::styled(
-                fk.referenced_columns.join(", "),
-                Style::default().fg(th.fg),
-            ),
+            Span::styled(fk.referenced_columns.join(", "), Style::default().fg(th.fg)),
         ]));
         lines.push(Line::default());
     }
@@ -1220,10 +1352,8 @@ fn draw_constraints(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     }
 
     let header = Row::new(vec![
-        Cell::from("Constraint")
-            .style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Definition")
-            .style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+        Cell::from("Constraint").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+        Cell::from("Definition").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
     ])
     .style(Style::default().bg(th.sel_bg));
 
@@ -1239,7 +1369,11 @@ fn draw_constraints(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .collect();
 
     f.render_widget(
-        Table::new(rows, [Constraint::Percentage(35), Constraint::Percentage(65)]).header(header),
+        Table::new(
+            rows,
+            [Constraint::Percentage(35), Constraint::Percentage(65)],
+        )
+        .header(header),
         area,
     );
 }
@@ -1270,10 +1404,7 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(
-                    "  {} relationship(s)  ",
-                    app.relationships.len()
-                ),
+                format!("  {} relationship(s)  ", app.relationships.len()),
                 Style::default().fg(th.muted),
             ),
         ]),
@@ -1292,33 +1423,20 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     for (tbl, edges) in &by_table {
         lines.push(Line::from(vec![Span::styled(
             format!("  ┌─  {tbl}"),
-            Style::default()
-                .fg(th.accent2)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
         )]));
         for (i, edge) in edges.iter().enumerate() {
             let connector = if i + 1 == edges.len() { "└" } else { "├" };
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {connector}── "),
-                    Style::default().fg(th.border),
-                ),
-                Span::styled(
-                    edge.from_columns.join(", "),
-                    Style::default().fg(th.fg),
-                ),
+                Span::styled(format!("  {connector}── "), Style::default().fg(th.border)),
+                Span::styled(edge.from_columns.join(", "), Style::default().fg(th.fg)),
                 Span::styled("  ──▶  ", Style::default().fg(th.muted)),
                 Span::styled(
                     &edge.to_table,
-                    Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(".", Style::default().fg(th.muted)),
-                Span::styled(
-                    edge.to_columns.join(", "),
-                    Style::default().fg(th.fg),
-                ),
+                Span::styled(edge.to_columns.join(", "), Style::default().fg(th.fg)),
             ]));
         }
         lines.push(Line::default());
@@ -1330,9 +1448,7 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             let referenced: HashSet<&str> = app
                 .relationships
                 .iter()
-                .flat_map(|e| {
-                    [e.from_table.as_str(), e.to_table.as_str()]
-                })
+                .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
                 .collect();
             let standalone: Vec<&str> = si
                 .tables
@@ -1380,9 +1496,7 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                 Block::default()
                     .title(Span::styled(
                         "  SQL Editor   Ctrl+R run  Esc browser  ",
-                        Style::default()
-                            .fg(th.accent)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                     ))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1417,10 +1531,7 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
-                    .title(Span::styled(
-                        "  Results  ",
-                        Style::default().fg(th.muted),
-                    ))
+                    .title(Span::styled("  Results  ", Style::default().fg(th.muted)))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(th.border))
