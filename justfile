@@ -79,49 +79,44 @@ ci: fmt-check lint test audit
 # `just ci` plus the Postgres integration tests; needs `just up` beforehand.
 ci-full: ci test-integration
 
-# ─── Release ──────────────────────────────────────────────────────────────────
+# ─── Release build ────────────────────────────────────────────────────────────
+# These recipes are about building the optimized `tsql` binary locally;
+# nothing here touches git tags, crates.io, or GitHub. The CI publish
+# workflow lives in `.github/workflows/release.yml` and is unrelated.
 
-# Print the workspace version that the release recipes will use.
+# Print the workspace version that release-* recipes embed in the binary.
 release-version:
     @echo "tsql {{version}}"
 
-# Run every gate the release workflow runs PLUS a dry-run cargo package.
+# Pre-flight gates (fmt + clippy + tests + audit + smoke) before a release build.
 release-check: fmt-check lint test audit smoke-sqlite
-    cargo package --workspace --allow-dirty --no-verify
 
-# Build optimized release binaries into `target/release/` (does NOT publish).
+# Build the optimized release binary into `target/release/tsql`.
 release-build:
-    cargo build --workspace --release
+    cargo build --release -p tsql
 
-# Build the release binary then print its size and SHA-256 for verification.
-release-binary: release-build
-    @ls -lh target/release/tsql
-    @sha256sum target/release/tsql
-
-# Create and push the v{{version}} git tag, which is what triggers crates.io publish.
-release-tag: release-check
-    @if git rev-parse --verify --quiet "refs/tags/v{{version}}" >/dev/null; then \
-        echo "tag v{{version}} already exists; bump the workspace version first"; \
-        exit 1; \
-    fi
-    git tag -a "v{{version}}" -m "tsql v{{version}}"
-    git push origin "v{{version}}"
-
-# Show the last 5 release-workflow runs (newest first); needs `gh` authenticated.
+# Print release-binary status: existence, size, mtime, SHA-256, --version output.
 release-status:
-    @gh run list --workflow=release.yml --limit=5
+    @if [ ! -x target/release/tsql ]; then \
+        echo "no release binary yet  (run \`just release-build\`)"; \
+        exit 0; \
+    fi
+    @echo "── target/release/tsql ──"
+    @ls -lh target/release/tsql | awk '{print "size  :", $5; print "mtime :", $6, $7, $8}'
+    @printf "sha256: " && sha256sum target/release/tsql | awk '{print $1}'
+    @printf "tsql  : " && target/release/tsql --version 2>/dev/null || echo "(binary did not respond to --version)"
 
-# Tail the live logs of the most recent release-workflow run (Ctrl+C to detach).
-release-watch:
-    @gh run watch $(gh run list --workflow=release.yml --limit=1 --json databaseId --jq '.[0].databaseId')
+# Build the release binary and print its status in one step (build + verify).
+release: release-build release-status
 
-# Trigger the release workflow without a tag (publish step is skipped, gates run).
-release-dispatch:
-    @gh workflow run release.yml
+# Build, then run the release binary; pass args after the recipe (default --help).
+release-run *args="--help": release-build
+    ./target/release/tsql {{args}}
 
-# Look up the latest published version of each workspace crate on crates.io.
-release-published:
-    @for crate in tsql-core tsql-sql tsql-db tsql-tui tsql; do \
-        echo "── $crate ──"; \
-        cargo search "$crate" --limit 1 || true; \
-    done
+# Install the release binary into ~/.cargo/bin/tsql (so `tsql` is on your PATH).
+release-install:
+    cargo install --path crates/tsql-app --force
+
+# Remove the release build artifacts (keeps the debug target dir intact).
+release-clean:
+    rm -rf target/release
