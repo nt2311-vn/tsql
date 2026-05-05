@@ -488,7 +488,7 @@ pub async fn fetch_relationships(
 }
 
 async fn execute_postgres(url: &str, statements: &[String]) -> Result<QueryOutput, DbError> {
-    let pool = postgres_pool(url).await?;
+    let pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
     let mut output = Vec::with_capacity(statements.len());
 
     for statement in statements {

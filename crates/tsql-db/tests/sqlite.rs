@@ -18,7 +18,7 @@ fn tmp_db_url() -> (String, String) {
 
 #[tokio::test]
 async fn executes_sqlite_script() {
-    let db = TempDb::new("exec");
+    let (url, path) = tmp_db_url();
     let document = SqlDocument::new(
         r#"
         create table users(id integer primary key, name text not null);
@@ -27,10 +27,11 @@ async fn executes_sqlite_script() {
         "#,
     );
 
-    let output = execute_script(DriverKind::Sqlite, &db.url, &document)
+    let output = execute_script(DriverKind::Sqlite, &url, &document)
         .await
         .expect("sqlite script executes");
 
+    let _ = std::fs::remove_file(path);
     assert_eq!(output.statements.len(), 3);
     assert_eq!(output.statements[2].columns, ["id", "name"]);
     assert_eq!(output.statements[2].rows[0], ["1", "ada"]);
