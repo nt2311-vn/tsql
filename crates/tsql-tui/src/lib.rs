@@ -215,6 +215,10 @@ struct AppState {
     tx: Option<UnboundedSender<DbMessage>>,
     /// Number of in-flight metadata loads. Drives the spinner/status bar.
     pending: usize,
+    /// Command palette buffer. `Some(":select")` when the user has pressed
+    /// `:` in Browser mode and is typing a command; `None` otherwise. The
+    /// status bar swaps for a `:`-prefixed prompt while this is `Some`.
+    command_input: Option<String>,
 }
 
 impl AppState {
@@ -256,6 +260,7 @@ impl AppState {
             last_error: None,
             tx: None,
             pending: 0,
+            command_input: None,
         }
     }
 
@@ -456,14 +461,30 @@ fn apply_db_message(app: &mut AppState, msg: DbMessage) {
 }
 
 async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    // Ctrl+C is always a hard quit, even from text-entry contexts.
+    if (key.code, key.modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL) {
+        return Ok(true);
+    }
+
+    // The command palette steals all input while open.
+    if app.command_input.is_some() {
+        return handle_command_key(app, key);
+    }
+
     match (key.code, key.modifiers) {
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(true),
         // q quits from any non-text-entry mode
         (KeyCode::Char('q'), KeyModifiers::NONE)
             if app.mode != AppMode::Editor
                 && !(app.mode == AppMode::Connect && app.connect_focus == ConnectFocus::NewUrl) =>
         {
             return Ok(true);
+        }
+        // `:` opens the command palette from Browser mode only. The editor
+        // wants `:` to land in the buffer; the connect screen has its own
+        // text entry.
+        (KeyCode::Char(':'), KeyModifiers::NONE) if app.mode == AppMode::Browser => {
+            app.command_input = Some(String::new());
+            return Ok(false);
         }
         _ => {}
     }
@@ -472,6 +493,132 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         AppMode::Connect => handle_connect_key(app, key).await,
         AppMode::Editor => handle_editor_key(app, key).await,
         AppMode::Browser => handle_browser_key(app, key).await,
+    }
+}
+
+/// Handle key input while the `:` command palette is open. Returns
+/// `Ok(true)` only on `:q`/`:quit` to terminate the program.
+fn handle_command_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    let buf = app
+        .command_input
+        .as_mut()
+        .expect("command palette must be open");
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            app.command_input = None;
+            app.status = nav_hint();
+        }
+        (KeyCode::Backspace, _) if buf.pop().is_none() => {
+            // Backspace on an empty buffer closes the palette.
+            app.command_input = None;
+            app.status = nav_hint();
+        }
+        (KeyCode::Backspace, _) => {}
+        (KeyCode::Enter, _) => {
+            let cmd = buf.trim().to_owned();
+            app.command_input = None;
+            return run_command(app, &cmd);
+        }
+        (KeyCode::Char(ch), m) if !m.contains(KeyModifiers::CONTROL) => {
+            buf.push(ch);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// Execute a command typed into the `:` palette. Unknown commands set
+/// `last_error` and stay in Browser mode.
+fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
+    let cmd = command.trim();
+    let (head, _rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+    match head {
+        "" => {}
+        "q" | "quit" => return Ok(true),
+        "select" | "s" => prefill_editor_with_select(app),
+        "insert" | "i" => prefill_editor_with_insert(app),
+        "describe" | "desc" | "cols" | "columns" => switch_detail_tab(app, DetailTab::Columns),
+        "indexes" | "idx" => switch_detail_tab(app, DetailTab::Indexes),
+        "keys" => switch_detail_tab(app, DetailTab::Keys),
+        "constraints" | "ck" => switch_detail_tab(app, DetailTab::Constraints),
+        "erd" | "rel" | "relationships" => {
+            switch_detail_tab(app, DetailTab::Erd);
+            if app.relationships.is_empty() && !app.current_schema.is_empty() {
+                let schema = app.current_schema.clone();
+                spawn_relationships(app, schema);
+            }
+        }
+        "help" | "h" | "?" => {
+            app.status = ":select :insert :describe :indexes :keys \
+                          :constraints :erd :help :q"
+                .to_owned();
+        }
+        other => {
+            app.last_error = Some(format!("unknown command: :{other}  (try :help)"));
+            app.status = format!("unknown command: :{other}");
+        }
+    }
+    Ok(false)
+}
+
+fn switch_detail_tab(app: &mut AppState, tab: DetailTab) {
+    if app.current_table.is_empty() {
+        app.status = "select a table first".to_owned();
+        return;
+    }
+    app.detail_tab = tab;
+    app.pane = BrowserPane::Detail;
+    app.status = format!("{}  ({})", tab.label(), app.current_table);
+}
+
+fn prefill_editor_with_select(app: &mut AppState) {
+    if app.current_table.is_empty() {
+        app.status = "select a table first".to_owned();
+        return;
+    }
+    let qualified = qualified_table(app);
+    app.editor = format!("SELECT * FROM {qualified} LIMIT 100;\n");
+    app.editor_cursor = app.editor.len();
+    app.history_idx = None;
+    app.mode = AppMode::Editor;
+    app.status = "editor: Ctrl+R run  Esc browser".to_owned();
+}
+
+fn prefill_editor_with_insert(app: &mut AppState) {
+    if app.current_table.is_empty() {
+        app.status = "select a table first".to_owned();
+        return;
+    }
+    let qualified = qualified_table(app);
+    let cols: Vec<String> = app
+        .table_info
+        .as_ref()
+        .map(|info| info.columns.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    let template = if cols.is_empty() {
+        format!("INSERT INTO {qualified} VALUES (...);\n")
+    } else {
+        let names = cols.join(", ");
+        let placeholders: Vec<String> = cols.iter().map(|c| format!(":{c}")).collect();
+        format!(
+            "INSERT INTO {qualified}\n  ({names})\nVALUES\n  ({});\n",
+            placeholders.join(", ")
+        )
+    };
+    app.editor = template;
+    app.editor_cursor = app.editor.len();
+    app.history_idx = None;
+    app.mode = AppMode::Editor;
+    app.status = "editor: replace placeholders, Ctrl+R run".to_owned();
+}
+
+/// Build a driver-appropriate qualified identifier. Sqlite has no schemas
+/// outside `main`, so the schema prefix is dropped there to keep queries
+/// portable.
+fn qualified_table(app: &AppState) -> String {
+    match app.driver {
+        DriverKind::Postgres => format!("\"{}\".\"{}\"", app.current_schema, app.current_table),
+        DriverKind::Sqlite => format!("\"{}\"", app.current_table),
     }
 }
 
@@ -1919,7 +2066,15 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 
 fn draw_status(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let th = app.theme;
-    let (text, fg) = if let Some(err) = &app.last_error {
+    let (text, fg) = if let Some(buf) = &app.command_input {
+        // Active palette: render `:<input>_` and route the hardware cursor
+        // there so the user sees their typing.
+        let prompt = format!(":{buf}");
+        let cursor_x = area.x + prompt.chars().count() as u16;
+        let cursor_y = area.y;
+        f.set_cursor_position((cursor_x, cursor_y));
+        (prompt, th.accent)
+    } else if let Some(err) = &app.last_error {
         (format!(" ✗  {err}"), th.error)
     } else {
         (format!(" {}", app.status), th.muted)
