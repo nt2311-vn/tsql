@@ -221,4 +221,38 @@ mod tests {
 
         assert_eq!(expanded, r#"url = "sqlite::memory:""#);
     }
+
+    #[test]
+    fn default_config_path_uses_xdg_config_home() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/tsql-test-xdg");
+
+        let path = default_config_path().expect("path resolves");
+
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/tmp/tsql-test-xdg/tsql/config.toml")
+        );
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[tokio::test]
+    async fn load_default_returns_none_when_missing() {
+        // Set env, then drop guard before awaiting so we don't hold a sync lock
+        // across an await point. The path is unique per test, so racing tests
+        // observe their own value when re-reading inside the function.
+        let path = "/tmp/tsql-nonexistent-config-dir-for-tests";
+        {
+            let _guard = ENV_LOCK.lock().expect("env lock");
+            std::env::set_var("XDG_CONFIG_HOME", path);
+        }
+
+        let result = AppConfig::load_default().await.expect("ok");
+
+        assert!(result.is_none());
+
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
 }
