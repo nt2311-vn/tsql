@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
@@ -16,12 +16,36 @@ use ratatui::widgets::{
     Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tsql_core::{ConnectionConfig, DriverKind};
-use tsql_db::{
-    execute_script, fetch_overview, fetch_records, fetch_relationships, fetch_table_info,
-    DatabaseOverview, RelationshipEdge, StatementOutput, TableInfo,
-};
+use tsql_db::{DatabaseOverview, Pool, RelationshipEdge, StatementOutput, TableInfo};
 use tsql_sql::SqlDocument;
+
+// ─── Background DB messages ──────────────────────────────────────────────────
+//
+// Metadata loads run on tokio tasks so the event loop can keep drawing and
+// processing input while a slow database is responding. Tasks send their
+// results back through this channel; `run_loop` drains the receiver between
+// every key poll and applies the messages to `AppState`.
+
+#[derive(Debug)]
+enum DbMessage {
+    TableInfo {
+        schema: String,
+        table: String,
+        result: Result<TableInfo, String>,
+    },
+    Records {
+        schema: String,
+        table: String,
+        offset: usize,
+        result: Result<StatementOutput, String>,
+    },
+    Relationships {
+        schema: String,
+        result: Result<Vec<RelationshipEdge>, String>,
+    },
+}
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
 
@@ -152,6 +176,7 @@ impl SidebarEntry {
 struct AppState {
     driver: DriverKind,
     url: String,
+    pool: Option<Pool>,
     saved_connections: Vec<(String, ConnectionConfig)>,
     connect_idx: usize,
     connect_focus: ConnectFocus,
@@ -173,9 +198,30 @@ struct AppState {
     record_col: usize,
     record_table_state: TableState,
     relationships: Vec<RelationshipEdge>,
+    /// Row index into `relationships` selected on the ERD tab. Used by
+    /// j/k navigation and the Enter / `o` jump-to-table shortcuts.
+    erd_selected: usize,
     editor: String,
+    /// Byte index of the cursor within `editor`. Always sits on a UTF-8
+    /// char boundary.
+    editor_cursor: usize,
+    /// Last 50 successfully-submitted queries, newest last.
+    history: Vec<String>,
+    /// Index into `history` while the user is browsing it with
+    /// Ctrl+P/Ctrl+N. `None` means the editor holds a fresh draft.
+    history_idx: Option<usize>,
     status: String,
     last_error: Option<String>,
+    /// Channel used by spawned db tasks to send results back to the event
+    /// loop. `Option` because it is wired up in `run`/`run_connect` after
+    /// state construction.
+    tx: Option<UnboundedSender<DbMessage>>,
+    /// Number of in-flight metadata loads. Drives the spinner/status bar.
+    pending: usize,
+    /// Command palette buffer. `Some(":select")` when the user has pressed
+    /// `:` in Browser mode and is typing a command; `None` otherwise. The
+    /// status bar swaps for a `:`-prefixed prompt while this is `Some`.
+    command_input: Option<String>,
 }
 
 impl AppState {
@@ -188,6 +234,7 @@ impl AppState {
             driver,
             connect_input: url.clone(),
             url,
+            pool: None,
             saved_connections: Vec::new(),
             connect_idx: 0,
             connect_focus: ConnectFocus::Picker,
@@ -208,9 +255,16 @@ impl AppState {
             record_col: 0,
             record_table_state: ts,
             relationships: Vec::new(),
+            erd_selected: 0,
             editor: String::new(),
+            editor_cursor: 0,
+            history: Vec::new(),
+            history_idx: None,
             status: "Loading database overview…".to_owned(),
             last_error: None,
+            tx: None,
+            pending: 0,
+            command_input: None,
         }
     }
 
@@ -263,8 +317,10 @@ fn rebuild_sidebar(app: &mut AppState, overview: &DatabaseOverview) {
 pub async fn run(driver: DriverKind, url: String) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = AppState::new(driver, url);
+    let (tx, rx) = unbounded_channel();
+    app.tx = Some(tx);
 
-    match fetch_overview(app.driver, &app.url).await {
+    match open_pool_and_overview(&mut app).await {
         Ok(ov) => {
             rebuild_sidebar(&mut app, &ov);
             app.overview = Some(ov);
@@ -276,7 +332,7 @@ pub async fn run(driver: DriverKind, url: String) -> Result<()> {
         }
     }
 
-    let result = run_loop(&mut terminal, &mut app).await;
+    let result = run_loop(&mut terminal, &mut app, rx).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -284,6 +340,8 @@ pub async fn run(driver: DriverKind, url: String) -> Result<()> {
 pub async fn run_connect(connections: Vec<(String, ConnectionConfig)>) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = AppState::new(DriverKind::Postgres, String::new());
+    let (tx, rx) = unbounded_channel();
+    app.tx = Some(tx);
     app.mode = AppMode::Connect;
     app.saved_connections = connections;
     app.connect_input = String::new();
@@ -294,7 +352,7 @@ pub async fn run_connect(connections: Vec<(String, ConnectionConfig)>) -> Result
         app.connect_focus = ConnectFocus::Picker;
         app.status = "j/k navigate  Enter connect  n new connection  q quit".to_owned();
     }
-    let result = run_loop(&mut terminal, &mut app).await;
+    let result = run_loop(&mut terminal, &mut app, rx).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -308,11 +366,21 @@ fn nav_hint() -> String {
 async fn run_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     app: &mut AppState,
+    mut rx: UnboundedReceiver<DbMessage>,
 ) -> Result<()> {
     loop {
         terminal.draw(|f| draw(f, app))?;
 
-        if !event::poll(Duration::from_millis(150))? {
+        // Drain any messages from background db tasks. try_recv is
+        // non-blocking, so this stays cooperative with the input poll
+        // below and we never stall the UI on a slow database.
+        while let Ok(msg) = rx.try_recv() {
+            apply_db_message(app, msg);
+        }
+
+        // Short poll keeps the UI responsive (~30 fps) while still letting
+        // the runtime schedule background tasks.
+        if !event::poll(Duration::from_millis(33))? {
             continue;
         }
         if let Event::Key(key) = event::read()? {
@@ -324,15 +392,111 @@ async fn run_loop(
     Ok(())
 }
 
+/// Apply the result of a background metadata fetch to `AppState`.
+/// Stale messages (for a table the user has navigated away from) are
+/// dropped so the UI never displays the wrong data.
+fn apply_db_message(app: &mut AppState, msg: DbMessage) {
+    app.pending = app.pending.saturating_sub(1);
+    match msg {
+        DbMessage::TableInfo {
+            schema,
+            table,
+            result,
+        } => {
+            if schema != app.current_schema || table != app.current_table {
+                return;
+            }
+            match result {
+                Ok(info) => {
+                    app.table_info = Some(info);
+                    app.detail_tab = DetailTab::Records;
+                    app.pane = BrowserPane::Detail;
+                }
+                Err(e) => {
+                    app.last_error = Some(e.clone());
+                    app.status = format!("error loading {table}: {e}");
+                }
+            }
+        }
+        DbMessage::Records {
+            schema,
+            table,
+            offset,
+            result,
+        } => {
+            if schema != app.current_schema
+                || table != app.current_table
+                || offset != app.record_offset
+            {
+                return;
+            }
+            match result {
+                Ok(out) => {
+                    let rows = out.rows.len();
+                    app.records = Some(out);
+                    app.record_row = 0;
+                    app.record_table_state.select(Some(0));
+                    app.status = format!(
+                        " {schema}.{table}  offset {offset}  {rows} rows  \
+                         j/k rows  [/] cols  y cell  Y row  l/h tabs"
+                    );
+                }
+                Err(e) => {
+                    app.last_error = Some(e.clone());
+                    app.status = format!("error loading rows: {e}");
+                }
+            }
+        }
+        DbMessage::Relationships { schema, result } => {
+            if schema != app.current_schema {
+                return;
+            }
+            match result {
+                Ok(mut rels) => {
+                    // Stable sort by source table so flat j/k navigation
+                    // matches the visual grouping in `draw_erd`.
+                    rels.sort_by(|a, b| a.from_table.cmp(&b.from_table));
+                    app.relationships = rels;
+                    app.erd_selected = 0;
+                    app.status = format!(
+                        "ERD  schema: {schema}  {} relationship(s)  \
+                         j/k select  Enter \u{2192} target  o \u{2192} source",
+                        app.relationships.len()
+                    );
+                }
+                Err(e) => {
+                    app.status = format!("ERD error: {e}");
+                }
+            }
+        }
+    }
+}
+
 async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    // Ctrl+C is always a hard quit, even from text-entry contexts.
+    if (key.code, key.modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL) {
+        return Ok(true);
+    }
+
+    // The command palette steals all input while open.
+    if app.command_input.is_some() {
+        return handle_command_key(app, key);
+    }
+
     match (key.code, key.modifiers) {
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(true),
         // q quits from any non-text-entry mode
         (KeyCode::Char('q'), KeyModifiers::NONE)
             if app.mode != AppMode::Editor
                 && !(app.mode == AppMode::Connect && app.connect_focus == ConnectFocus::NewUrl) =>
         {
             return Ok(true);
+        }
+        // `:` opens the command palette from Browser mode only. The editor
+        // wants `:` to land in the buffer; the connect screen has its own
+        // text entry.
+        (KeyCode::Char(':'), KeyModifiers::NONE) if app.mode == AppMode::Browser => {
+            app.command_input = Some(String::new());
+            return Ok(false);
         }
         _ => {}
     }
@@ -341,6 +505,132 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         AppMode::Connect => handle_connect_key(app, key).await,
         AppMode::Editor => handle_editor_key(app, key).await,
         AppMode::Browser => handle_browser_key(app, key).await,
+    }
+}
+
+/// Handle key input while the `:` command palette is open. Returns
+/// `Ok(true)` only on `:q`/`:quit` to terminate the program.
+fn handle_command_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    let buf = app
+        .command_input
+        .as_mut()
+        .expect("command palette must be open");
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            app.command_input = None;
+            app.status = nav_hint();
+        }
+        (KeyCode::Backspace, _) if buf.pop().is_none() => {
+            // Backspace on an empty buffer closes the palette.
+            app.command_input = None;
+            app.status = nav_hint();
+        }
+        (KeyCode::Backspace, _) => {}
+        (KeyCode::Enter, _) => {
+            let cmd = buf.trim().to_owned();
+            app.command_input = None;
+            return run_command(app, &cmd);
+        }
+        (KeyCode::Char(ch), m) if !m.contains(KeyModifiers::CONTROL) => {
+            buf.push(ch);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// Execute a command typed into the `:` palette. Unknown commands set
+/// `last_error` and stay in Browser mode.
+fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
+    let cmd = command.trim();
+    let (head, _rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+    match head {
+        "" => {}
+        "q" | "quit" => return Ok(true),
+        "select" | "s" => prefill_editor_with_select(app),
+        "insert" | "i" => prefill_editor_with_insert(app),
+        "describe" | "desc" | "cols" | "columns" => switch_detail_tab(app, DetailTab::Columns),
+        "indexes" | "idx" => switch_detail_tab(app, DetailTab::Indexes),
+        "keys" => switch_detail_tab(app, DetailTab::Keys),
+        "constraints" | "ck" => switch_detail_tab(app, DetailTab::Constraints),
+        "erd" | "rel" | "relationships" => {
+            switch_detail_tab(app, DetailTab::Erd);
+            if app.relationships.is_empty() && !app.current_schema.is_empty() {
+                let schema = app.current_schema.clone();
+                spawn_relationships(app, schema);
+            }
+        }
+        "help" | "h" | "?" => {
+            app.status = ":select :insert :describe :indexes :keys \
+                          :constraints :erd :help :q"
+                .to_owned();
+        }
+        other => {
+            app.last_error = Some(format!("unknown command: :{other}  (try :help)"));
+            app.status = format!("unknown command: :{other}");
+        }
+    }
+    Ok(false)
+}
+
+fn switch_detail_tab(app: &mut AppState, tab: DetailTab) {
+    if app.current_table.is_empty() {
+        app.status = "select a table first".to_owned();
+        return;
+    }
+    app.detail_tab = tab;
+    app.pane = BrowserPane::Detail;
+    app.status = format!("{}  ({})", tab.label(), app.current_table);
+}
+
+fn prefill_editor_with_select(app: &mut AppState) {
+    if app.current_table.is_empty() {
+        app.status = "select a table first".to_owned();
+        return;
+    }
+    let qualified = qualified_table(app);
+    app.editor = format!("SELECT * FROM {qualified} LIMIT 100;\n");
+    app.editor_cursor = app.editor.len();
+    app.history_idx = None;
+    app.mode = AppMode::Editor;
+    app.status = "editor: Ctrl+R run  Esc browser".to_owned();
+}
+
+fn prefill_editor_with_insert(app: &mut AppState) {
+    if app.current_table.is_empty() {
+        app.status = "select a table first".to_owned();
+        return;
+    }
+    let qualified = qualified_table(app);
+    let cols: Vec<String> = app
+        .table_info
+        .as_ref()
+        .map(|info| info.columns.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    let template = if cols.is_empty() {
+        format!("INSERT INTO {qualified} VALUES (...);\n")
+    } else {
+        let names = cols.join(", ");
+        let placeholders: Vec<String> = cols.iter().map(|c| format!(":{c}")).collect();
+        format!(
+            "INSERT INTO {qualified}\n  ({names})\nVALUES\n  ({});\n",
+            placeholders.join(", ")
+        )
+    };
+    app.editor = template;
+    app.editor_cursor = app.editor.len();
+    app.history_idx = None;
+    app.mode = AppMode::Editor;
+    app.status = "editor: replace placeholders, Ctrl+R run".to_owned();
+}
+
+/// Build a driver-appropriate qualified identifier. Sqlite has no schemas
+/// outside `main`, so the schema prefix is dropped there to keep queries
+/// portable.
+fn qualified_table(app: &AppState) -> String {
+    match app.driver {
+        DriverKind::Postgres => format!("\"{}\".\"{}\"", app.current_schema, app.current_table),
+        DriverKind::Sqlite => format!("\"{}\"", app.current_table),
     }
 }
 
@@ -414,7 +704,7 @@ async fn try_connect(app: &mut AppState, url: String) {
     app.url = url;
     app.last_error = None;
     app.status = format!("Connecting to {}…", app.url);
-    match fetch_overview(app.driver, &app.url).await {
+    match open_pool_and_overview(app).await {
         Ok(ov) => {
             rebuild_sidebar(app, &ov);
             app.overview = Some(ov);
@@ -428,6 +718,15 @@ async fn try_connect(app: &mut AppState, url: String) {
     }
 }
 
+/// Open a fresh `Pool` for the active driver/url and load the schema overview.
+/// The pool is stored on `app.pool` so subsequent metadata calls reuse it.
+async fn open_pool_and_overview(app: &mut AppState) -> Result<DatabaseOverview, tsql_db::DbError> {
+    let pool = Pool::connect(app.driver, &app.url).await?;
+    let overview = pool.fetch_overview().await?;
+    app.pool = Some(pool);
+    Ok(overview)
+}
+
 async fn handle_editor_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => {
@@ -435,35 +734,214 @@ async fn handle_editor_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
             app.status = nav_hint();
         }
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-            app.last_error = None;
-            app.status = "executing…".to_owned();
-            let doc = SqlDocument::new(app.editor.clone());
-            match execute_script(app.driver, &app.url, &doc).await {
-                Ok(out) => {
-                    if let Some(first) = out.statements.into_iter().next() {
-                        let rows = first.rows.len();
-                        app.records = Some(first);
-                        app.record_row = 0;
-                        app.record_col = 0;
-                        app.record_table_state.select(Some(0));
-                        app.status = format!("{rows} rows  Esc → browser");
-                    }
-                }
-                Err(e) => {
-                    app.last_error = Some(e.to_string());
-                    app.status = format!("error: {e}");
-                }
-            }
+            run_editor_query(app).await;
         }
-        (KeyCode::Backspace, _) => {
-            app.editor.pop();
+        // History recall (Ctrl+P / Ctrl+N). Up/Down stay free for line
+        // navigation within multi-line queries.
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => history_prev(app),
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => history_next(app),
+        // Cursor movement
+        (KeyCode::Left, _) => {
+            app.editor_cursor = prev_char_boundary(&app.editor, app.editor_cursor);
         }
-        (KeyCode::Enter, _) => app.editor.push('\n'),
-        (KeyCode::Tab, _) => app.editor.push_str("    "),
-        (KeyCode::Char(ch), _) => app.editor.push(ch),
+        (KeyCode::Right, _) => {
+            app.editor_cursor = next_char_boundary(&app.editor, app.editor_cursor);
+        }
+        (KeyCode::Up, _) => {
+            app.editor_cursor = move_cursor_vertical(&app.editor, app.editor_cursor, -1);
+        }
+        (KeyCode::Down, _) => {
+            app.editor_cursor = move_cursor_vertical(&app.editor, app.editor_cursor, 1);
+        }
+        (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+            app.editor_cursor = line_start(&app.editor, app.editor_cursor);
+        }
+        (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+            app.editor_cursor = line_end(&app.editor, app.editor_cursor);
+        }
+        // Edits
+        (KeyCode::Backspace, _) if app.editor_cursor > 0 => {
+            let prev = prev_char_boundary(&app.editor, app.editor_cursor);
+            app.editor.replace_range(prev..app.editor_cursor, "");
+            app.editor_cursor = prev;
+            app.history_idx = None;
+        }
+        (KeyCode::Delete, _) if app.editor_cursor < app.editor.len() => {
+            let next = next_char_boundary(&app.editor, app.editor_cursor);
+            app.editor.replace_range(app.editor_cursor..next, "");
+            app.history_idx = None;
+        }
+        (KeyCode::Enter, _) => editor_insert_str(app, "\n"),
+        (KeyCode::Tab, _) => editor_insert_str(app, "    "),
+        (KeyCode::Char(ch), m) if !m.contains(KeyModifiers::CONTROL) => {
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            editor_insert_str(app, s);
+        }
         _ => {}
     }
     Ok(false)
+}
+
+async fn run_editor_query(app: &mut AppState) {
+    if app.editor.trim().is_empty() {
+        return;
+    }
+    app.last_error = None;
+    app.status = "executing…".to_owned();
+    let doc = SqlDocument::new(app.editor.clone());
+    let pool = app.pool.as_ref().expect("connected pool in editor mode");
+    match pool.execute_script(&doc).await {
+        Ok(out) => {
+            if let Some(first) = out.statements.into_iter().next() {
+                let rows = first.rows.len();
+                app.records = Some(first);
+                app.record_row = 0;
+                app.record_col = 0;
+                app.record_table_state.select(Some(0));
+                app.status = format!("{rows} rows  Esc → browser");
+            }
+            push_history(app);
+        }
+        Err(e) => {
+            app.last_error = Some(e.to_string());
+            app.status = format!("error: {e}");
+        }
+    }
+}
+
+fn editor_insert_str(app: &mut AppState, s: &str) {
+    app.editor.insert_str(app.editor_cursor, s);
+    app.editor_cursor += s.len();
+    app.history_idx = None;
+}
+
+fn push_history(app: &mut AppState) {
+    let trimmed = app.editor.trim().to_owned();
+    if trimmed.is_empty() {
+        return;
+    }
+    // De-duplicate adjacent: don't store the same query twice in a row.
+    if app.history.last().map(String::as_str) == Some(trimmed.as_str()) {
+        return;
+    }
+    app.history.push(trimmed);
+    const MAX_HISTORY: usize = 50;
+    if app.history.len() > MAX_HISTORY {
+        let drop = app.history.len() - MAX_HISTORY;
+        app.history.drain(..drop);
+    }
+    app.history_idx = None;
+}
+
+fn history_prev(app: &mut AppState) {
+    if app.history.is_empty() {
+        return;
+    }
+    let next = match app.history_idx {
+        None => app.history.len() - 1,
+        Some(0) => 0,
+        Some(i) => i - 1,
+    };
+    app.editor = app.history[next].clone();
+    app.editor_cursor = app.editor.len();
+    app.history_idx = Some(next);
+    app.status = format!("history {}/{}", next + 1, app.history.len());
+}
+
+fn history_next(app: &mut AppState) {
+    let Some(idx) = app.history_idx else {
+        return;
+    };
+    if idx + 1 >= app.history.len() {
+        // Step past the newest entry → blank draft.
+        app.editor.clear();
+        app.editor_cursor = 0;
+        app.history_idx = None;
+        app.status = "history: new draft".to_owned();
+    } else {
+        let next = idx + 1;
+        app.editor = app.history[next].clone();
+        app.editor_cursor = app.editor.len();
+        app.history_idx = Some(next);
+        app.status = format!("history {}/{}", next + 1, app.history.len());
+    }
+}
+
+// ─── Editor cursor helpers ────────────────────────────────────────────────────
+
+fn prev_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx == 0 {
+        return 0;
+    }
+    idx -= 1;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn next_char_boundary(s: &str, mut idx: usize) -> usize {
+    let len = s.len();
+    if idx >= len {
+        return len;
+    }
+    idx += 1;
+    while idx < len && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+fn line_start(s: &str, idx: usize) -> usize {
+    s[..idx].rfind('\n').map_or(0, |p| p + 1)
+}
+
+fn line_end(s: &str, idx: usize) -> usize {
+    s[idx..].find('\n').map_or(s.len(), |p| idx + p)
+}
+
+/// Compute (line, column-in-chars) for a byte index.
+fn line_col(s: &str, idx: usize) -> (usize, usize) {
+    let prefix = &s[..idx];
+    let line = prefix.bytes().filter(|b| *b == b'\n').count();
+    let col = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, after)| after)
+        .chars()
+        .count();
+    (line, col)
+}
+
+/// Move cursor up (delta = -1) or down (delta = 1) one line, preserving
+/// the visual column where possible.
+fn move_cursor_vertical(s: &str, idx: usize, delta: isize) -> usize {
+    let (line, col) = line_col(s, idx);
+    let target_line = match delta {
+        d if d < 0 && line == 0 => return idx,
+        d if d < 0 => line - 1,
+        _ => line + 1,
+    };
+    let lines: Vec<&str> = s.split('\n').collect();
+    if target_line >= lines.len() {
+        return idx;
+    }
+    // Build byte offset of target_line's start.
+    let mut offset = 0usize;
+    for line_text in lines.iter().take(target_line) {
+        offset += line_text.len() + 1; // +1 for the '\n'
+    }
+    let target = lines[target_line];
+    // Walk char-by-char on the target line up to `col` chars.
+    let mut byte = 0usize;
+    for (i, ch) in target.char_indices() {
+        let chars_so_far = target[..i].chars().count();
+        if chars_so_far >= col {
+            return offset + i;
+        }
+        byte = i + ch.len_utf8();
+    }
+    offset + byte
 }
 
 async fn handle_browser_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
@@ -564,19 +1042,8 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 && !app.current_schema.is_empty()
             {
                 let schema = app.current_schema.clone();
-                match fetch_relationships(app.driver, &app.url, &schema).await {
-                    Ok(rels) => {
-                        app.relationships = rels;
-                        app.status = format!(
-                            "ERD  schema: {}  {} relationship(s)",
-                            schema,
-                            app.relationships.len()
-                        );
-                    }
-                    Err(e) => {
-                        app.status = format!("ERD error: {e}");
-                    }
-                }
+                app.status = format!("Loading ERD for {schema}…");
+                spawn_relationships(app, schema);
             }
         }
         KeyCode::Char('h') | KeyCode::Left => {
@@ -592,7 +1059,7 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                     app.record_offset += 50;
                     let s = app.current_schema.clone();
                     let t = app.current_table.clone();
-                    load_records_page(app, &s, &t).await;
+                    load_records_page(app, &s, &t);
                 }
             }
         }
@@ -604,8 +1071,26 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 app.record_offset = app.record_offset.saturating_sub(50);
                 let s = app.current_schema.clone();
                 let t = app.current_table.clone();
-                load_records_page(app, &s, &t).await;
+                load_records_page(app, &s, &t);
             }
+        }
+        // ERD navigation: move the highlight through the flat edge list.
+        KeyCode::Char('j') | KeyCode::Down
+            if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() =>
+        {
+            let max = app.relationships.len() - 1;
+            app.erd_selected = (app.erd_selected + 1).min(max);
+        }
+        KeyCode::Char('k') | KeyCode::Up
+            if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() =>
+        {
+            app.erd_selected = app.erd_selected.saturating_sub(1);
+        }
+        KeyCode::Enter if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() => {
+            jump_to_erd_target(app, ErdJump::Target).await;
+        }
+        KeyCode::Char('o') if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() => {
+            jump_to_erd_target(app, ErdJump::Source).await;
         }
         KeyCode::Char(']') if app.detail_tab == DetailTab::Records => {
             if let Some(rec) = &app.records {
@@ -645,40 +1130,127 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     Ok(false)
 }
 
-// ─── Data loaders ─────────────────────────────────────────────────────────────
+/// Direction of an ERD jump: follow the FK arrow to its `to_table`, or
+/// hop back to the owning `from_table`.
+#[derive(Debug, Clone, Copy)]
+enum ErdJump {
+    Target,
+    Source,
+}
 
-async fn load_table(app: &mut AppState, schema: &str, table: &str) {
-    match fetch_table_info(app.driver, &app.url, schema, table).await {
-        Ok(info) => {
-            app.table_info = Some(info);
-            app.detail_tab = DetailTab::Records;
-            app.pane = BrowserPane::Detail;
-            load_records_page(app, schema, table).await;
-        }
-        Err(e) => {
-            app.last_error = Some(e.to_string());
-            app.status = format!("error loading {table}: {e}");
+/// Load the table at the other end of the highlighted ERD edge. Schema is
+/// inherited from the current schema (FK edges are schema-scoped). Updates
+/// the sidebar selection so the new table is the active context for
+/// further navigation.
+async fn jump_to_erd_target(app: &mut AppState, direction: ErdJump) {
+    let Some(edge) = app.relationships.get(app.erd_selected).cloned() else {
+        return;
+    };
+    let target = match direction {
+        ErdJump::Target => edge.to_table,
+        ErdJump::Source => edge.from_table,
+    };
+    let schema = app.current_schema.clone();
+    select_sidebar_for(app, &target);
+    app.detail_tab = DetailTab::Records;
+    load_table(app, &schema, &target).await;
+}
+
+/// If the sidebar contains an entry for `table`, point `sidebar_idx` at
+/// it so the highlight follows the user. Silent no-op when the table is
+/// not visible (e.g. its parent schema is collapsed) — `load_table`
+/// already handles loading the metadata regardless.
+fn select_sidebar_for(app: &mut AppState, table: &str) {
+    for (i, entry) in app.sidebar.iter().enumerate() {
+        if let SidebarEntry::Table { name, .. } = entry {
+            if name == table {
+                app.sidebar_idx = i;
+                app.sidebar_list_state.select(Some(i));
+                return;
+            }
         }
     }
 }
 
-async fn load_records_page(app: &mut AppState, schema: &str, table: &str) {
-    match fetch_records(app.driver, &app.url, schema, table, 50, app.record_offset).await {
-        Ok(out) => {
-            let rows = out.rows.len();
-            app.records = Some(out);
-            app.record_row = 0;
-            app.record_table_state.select(Some(0));
-            app.status = format!(
-                " {schema}.{table}  offset {off}  {rows} rows  \
-                 j/k rows  [/] cols  y cell  Y row  l/h tabs",
-                off = app.record_offset
-            );
-        }
-        Err(e) => {
-            app.status = format!("error loading records: {e}");
-        }
+// ─── Data loaders ─────────────────────────────────────────────────────────────
+
+/// Kick off a non-blocking load of `(schema.table)`'s metadata and first
+/// records page. Marks the table as the active selection synchronously so
+/// the sidebar updates immediately, then spawns two background tasks that
+/// will deliver `TableInfo` and `Records` messages to the event loop.
+async fn load_table(app: &mut AppState, schema: &str, table: &str) {
+    // Preserve cached relationships when jumping inside the same schema
+    // (ERD edges are schema-scoped, so they're still valid).
+    if schema != app.current_schema {
+        app.relationships.clear();
+        app.erd_selected = 0;
     }
+    app.current_schema = schema.to_owned();
+    app.current_table = table.to_owned();
+    app.record_offset = 0;
+    app.table_info = None;
+    app.records = None;
+    app.status = format!("Loading {schema}.{table}…");
+
+    spawn_table_info(app, schema.to_owned(), table.to_owned());
+    spawn_records(app, schema.to_owned(), table.to_owned(), 0);
+}
+
+/// Spawn a non-blocking re-fetch of the active table's records at the
+/// current `record_offset` (used after `n`/`p` paging key presses).
+fn load_records_page(app: &mut AppState, schema: &str, table: &str) {
+    spawn_records(app, schema.to_owned(), table.to_owned(), app.record_offset);
+}
+
+fn spawn_table_info(app: &mut AppState, schema: String, table: String) {
+    let (Some(pool), Some(tx)) = (app.pool.clone(), app.tx.clone()) else {
+        return;
+    };
+    app.pending += 1;
+    tokio::spawn(async move {
+        let result = pool
+            .fetch_table_info(&schema, &table)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(DbMessage::TableInfo {
+            schema,
+            table,
+            result,
+        });
+    });
+}
+
+fn spawn_records(app: &mut AppState, schema: String, table: String, offset: usize) {
+    let (Some(pool), Some(tx)) = (app.pool.clone(), app.tx.clone()) else {
+        return;
+    };
+    app.pending += 1;
+    tokio::spawn(async move {
+        let result = pool
+            .fetch_records(&schema, &table, 50, offset)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(DbMessage::Records {
+            schema,
+            table,
+            offset,
+            result,
+        });
+    });
+}
+
+fn spawn_relationships(app: &mut AppState, schema: String) {
+    let (Some(pool), Some(tx)) = (app.pool.clone(), app.tx.clone()) else {
+        return;
+    };
+    app.pending += 1;
+    tokio::spawn(async move {
+        let result = pool
+            .fetch_relationships(&schema)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(DbMessage::Relationships { schema, result });
+    });
 }
 
 // ─── Draw root ────────────────────────────────────────────────────────────────
@@ -1411,35 +1983,70 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         Line::default(),
     ];
 
-    // Group edges by source table (deterministic BTreeMap)
-    let mut by_table: BTreeMap<&str, Vec<&RelationshipEdge>> = BTreeMap::new();
-    for edge in &app.relationships {
-        by_table
-            .entry(edge.from_table.as_str())
-            .or_default()
-            .push(edge);
-    }
-
-    for (tbl, edges) in &by_table {
-        lines.push(Line::from(vec![Span::styled(
-            format!("  ┌─  {tbl}"),
-            Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
-        )]));
-        for (i, edge) in edges.iter().enumerate() {
-            let connector = if i + 1 == edges.len() { "└" } else { "├" };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {connector}── "), Style::default().fg(th.border)),
-                Span::styled(edge.from_columns.join(", "), Style::default().fg(th.fg)),
-                Span::styled("  ──▶  ", Style::default().fg(th.muted)),
-                Span::styled(
-                    &edge.to_table,
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(".", Style::default().fg(th.muted)),
-                Span::styled(edge.to_columns.join(", "), Style::default().fg(th.fg)),
-            ]));
+    // Walk relationships in their (already-sorted) order so the flat
+    // index `erd_selected` lines up with the rendered rows.
+    let selected = app.erd_selected;
+    let mut prev_from: Option<&str> = None;
+    let mut group_remaining = 0usize;
+    for (idx, edge) in app.relationships.iter().enumerate() {
+        let from = edge.from_table.as_str();
+        if Some(from) != prev_from {
+            // Header for a new source-table group.
+            lines.push(Line::from(vec![Span::styled(
+                format!("  ┌─  {from}"),
+                Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
+            )]));
+            // Count consecutive edges that share this from_table.
+            group_remaining = app.relationships[idx..]
+                .iter()
+                .take_while(|e| e.from_table == edge.from_table)
+                .count();
+            prev_from = Some(from);
         }
-        lines.push(Line::default());
+        let connector = if group_remaining == 1 { "└" } else { "├" };
+        group_remaining -= 1;
+
+        let is_selected = idx == selected;
+        let row_bg = if is_selected { th.sel_bg } else { th.bg };
+        let row_fg = if is_selected { th.sel_fg } else { th.fg };
+        let highlight = Style::default().fg(row_fg).bg(row_bg);
+        let arrow = if is_selected {
+            "  ━━▶  "
+        } else {
+            "  ──▶  "
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {connector}── "),
+                Style::default().fg(th.border).bg(row_bg),
+            ),
+            Span::styled(edge.from_columns.join(", "), highlight),
+            Span::styled(
+                arrow,
+                Style::default()
+                    .fg(if is_selected { th.accent } else { th.muted })
+                    .bg(row_bg)
+                    .add_modifier(if is_selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(
+                edge.to_table.clone(),
+                Style::default()
+                    .fg(th.accent)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(".", Style::default().fg(th.muted).bg(row_bg)),
+            Span::styled(edge.to_columns.join(", "), highlight),
+        ]));
+
+        if group_remaining == 0 {
+            lines.push(Line::default());
+        }
     }
 
     // Show unreferenced tables if we have the overview
@@ -1488,6 +2095,16 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
+    let title = if app.history.is_empty() {
+        "  SQL Editor   Ctrl+R run  Esc browser  ".to_owned()
+    } else {
+        format!(
+            "  SQL Editor   Ctrl+R run  Ctrl+P/N history ({})  Esc browser  ",
+            app.history.len()
+        )
+    };
+
+    let editor_area = layout[0];
     f.render_widget(
         Paragraph::new(app.editor.as_str())
             .style(Style::default().fg(th.fg).bg(th.bg))
@@ -1495,7 +2112,7 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             .block(
                 Block::default()
                     .title(Span::styled(
-                        "  SQL Editor   Ctrl+R run  Esc browser  ",
+                        title,
                         Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                     ))
                     .borders(Borders::ALL)
@@ -1503,8 +2120,24 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                     .border_style(Style::default().fg(th.active_border))
                     .style(Style::default().bg(th.bg)),
             ),
-        layout[0],
+        editor_area,
     );
+
+    // Position the terminal's hardware cursor inside the editor pane so the
+    // user can see exactly where edits will land. Coordinates are computed
+    // from the (line, column) of `editor_cursor`. Note this ignores soft-wrap
+    // so very long lines may push the cursor off the visible width; that's a
+    // known limitation deferred to future work.
+    let inner = Rect {
+        x: editor_area.x + 1,
+        y: editor_area.y + 1,
+        width: editor_area.width.saturating_sub(2),
+        height: editor_area.height.saturating_sub(2),
+    };
+    let (line, col) = line_col(&app.editor, app.editor_cursor);
+    let cx = inner.x + (col as u16).min(inner.width.saturating_sub(1));
+    let cy = inner.y + (line as u16).min(inner.height.saturating_sub(1));
+    f.set_cursor_position((cx, cy));
 
     // Results from editor queries
     let result_text: String = if let Some(rec) = &app.records {
@@ -1545,7 +2178,15 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 
 fn draw_status(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let th = app.theme;
-    let (text, fg) = if let Some(err) = &app.last_error {
+    let (text, fg) = if let Some(buf) = &app.command_input {
+        // Active palette: render `:<input>_` and route the hardware cursor
+        // there so the user sees their typing.
+        let prompt = format!(":{buf}");
+        let cursor_x = area.x + prompt.chars().count() as u16;
+        let cursor_y = area.y;
+        f.set_cursor_position((cursor_x, cursor_y));
+        (prompt, th.accent)
+    } else if let Some(err) = &app.last_error {
         (format!(" ✗  {err}"), th.error)
     } else {
         (format!(" {}", app.status), th.muted)
@@ -1581,7 +2222,10 @@ fn restore_terminal(
 
 #[cfg(test)]
 mod tests {
-    use super::{Theme, ALL_TABS};
+    use super::{
+        line_col, line_end, line_start, move_cursor_vertical, next_char_boundary,
+        prev_char_boundary, Theme, ALL_TABS,
+    };
 
     #[test]
     fn catppuccin_mocha_name() {
@@ -1601,5 +2245,60 @@ mod tests {
         for tab in ALL_TABS {
             assert!(!tab.label().is_empty());
         }
+    }
+
+    #[test]
+    fn char_boundary_walks_skip_utf8_continuation_bytes() {
+        // "ñ" is 2 bytes; cursor at 0 → next at 2, then prev → 0.
+        let s = "ñ";
+        assert_eq!(next_char_boundary(s, 0), 2);
+        assert_eq!(prev_char_boundary(s, 2), 0);
+        assert_eq!(prev_char_boundary("", 0), 0);
+        assert_eq!(next_char_boundary("", 0), 0);
+    }
+
+    #[test]
+    fn line_start_and_line_end_handle_multiline() {
+        let s = "select 1;\nselect 2;\nselect 3;";
+        // Cursor in the middle of line 1 (0-indexed)
+        let mid = 14;
+        assert_eq!(line_start(s, mid), 10, "line 1 starts after first newline");
+        assert_eq!(line_end(s, mid), 19, "line 1 ends at second newline");
+        // Beginning of buffer: line_start = 0
+        assert_eq!(line_start(s, 3), 0);
+        // Last line has no trailing newline: line_end is buffer length
+        assert_eq!(line_end(s, 25), s.len());
+    }
+
+    #[test]
+    fn line_col_counts_lines_and_columns() {
+        let s = "abc\ndé\nxyz";
+        // After 'b' on line 0 → (0, 1)
+        assert_eq!(line_col(s, 1), (0, 1));
+        // After 'é' on line 1: 'd' at byte 4, 'é' is 2 bytes ending at 7 → (1, 2)
+        assert_eq!(line_col(s, 7), (1, 2));
+        // Empty buffer
+        assert_eq!(line_col("", 0), (0, 0));
+    }
+
+    #[test]
+    fn vertical_cursor_preserves_column() {
+        let s = "abcdef\n12\nXYZ";
+        // From column 4 of line 0 (after 'd'): byte idx 4
+        // Down → line 1 has only 2 chars, so we land at end of "12" (byte 9).
+        assert_eq!(move_cursor_vertical(s, 4, 1), 9);
+        // Up from start does nothing
+        assert_eq!(move_cursor_vertical(s, 2, -1), 2);
+        // Down from last line does nothing
+        assert_eq!(move_cursor_vertical(s, s.len(), 1), s.len());
+    }
+
+    #[test]
+    fn vertical_cursor_round_trip() {
+        let s = "alpha\nbeta\ngamma";
+        // line 0, col 3 → byte 3
+        let down = move_cursor_vertical(s, 3, 1);
+        // back up should land on column 3 of line 0
+        assert_eq!(move_cursor_vertical(s, down, -1), 3);
     }
 }

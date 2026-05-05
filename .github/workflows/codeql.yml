@@ -1,0 +1,70 @@
+name: codeql
+
+# Adds the third code-scanning analysis required by the `main` branch
+# ruleset (the other two are Semgrep OSS and Trivy in security.yml).
+#
+# CodeQL extracts data during compilation, so the workflow installs the
+# Rust toolchain, runs `cargo build` for the whole workspace, then asks
+# CodeQL to analyse what it observed. Triggers mirror security.yml so
+# both PRs and pushes to main get fresh results.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    # Weekly Monday refresh, slightly offset from the security.yml cron
+    # so the two workflows don't compete for runners.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          # Use the security-and-quality query suite for higher coverage.
+          # Switch to `security-extended` if PR feedback time matters more.
+          queries: security-and-quality
+
+      # CodeQL hooks into rustc to extract analysis data. Build the entire
+      # workspace with all features so every code path is observed; tests
+      # are excluded to keep build time bounded.
+      - name: Build workspace
+        run: cargo build --workspace --all-features
+
+      - name: Run CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"

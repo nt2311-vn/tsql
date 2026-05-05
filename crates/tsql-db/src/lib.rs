@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
-use sqlx::postgres::{PgPoolOptions, PgRow};
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 use thiserror::Error;
@@ -111,22 +111,104 @@ pub struct RelationshipEdge {
     pub to_columns: Vec<String>,
 }
 
+/// A reusable database connection pool. Cheap to clone (each variant is
+/// `Arc`-backed in `sqlx`), so it can be shared across tasks and used to
+/// avoid the per-call connection handshake that the URL-based helpers pay.
+#[derive(Debug, Clone)]
+pub enum Pool {
+    Postgres(PgPool),
+    Sqlite(SqlitePool),
+}
+
+impl Pool {
+    /// Open a fresh pool for the given driver and URL.
+    pub async fn connect(driver: DriverKind, url: &str) -> Result<Self, DbError> {
+        match driver {
+            DriverKind::Postgres => {
+                let pool = PgPoolOptions::new().max_connections(4).connect(url).await?;
+                Ok(Self::Postgres(pool))
+            }
+            DriverKind::Sqlite => Ok(Self::Sqlite(sqlite_pool(url).await?)),
+        }
+    }
+
+    pub fn driver(&self) -> DriverKind {
+        match self {
+            Pool::Postgres(_) => DriverKind::Postgres,
+            Pool::Sqlite(_) => DriverKind::Sqlite,
+        }
+    }
+
+    pub async fn execute_script(&self, document: &SqlDocument) -> Result<QueryOutput, DbError> {
+        let stmts = document.statements();
+        match self {
+            Pool::Postgres(pool) => execute_postgres(pool, &stmts).await,
+            Pool::Sqlite(pool) => execute_sqlite(pool, &stmts).await,
+        }
+    }
+
+    pub async fn fetch_overview(&self) -> Result<DatabaseOverview, DbError> {
+        match self {
+            Pool::Postgres(pool) => fetch_postgres_overview(pool).await,
+            Pool::Sqlite(pool) => fetch_sqlite_overview(pool).await,
+        }
+    }
+
+    pub async fn fetch_table_info(&self, schema: &str, table: &str) -> Result<TableInfo, DbError> {
+        match self {
+            Pool::Postgres(pool) => fetch_postgres_table_info(pool, schema, table).await,
+            Pool::Sqlite(pool) => fetch_sqlite_table_info(pool, schema, table).await,
+        }
+    }
+
+    pub async fn fetch_records(
+        &self,
+        schema: &str,
+        table: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<StatementOutput, DbError> {
+        let sql = match self.driver() {
+            DriverKind::Postgres => {
+                format!("SELECT * FROM \"{schema}\".\"{table}\" LIMIT {limit} OFFSET {offset}")
+            }
+            DriverKind::Sqlite => {
+                format!("SELECT * FROM \"{table}\" LIMIT {limit} OFFSET {offset}")
+            }
+        };
+        let document = SqlDocument::new(sql);
+        self.execute_script(&document)
+            .await?
+            .statements
+            .into_iter()
+            .next()
+            .ok_or_else(|| DbError::Sqlx(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn fetch_relationships(
+        &self,
+        schema: &str,
+    ) -> Result<Vec<RelationshipEdge>, DbError> {
+        match self {
+            Pool::Postgres(pool) => fetch_postgres_relationships(pool, schema).await,
+            Pool::Sqlite(pool) => fetch_sqlite_relationships(pool, schema).await,
+        }
+    }
+}
+
 pub async fn execute_script(
     driver: DriverKind,
     url: &str,
     document: &SqlDocument,
 ) -> Result<QueryOutput, DbError> {
-    match driver {
-        DriverKind::Postgres => execute_postgres(url, &document.statements()).await,
-        DriverKind::Sqlite => execute_sqlite(url, &document.statements()).await,
-    }
+    Pool::connect(driver, url)
+        .await?
+        .execute_script(document)
+        .await
 }
 
 pub async fn fetch_overview(driver: DriverKind, url: &str) -> Result<DatabaseOverview, DbError> {
-    match driver {
-        DriverKind::Postgres => fetch_postgres_overview(url).await,
-        DriverKind::Sqlite => fetch_sqlite_overview(url).await,
-    }
+    Pool::connect(driver, url).await?.fetch_overview().await
 }
 
 pub async fn fetch_table_info(
@@ -135,10 +217,10 @@ pub async fn fetch_table_info(
     schema: &str,
     table: &str,
 ) -> Result<TableInfo, DbError> {
-    match driver {
-        DriverKind::Postgres => fetch_postgres_table_info(url, schema, table).await,
-        DriverKind::Sqlite => fetch_sqlite_table_info(url, schema, table).await,
-    }
+    Pool::connect(driver, url)
+        .await?
+        .fetch_table_info(schema, table)
+        .await
 }
 
 pub async fn fetch_records(
@@ -149,27 +231,10 @@ pub async fn fetch_records(
     limit: usize,
     offset: usize,
 ) -> Result<StatementOutput, DbError> {
-    let sql = match driver {
-        DriverKind::Postgres => format!(
-            "SELECT * FROM \"{}\".\"{}\" LIMIT {} OFFSET {}",
-            schema, table, limit, offset
-        ),
-        DriverKind::Sqlite => {
-            format!(
-                "SELECT * FROM \"{}\" LIMIT {} OFFSET {}",
-                table, limit, offset
-            )
-        }
-    };
-
-    let document = SqlDocument::new(sql);
-    let output = execute_script(driver, url, &document).await?;
-
-    output
-        .statements
-        .into_iter()
-        .next()
-        .ok_or_else(|| DbError::Sqlx(sqlx::Error::RowNotFound))
+    Pool::connect(driver, url)
+        .await?
+        .fetch_records(schema, table, limit, offset)
+        .await
 }
 
 type PragmaFkRow = (i64, i64, String, String, String, String, String, String);
@@ -185,13 +250,11 @@ async fn sqlite_pool(url: &str) -> Result<SqlitePool, DbError> {
         .map_err(DbError::Sqlx)
 }
 
-async fn fetch_sqlite_overview(url: &str) -> Result<DatabaseOverview, DbError> {
-    let pool = sqlite_pool(url).await?;
-
+async fn fetch_sqlite_overview(pool: &SqlitePool) -> Result<DatabaseOverview, DbError> {
     let tables: Vec<(String,)> = sqlx::query_as(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await?;
 
     Ok(DatabaseOverview {
@@ -203,16 +266,14 @@ async fn fetch_sqlite_overview(url: &str) -> Result<DatabaseOverview, DbError> {
 }
 
 async fn fetch_sqlite_table_info(
-    url: &str,
+    pool: &SqlitePool,
     _schema: &str,
     table: &str,
 ) -> Result<TableInfo, DbError> {
-    let pool = sqlite_pool(url).await?;
-
     // Columns
     let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
         sqlx::query_as(&format!("PRAGMA table_info(\"{}\")", table))
-            .fetch_all(&pool)
+            .fetch_all(pool)
             .await?;
 
     let column_infos = columns
@@ -227,7 +288,7 @@ async fn fetch_sqlite_table_info(
 
     // Primary Key
     let pk_columns: Vec<String> = sqlx::query_as(&format!("PRAGMA table_info(\"{}\")", table))
-        .fetch_all(&pool)
+        .fetch_all(pool)
         .await?
         .into_iter()
         .filter(|row: &(i64, String, String, i64, Option<String>, i64)| row.5 > 0)
@@ -245,7 +306,7 @@ async fn fetch_sqlite_table_info(
 
     // Foreign Keys
     let fks: Vec<PragmaFkRow> = sqlx::query_as(&format!("PRAGMA foreign_key_list(\"{}\")", table))
-        .fetch_all(&pool)
+        .fetch_all(pool)
         .await?;
 
     let mut foreign_keys = Vec::new();
@@ -261,14 +322,14 @@ async fn fetch_sqlite_table_info(
     // Indexes
     let index_list: Vec<(i64, String, i64, String, i64)> =
         sqlx::query_as(&format!("PRAGMA index_list(\"{}\")", table))
-            .fetch_all(&pool)
+            .fetch_all(pool)
             .await?;
 
     let mut indexes = Vec::new();
     for (_, index_name, unique, _, _) in index_list {
         let index_info: Vec<(i64, i64, String)> =
             sqlx::query_as(&format!("PRAGMA index_info(\"{}\")", index_name))
-                .fetch_all(&pool)
+                .fetch_all(pool)
                 .await?;
 
         indexes.push(IndexInfo {
@@ -289,15 +350,13 @@ async fn fetch_sqlite_table_info(
     })
 }
 
-async fn fetch_postgres_overview(url: &str) -> Result<DatabaseOverview, DbError> {
-    let pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
-
+async fn fetch_postgres_overview(pool: &PgPool) -> Result<DatabaseOverview, DbError> {
     let schemas: Vec<(String,)> = sqlx::query_as(
         "SELECT schema_name FROM information_schema.schemata 
          WHERE schema_name NOT IN ('information_schema', 'pg_catalog') 
          ORDER BY schema_name",
     )
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await?;
 
     let mut schema_infos = Vec::with_capacity(schemas.len());
@@ -308,7 +367,7 @@ async fn fetch_postgres_overview(url: &str) -> Result<DatabaseOverview, DbError>
              ORDER BY table_name",
         )
         .bind(&schema_name)
-        .fetch_all(&pool)
+        .fetch_all(pool)
         .await?;
 
         schema_infos.push(SchemaInfo {
@@ -323,12 +382,10 @@ async fn fetch_postgres_overview(url: &str) -> Result<DatabaseOverview, DbError>
 }
 
 async fn fetch_postgres_table_info(
-    url: &str,
+    pool: &PgPool,
     schema: &str,
     table: &str,
 ) -> Result<TableInfo, DbError> {
-    let pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
-
     // Columns
     let columns: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT column_name, data_type, is_nullable, column_default 
@@ -338,7 +395,7 @@ async fn fetch_postgres_table_info(
     )
     .bind(schema)
     .bind(table)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await?;
 
     let column_infos = columns
@@ -364,7 +421,7 @@ async fn fetch_postgres_table_info(
     )
     .bind(schema)
     .bind(table)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await?;
 
     let primary_key = if pk_columns.is_empty() {
@@ -383,9 +440,6 @@ async fn fetch_postgres_table_info(
             ccu.table_name AS foreign_table_name,
             ccu.column_name AS foreign_column_name,
             tc.constraint_name
-        FROM ,
-            ccu.column_name AS foreign_column_name,
-            tc.constraint_name
         FROM 
             information_schema.table_constraints AS tc 
             JOIN information_schema.key_column_usage AS kcu
@@ -399,7 +453,7 @@ async fn fetch_postgres_table_info(
     )
     .bind(schema)
     .bind(table)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await?;
 
     let foreign_keys = fks
@@ -427,7 +481,7 @@ async fn fetch_postgres_table_info(
     )
     .bind(schema)
     .bind(table)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await?;
 
     let mut idx_map: BTreeMap<String, (Vec<String>, bool)> = BTreeMap::new();
@@ -457,7 +511,7 @@ async fn fetch_postgres_table_info(
     )
     .bind(schema)
     .bind(table)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await?;
 
     let constraints = constraint_rows
@@ -481,22 +535,21 @@ pub async fn fetch_relationships(
     url: &str,
     schema: &str,
 ) -> Result<Vec<RelationshipEdge>, DbError> {
-    match driver {
-        DriverKind::Postgres => fetch_postgres_relationships(url, schema).await,
-        DriverKind::Sqlite => fetch_sqlite_relationships(url, schema).await,
-    }
+    Pool::connect(driver, url)
+        .await?
+        .fetch_relationships(schema)
+        .await
 }
 
-async fn execute_postgres(url: &str, statements: &[String]) -> Result<QueryOutput, DbError> {
-    let pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
+async fn execute_postgres(pool: &PgPool, statements: &[String]) -> Result<QueryOutput, DbError> {
     let mut output = Vec::with_capacity(statements.len());
 
     for statement in statements {
         if returns_rows(statement) {
-            let rows = sqlx::query(statement).fetch_all(&pool).await?;
+            let rows = sqlx::query(statement).fetch_all(pool).await?;
             output.push(postgres_rows(statement, &rows));
         } else {
-            let result = sqlx::query(statement).execute(&pool).await?;
+            let result = sqlx::query(statement).execute(pool).await?;
             output.push(StatementOutput {
                 statement: statement.clone(),
                 columns: Vec::new(),
@@ -509,16 +562,15 @@ async fn execute_postgres(url: &str, statements: &[String]) -> Result<QueryOutpu
     Ok(QueryOutput { statements: output })
 }
 
-async fn execute_sqlite(url: &str, statements: &[String]) -> Result<QueryOutput, DbError> {
-    let pool = sqlite_pool(url).await?;
+async fn execute_sqlite(pool: &SqlitePool, statements: &[String]) -> Result<QueryOutput, DbError> {
     let mut output = Vec::with_capacity(statements.len());
 
     for statement in statements {
         if returns_rows(statement) {
-            let rows = sqlx::query(statement).fetch_all(&pool).await?;
+            let rows = sqlx::query(statement).fetch_all(pool).await?;
             output.push(sqlite_rows(statement, &rows));
         } else {
-            let result = sqlx::query(statement).execute(&pool).await?;
+            let result = sqlx::query(statement).execute(pool).await?;
             output.push(StatementOutput {
                 statement: statement.clone(),
                 columns: Vec::new(),
@@ -640,22 +692,20 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 async fn fetch_sqlite_relationships(
-    url: &str,
+    pool: &SqlitePool,
     _schema: &str,
 ) -> Result<Vec<RelationshipEdge>, DbError> {
-    let pool = sqlite_pool(url).await?;
-
     let tables: Vec<(String,)> = sqlx::query_as(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await?;
 
     let mut edges = Vec::new();
     for (table,) in tables {
         let fks: Vec<PragmaFkRow> =
             sqlx::query_as(&format!("PRAGMA foreign_key_list(\"{}\")", table))
-                .fetch_all(&pool)
+                .fetch_all(pool)
                 .await?;
 
         for (_, _, ref_table, from, to, _, _, _) in fks {
@@ -672,11 +722,9 @@ async fn fetch_sqlite_relationships(
 }
 
 async fn fetch_postgres_relationships(
-    url: &str,
+    pool: &PgPool,
     schema: &str,
 ) -> Result<Vec<RelationshipEdge>, DbError> {
-    let pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
-
     let fks: Vec<(String, String, String, String)> = sqlx::query_as(
         "SELECT
             tc.table_name, kcu.column_name, 
@@ -693,7 +741,7 @@ async fn fetch_postgres_relationships(
         WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1",
     )
     .bind(schema)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await?;
 
     Ok(fks
