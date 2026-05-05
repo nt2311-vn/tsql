@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
@@ -198,6 +198,9 @@ struct AppState {
     record_col: usize,
     record_table_state: TableState,
     relationships: Vec<RelationshipEdge>,
+    /// Row index into `relationships` selected on the ERD tab. Used by
+    /// j/k navigation and the Enter / `o` jump-to-table shortcuts.
+    erd_selected: usize,
     editor: String,
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
@@ -252,6 +255,7 @@ impl AppState {
             record_col: 0,
             record_table_state: ts,
             relationships: Vec::new(),
+            erd_selected: 0,
             editor: String::new(),
             editor_cursor: 0,
             history: Vec::new(),
@@ -448,9 +452,17 @@ fn apply_db_message(app: &mut AppState, msg: DbMessage) {
                 return;
             }
             match result {
-                Ok(rels) => {
-                    app.status = format!("ERD  schema: {schema}  {} relationship(s)", rels.len());
+                Ok(mut rels) => {
+                    // Stable sort by source table so flat j/k navigation
+                    // matches the visual grouping in `draw_erd`.
+                    rels.sort_by(|a, b| a.from_table.cmp(&b.from_table));
                     app.relationships = rels;
+                    app.erd_selected = 0;
+                    app.status = format!(
+                        "ERD  schema: {schema}  {} relationship(s)  \
+                         j/k select  Enter \u{2192} target  o \u{2192} source",
+                        app.relationships.len()
+                    );
                 }
                 Err(e) => {
                     app.status = format!("ERD error: {e}");
@@ -1062,6 +1074,24 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 load_records_page(app, &s, &t);
             }
         }
+        // ERD navigation: move the highlight through the flat edge list.
+        KeyCode::Char('j') | KeyCode::Down
+            if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() =>
+        {
+            let max = app.relationships.len() - 1;
+            app.erd_selected = (app.erd_selected + 1).min(max);
+        }
+        KeyCode::Char('k') | KeyCode::Up
+            if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() =>
+        {
+            app.erd_selected = app.erd_selected.saturating_sub(1);
+        }
+        KeyCode::Enter if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() => {
+            jump_to_erd_target(app, ErdJump::Target).await;
+        }
+        KeyCode::Char('o') if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() => {
+            jump_to_erd_target(app, ErdJump::Source).await;
+        }
         KeyCode::Char(']') if app.detail_tab == DetailTab::Records => {
             if let Some(rec) = &app.records {
                 let max = rec.columns.len().saturating_sub(1);
@@ -1100,6 +1130,48 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     Ok(false)
 }
 
+/// Direction of an ERD jump: follow the FK arrow to its `to_table`, or
+/// hop back to the owning `from_table`.
+#[derive(Debug, Clone, Copy)]
+enum ErdJump {
+    Target,
+    Source,
+}
+
+/// Load the table at the other end of the highlighted ERD edge. Schema is
+/// inherited from the current schema (FK edges are schema-scoped). Updates
+/// the sidebar selection so the new table is the active context for
+/// further navigation.
+async fn jump_to_erd_target(app: &mut AppState, direction: ErdJump) {
+    let Some(edge) = app.relationships.get(app.erd_selected).cloned() else {
+        return;
+    };
+    let target = match direction {
+        ErdJump::Target => edge.to_table,
+        ErdJump::Source => edge.from_table,
+    };
+    let schema = app.current_schema.clone();
+    select_sidebar_for(app, &target);
+    app.detail_tab = DetailTab::Records;
+    load_table(app, &schema, &target).await;
+}
+
+/// If the sidebar contains an entry for `table`, point `sidebar_idx` at
+/// it so the highlight follows the user. Silent no-op when the table is
+/// not visible (e.g. its parent schema is collapsed) — `load_table`
+/// already handles loading the metadata regardless.
+fn select_sidebar_for(app: &mut AppState, table: &str) {
+    for (i, entry) in app.sidebar.iter().enumerate() {
+        if let SidebarEntry::Table { name, .. } = entry {
+            if name == table {
+                app.sidebar_idx = i;
+                app.sidebar_list_state.select(Some(i));
+                return;
+            }
+        }
+    }
+}
+
 // ─── Data loaders ─────────────────────────────────────────────────────────────
 
 /// Kick off a non-blocking load of `(schema.table)`'s metadata and first
@@ -1107,12 +1179,17 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 /// the sidebar updates immediately, then spawns two background tasks that
 /// will deliver `TableInfo` and `Records` messages to the event loop.
 async fn load_table(app: &mut AppState, schema: &str, table: &str) {
+    // Preserve cached relationships when jumping inside the same schema
+    // (ERD edges are schema-scoped, so they're still valid).
+    if schema != app.current_schema {
+        app.relationships.clear();
+        app.erd_selected = 0;
+    }
     app.current_schema = schema.to_owned();
     app.current_table = table.to_owned();
     app.record_offset = 0;
     app.table_info = None;
     app.records = None;
-    app.relationships.clear();
     app.status = format!("Loading {schema}.{table}…");
 
     spawn_table_info(app, schema.to_owned(), table.to_owned());
@@ -1906,35 +1983,70 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         Line::default(),
     ];
 
-    // Group edges by source table (deterministic BTreeMap)
-    let mut by_table: BTreeMap<&str, Vec<&RelationshipEdge>> = BTreeMap::new();
-    for edge in &app.relationships {
-        by_table
-            .entry(edge.from_table.as_str())
-            .or_default()
-            .push(edge);
-    }
-
-    for (tbl, edges) in &by_table {
-        lines.push(Line::from(vec![Span::styled(
-            format!("  ┌─  {tbl}"),
-            Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
-        )]));
-        for (i, edge) in edges.iter().enumerate() {
-            let connector = if i + 1 == edges.len() { "└" } else { "├" };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {connector}── "), Style::default().fg(th.border)),
-                Span::styled(edge.from_columns.join(", "), Style::default().fg(th.fg)),
-                Span::styled("  ──▶  ", Style::default().fg(th.muted)),
-                Span::styled(
-                    &edge.to_table,
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(".", Style::default().fg(th.muted)),
-                Span::styled(edge.to_columns.join(", "), Style::default().fg(th.fg)),
-            ]));
+    // Walk relationships in their (already-sorted) order so the flat
+    // index `erd_selected` lines up with the rendered rows.
+    let selected = app.erd_selected;
+    let mut prev_from: Option<&str> = None;
+    let mut group_remaining = 0usize;
+    for (idx, edge) in app.relationships.iter().enumerate() {
+        let from = edge.from_table.as_str();
+        if Some(from) != prev_from {
+            // Header for a new source-table group.
+            lines.push(Line::from(vec![Span::styled(
+                format!("  ┌─  {from}"),
+                Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
+            )]));
+            // Count consecutive edges that share this from_table.
+            group_remaining = app.relationships[idx..]
+                .iter()
+                .take_while(|e| e.from_table == edge.from_table)
+                .count();
+            prev_from = Some(from);
         }
-        lines.push(Line::default());
+        let connector = if group_remaining == 1 { "└" } else { "├" };
+        group_remaining -= 1;
+
+        let is_selected = idx == selected;
+        let row_bg = if is_selected { th.sel_bg } else { th.bg };
+        let row_fg = if is_selected { th.sel_fg } else { th.fg };
+        let highlight = Style::default().fg(row_fg).bg(row_bg);
+        let arrow = if is_selected {
+            "  ━━▶  "
+        } else {
+            "  ──▶  "
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {connector}── "),
+                Style::default().fg(th.border).bg(row_bg),
+            ),
+            Span::styled(edge.from_columns.join(", "), highlight),
+            Span::styled(
+                arrow,
+                Style::default()
+                    .fg(if is_selected { th.accent } else { th.muted })
+                    .bg(row_bg)
+                    .add_modifier(if is_selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(
+                edge.to_table.clone(),
+                Style::default()
+                    .fg(th.accent)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(".", Style::default().fg(th.muted).bg(row_bg)),
+            Span::styled(edge.to_columns.join(", "), highlight),
+        ]));
+
+        if group_remaining == 0 {
+            lines.push(Line::default());
+        }
     }
 
     // Show unreferenced tables if we have the overview
