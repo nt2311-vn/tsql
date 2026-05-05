@@ -383,6 +383,9 @@ async fn fetch_postgres_table_info(
             ccu.table_name AS foreign_table_name,
             ccu.column_name AS foreign_column_name,
             tc.constraint_name
+        FROM ,
+            ccu.column_name AS foreign_column_name,
+            tc.constraint_name
         FROM 
             information_schema.table_constraints AS tc 
             JOIN information_schema.key_column_usage AS kcu
