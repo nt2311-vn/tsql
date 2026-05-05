@@ -15,6 +15,7 @@ categories = ["command-line-utilities", "database"]
 anyhow.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
 tsql-core = { path = "../tsql-core", version = "0.1.0" }
 tsql-db = { path = "../tsql-db", version = "0.1.0" }
 tsql-sql = { path = "../tsql-sql", version = "0.1.0" }

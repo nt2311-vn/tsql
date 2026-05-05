@@ -16,9 +16,36 @@ use ratatui::widgets::{
     Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tsql_core::{ConnectionConfig, DriverKind};
 use tsql_db::{DatabaseOverview, Pool, RelationshipEdge, StatementOutput, TableInfo};
 use tsql_sql::SqlDocument;
+
+// ─── Background DB messages ──────────────────────────────────────────────────
+//
+// Metadata loads run on tokio tasks so the event loop can keep drawing and
+// processing input while a slow database is responding. Tasks send their
+// results back through this channel; `run_loop` drains the receiver between
+// every key poll and applies the messages to `AppState`.
+
+#[derive(Debug)]
+enum DbMessage {
+    TableInfo {
+        schema: String,
+        table: String,
+        result: Result<TableInfo, String>,
+    },
+    Records {
+        schema: String,
+        table: String,
+        offset: usize,
+        result: Result<StatementOutput, String>,
+    },
+    Relationships {
+        schema: String,
+        result: Result<Vec<RelationshipEdge>, String>,
+    },
+}
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
 
@@ -174,6 +201,12 @@ struct AppState {
     editor: String,
     status: String,
     last_error: Option<String>,
+    /// Channel used by spawned db tasks to send results back to the event
+    /// loop. `Option` because it is wired up in `run`/`run_connect` after
+    /// state construction.
+    tx: Option<UnboundedSender<DbMessage>>,
+    /// Number of in-flight metadata loads. Drives the spinner/status bar.
+    pending: usize,
 }
 
 impl AppState {
@@ -210,6 +243,8 @@ impl AppState {
             editor: String::new(),
             status: "Loading database overview…".to_owned(),
             last_error: None,
+            tx: None,
+            pending: 0,
         }
     }
 
@@ -262,6 +297,8 @@ fn rebuild_sidebar(app: &mut AppState, overview: &DatabaseOverview) {
 pub async fn run(driver: DriverKind, url: String) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = AppState::new(driver, url);
+    let (tx, rx) = unbounded_channel();
+    app.tx = Some(tx);
 
     match open_pool_and_overview(&mut app).await {
         Ok(ov) => {
@@ -275,7 +312,7 @@ pub async fn run(driver: DriverKind, url: String) -> Result<()> {
         }
     }
 
-    let result = run_loop(&mut terminal, &mut app).await;
+    let result = run_loop(&mut terminal, &mut app, rx).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -283,6 +320,8 @@ pub async fn run(driver: DriverKind, url: String) -> Result<()> {
 pub async fn run_connect(connections: Vec<(String, ConnectionConfig)>) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = AppState::new(DriverKind::Postgres, String::new());
+    let (tx, rx) = unbounded_channel();
+    app.tx = Some(tx);
     app.mode = AppMode::Connect;
     app.saved_connections = connections;
     app.connect_input = String::new();
@@ -293,7 +332,7 @@ pub async fn run_connect(connections: Vec<(String, ConnectionConfig)>) -> Result
         app.connect_focus = ConnectFocus::Picker;
         app.status = "j/k navigate  Enter connect  n new connection  q quit".to_owned();
     }
-    let result = run_loop(&mut terminal, &mut app).await;
+    let result = run_loop(&mut terminal, &mut app, rx).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -307,11 +346,21 @@ fn nav_hint() -> String {
 async fn run_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     app: &mut AppState,
+    mut rx: UnboundedReceiver<DbMessage>,
 ) -> Result<()> {
     loop {
         terminal.draw(|f| draw(f, app))?;
 
-        if !event::poll(Duration::from_millis(150))? {
+        // Drain any messages from background db tasks. try_recv is
+        // non-blocking, so this stays cooperative with the input poll
+        // below and we never stall the UI on a slow database.
+        while let Ok(msg) = rx.try_recv() {
+            apply_db_message(app, msg);
+        }
+
+        // Short poll keeps the UI responsive (~30 fps) while still letting
+        // the runtime schedule background tasks.
+        if !event::poll(Duration::from_millis(33))? {
             continue;
         }
         if let Event::Key(key) = event::read()? {
@@ -321,6 +370,78 @@ async fn run_loop(
         }
     }
     Ok(())
+}
+
+/// Apply the result of a background metadata fetch to `AppState`.
+/// Stale messages (for a table the user has navigated away from) are
+/// dropped so the UI never displays the wrong data.
+fn apply_db_message(app: &mut AppState, msg: DbMessage) {
+    app.pending = app.pending.saturating_sub(1);
+    match msg {
+        DbMessage::TableInfo {
+            schema,
+            table,
+            result,
+        } => {
+            if schema != app.current_schema || table != app.current_table {
+                return;
+            }
+            match result {
+                Ok(info) => {
+                    app.table_info = Some(info);
+                    app.detail_tab = DetailTab::Records;
+                    app.pane = BrowserPane::Detail;
+                }
+                Err(e) => {
+                    app.last_error = Some(e.clone());
+                    app.status = format!("error loading {table}: {e}");
+                }
+            }
+        }
+        DbMessage::Records {
+            schema,
+            table,
+            offset,
+            result,
+        } => {
+            if schema != app.current_schema
+                || table != app.current_table
+                || offset != app.record_offset
+            {
+                return;
+            }
+            match result {
+                Ok(out) => {
+                    let rows = out.rows.len();
+                    app.records = Some(out);
+                    app.record_row = 0;
+                    app.record_table_state.select(Some(0));
+                    app.status = format!(
+                        " {schema}.{table}  offset {offset}  {rows} rows  \
+                         j/k rows  [/] cols  y cell  Y row  l/h tabs"
+                    );
+                }
+                Err(e) => {
+                    app.last_error = Some(e.clone());
+                    app.status = format!("error loading rows: {e}");
+                }
+            }
+        }
+        DbMessage::Relationships { schema, result } => {
+            if schema != app.current_schema {
+                return;
+            }
+            match result {
+                Ok(rels) => {
+                    app.status = format!("ERD  schema: {schema}  {} relationship(s)", rels.len());
+                    app.relationships = rels;
+                }
+                Err(e) => {
+                    app.status = format!("ERD error: {e}");
+                }
+            }
+        }
+    }
 }
 
 async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
@@ -573,20 +694,8 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 && !app.current_schema.is_empty()
             {
                 let schema = app.current_schema.clone();
-                let pool = app.pool.as_ref().expect("connected pool when browsing");
-                match pool.fetch_relationships(&schema).await {
-                    Ok(rels) => {
-                        app.relationships = rels;
-                        app.status = format!(
-                            "ERD  schema: {}  {} relationship(s)",
-                            schema,
-                            app.relationships.len()
-                        );
-                    }
-                    Err(e) => {
-                        app.status = format!("ERD error: {e}");
-                    }
-                }
+                app.status = format!("Loading ERD for {schema}…");
+                spawn_relationships(app, schema);
             }
         }
         KeyCode::Char('h') | KeyCode::Left => {
@@ -602,7 +711,7 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                     app.record_offset += 50;
                     let s = app.current_schema.clone();
                     let t = app.current_table.clone();
-                    load_records_page(app, &s, &t).await;
+                    load_records_page(app, &s, &t);
                 }
             }
         }
@@ -614,7 +723,7 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 app.record_offset = app.record_offset.saturating_sub(50);
                 let s = app.current_schema.clone();
                 let t = app.current_table.clone();
-                load_records_page(app, &s, &t).await;
+                load_records_page(app, &s, &t);
             }
         }
         KeyCode::Char(']') if app.detail_tab == DetailTab::Records => {
@@ -657,43 +766,78 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 
 // ─── Data loaders ─────────────────────────────────────────────────────────────
 
+/// Kick off a non-blocking load of `(schema.table)`'s metadata and first
+/// records page. Marks the table as the active selection synchronously so
+/// the sidebar updates immediately, then spawns two background tasks that
+/// will deliver `TableInfo` and `Records` messages to the event loop.
 async fn load_table(app: &mut AppState, schema: &str, table: &str) {
-    let pool = app.pool.as_ref().expect("connected pool when browsing");
-    match pool.fetch_table_info(schema, table).await {
-        Ok(info) => {
-            app.table_info = Some(info);
-            app.detail_tab = DetailTab::Records;
-            app.pane = BrowserPane::Detail;
-            load_records_page(app, schema, table).await;
-        }
-        Err(e) => {
-            app.last_error = Some(e.to_string());
-            app.status = format!("error loading {table}: {e}");
-        }
-    }
+    app.current_schema = schema.to_owned();
+    app.current_table = table.to_owned();
+    app.record_offset = 0;
+    app.table_info = None;
+    app.records = None;
+    app.relationships.clear();
+    app.status = format!("Loading {schema}.{table}…");
+
+    spawn_table_info(app, schema.to_owned(), table.to_owned());
+    spawn_records(app, schema.to_owned(), table.to_owned(), 0);
 }
 
-async fn load_records_page(app: &mut AppState, schema: &str, table: &str) {
-    let pool = app.pool.as_ref().expect("connected pool when browsing");
-    match pool
-        .fetch_records(schema, table, 50, app.record_offset)
-        .await
-    {
-        Ok(out) => {
-            let rows = out.rows.len();
-            app.records = Some(out);
-            app.record_row = 0;
-            app.record_table_state.select(Some(0));
-            app.status = format!(
-                " {schema}.{table}  offset {off}  {rows} rows  \
-                 j/k rows  [/] cols  y cell  Y row  l/h tabs",
-                off = app.record_offset
-            );
-        }
-        Err(e) => {
-            app.status = format!("error loading records: {e}");
-        }
-    }
+/// Spawn a non-blocking re-fetch of the active table's records at the
+/// current `record_offset` (used after `n`/`p` paging key presses).
+fn load_records_page(app: &mut AppState, schema: &str, table: &str) {
+    spawn_records(app, schema.to_owned(), table.to_owned(), app.record_offset);
+}
+
+fn spawn_table_info(app: &mut AppState, schema: String, table: String) {
+    let (Some(pool), Some(tx)) = (app.pool.clone(), app.tx.clone()) else {
+        return;
+    };
+    app.pending += 1;
+    tokio::spawn(async move {
+        let result = pool
+            .fetch_table_info(&schema, &table)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(DbMessage::TableInfo {
+            schema,
+            table,
+            result,
+        });
+    });
+}
+
+fn spawn_records(app: &mut AppState, schema: String, table: String, offset: usize) {
+    let (Some(pool), Some(tx)) = (app.pool.clone(), app.tx.clone()) else {
+        return;
+    };
+    app.pending += 1;
+    tokio::spawn(async move {
+        let result = pool
+            .fetch_records(&schema, &table, 50, offset)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(DbMessage::Records {
+            schema,
+            table,
+            offset,
+            result,
+        });
+    });
+}
+
+fn spawn_relationships(app: &mut AppState, schema: String) {
+    let (Some(pool), Some(tx)) = (app.pool.clone(), app.tx.clone()) else {
+        return;
+    };
+    app.pending += 1;
+    tokio::spawn(async move {
+        let result = pool
+            .fetch_relationships(&schema)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(DbMessage::Relationships { schema, result });
+    });
 }
 
 // ─── Draw root ────────────────────────────────────────────────────────────────
