@@ -199,6 +199,14 @@ struct AppState {
     record_table_state: TableState,
     relationships: Vec<RelationshipEdge>,
     editor: String,
+    /// Byte index of the cursor within `editor`. Always sits on a UTF-8
+    /// char boundary.
+    editor_cursor: usize,
+    /// Last 50 successfully-submitted queries, newest last.
+    history: Vec<String>,
+    /// Index into `history` while the user is browsing it with
+    /// Ctrl+P/Ctrl+N. `None` means the editor holds a fresh draft.
+    history_idx: Option<usize>,
     status: String,
     last_error: Option<String>,
     /// Channel used by spawned db tasks to send results back to the event
@@ -241,6 +249,9 @@ impl AppState {
             record_table_state: ts,
             relationships: Vec::new(),
             editor: String::new(),
+            editor_cursor: 0,
+            history: Vec::new(),
+            history_idx: None,
             status: "Loading database overview…".to_owned(),
             last_error: None,
             tx: None,
@@ -564,36 +575,214 @@ async fn handle_editor_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
             app.status = nav_hint();
         }
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-            app.last_error = None;
-            app.status = "executing…".to_owned();
-            let doc = SqlDocument::new(app.editor.clone());
-            let pool = app.pool.as_ref().expect("connected pool in editor mode");
-            match pool.execute_script(&doc).await {
-                Ok(out) => {
-                    if let Some(first) = out.statements.into_iter().next() {
-                        let rows = first.rows.len();
-                        app.records = Some(first);
-                        app.record_row = 0;
-                        app.record_col = 0;
-                        app.record_table_state.select(Some(0));
-                        app.status = format!("{rows} rows  Esc → browser");
-                    }
-                }
-                Err(e) => {
-                    app.last_error = Some(e.to_string());
-                    app.status = format!("error: {e}");
-                }
-            }
+            run_editor_query(app).await;
         }
-        (KeyCode::Backspace, _) => {
-            app.editor.pop();
+        // History recall (Ctrl+P / Ctrl+N). Up/Down stay free for line
+        // navigation within multi-line queries.
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => history_prev(app),
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => history_next(app),
+        // Cursor movement
+        (KeyCode::Left, _) => {
+            app.editor_cursor = prev_char_boundary(&app.editor, app.editor_cursor);
         }
-        (KeyCode::Enter, _) => app.editor.push('\n'),
-        (KeyCode::Tab, _) => app.editor.push_str("    "),
-        (KeyCode::Char(ch), _) => app.editor.push(ch),
+        (KeyCode::Right, _) => {
+            app.editor_cursor = next_char_boundary(&app.editor, app.editor_cursor);
+        }
+        (KeyCode::Up, _) => {
+            app.editor_cursor = move_cursor_vertical(&app.editor, app.editor_cursor, -1);
+        }
+        (KeyCode::Down, _) => {
+            app.editor_cursor = move_cursor_vertical(&app.editor, app.editor_cursor, 1);
+        }
+        (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+            app.editor_cursor = line_start(&app.editor, app.editor_cursor);
+        }
+        (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+            app.editor_cursor = line_end(&app.editor, app.editor_cursor);
+        }
+        // Edits
+        (KeyCode::Backspace, _) if app.editor_cursor > 0 => {
+            let prev = prev_char_boundary(&app.editor, app.editor_cursor);
+            app.editor.replace_range(prev..app.editor_cursor, "");
+            app.editor_cursor = prev;
+            app.history_idx = None;
+        }
+        (KeyCode::Delete, _) if app.editor_cursor < app.editor.len() => {
+            let next = next_char_boundary(&app.editor, app.editor_cursor);
+            app.editor.replace_range(app.editor_cursor..next, "");
+            app.history_idx = None;
+        }
+        (KeyCode::Enter, _) => editor_insert_str(app, "\n"),
+        (KeyCode::Tab, _) => editor_insert_str(app, "    "),
+        (KeyCode::Char(ch), m) if !m.contains(KeyModifiers::CONTROL) => {
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            editor_insert_str(app, s);
+        }
         _ => {}
     }
     Ok(false)
+}
+
+async fn run_editor_query(app: &mut AppState) {
+    if app.editor.trim().is_empty() {
+        return;
+    }
+    app.last_error = None;
+    app.status = "executing…".to_owned();
+    let doc = SqlDocument::new(app.editor.clone());
+    let pool = app.pool.as_ref().expect("connected pool in editor mode");
+    match pool.execute_script(&doc).await {
+        Ok(out) => {
+            if let Some(first) = out.statements.into_iter().next() {
+                let rows = first.rows.len();
+                app.records = Some(first);
+                app.record_row = 0;
+                app.record_col = 0;
+                app.record_table_state.select(Some(0));
+                app.status = format!("{rows} rows  Esc → browser");
+            }
+            push_history(app);
+        }
+        Err(e) => {
+            app.last_error = Some(e.to_string());
+            app.status = format!("error: {e}");
+        }
+    }
+}
+
+fn editor_insert_str(app: &mut AppState, s: &str) {
+    app.editor.insert_str(app.editor_cursor, s);
+    app.editor_cursor += s.len();
+    app.history_idx = None;
+}
+
+fn push_history(app: &mut AppState) {
+    let trimmed = app.editor.trim().to_owned();
+    if trimmed.is_empty() {
+        return;
+    }
+    // De-duplicate adjacent: don't store the same query twice in a row.
+    if app.history.last().map(String::as_str) == Some(trimmed.as_str()) {
+        return;
+    }
+    app.history.push(trimmed);
+    const MAX_HISTORY: usize = 50;
+    if app.history.len() > MAX_HISTORY {
+        let drop = app.history.len() - MAX_HISTORY;
+        app.history.drain(..drop);
+    }
+    app.history_idx = None;
+}
+
+fn history_prev(app: &mut AppState) {
+    if app.history.is_empty() {
+        return;
+    }
+    let next = match app.history_idx {
+        None => app.history.len() - 1,
+        Some(0) => 0,
+        Some(i) => i - 1,
+    };
+    app.editor = app.history[next].clone();
+    app.editor_cursor = app.editor.len();
+    app.history_idx = Some(next);
+    app.status = format!("history {}/{}", next + 1, app.history.len());
+}
+
+fn history_next(app: &mut AppState) {
+    let Some(idx) = app.history_idx else {
+        return;
+    };
+    if idx + 1 >= app.history.len() {
+        // Step past the newest entry → blank draft.
+        app.editor.clear();
+        app.editor_cursor = 0;
+        app.history_idx = None;
+        app.status = "history: new draft".to_owned();
+    } else {
+        let next = idx + 1;
+        app.editor = app.history[next].clone();
+        app.editor_cursor = app.editor.len();
+        app.history_idx = Some(next);
+        app.status = format!("history {}/{}", next + 1, app.history.len());
+    }
+}
+
+// ─── Editor cursor helpers ────────────────────────────────────────────────────
+
+fn prev_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx == 0 {
+        return 0;
+    }
+    idx -= 1;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn next_char_boundary(s: &str, mut idx: usize) -> usize {
+    let len = s.len();
+    if idx >= len {
+        return len;
+    }
+    idx += 1;
+    while idx < len && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+fn line_start(s: &str, idx: usize) -> usize {
+    s[..idx].rfind('\n').map_or(0, |p| p + 1)
+}
+
+fn line_end(s: &str, idx: usize) -> usize {
+    s[idx..].find('\n').map_or(s.len(), |p| idx + p)
+}
+
+/// Compute (line, column-in-chars) for a byte index.
+fn line_col(s: &str, idx: usize) -> (usize, usize) {
+    let prefix = &s[..idx];
+    let line = prefix.bytes().filter(|b| *b == b'\n').count();
+    let col = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, after)| after)
+        .chars()
+        .count();
+    (line, col)
+}
+
+/// Move cursor up (delta = -1) or down (delta = 1) one line, preserving
+/// the visual column where possible.
+fn move_cursor_vertical(s: &str, idx: usize, delta: isize) -> usize {
+    let (line, col) = line_col(s, idx);
+    let target_line = match delta {
+        d if d < 0 && line == 0 => return idx,
+        d if d < 0 => line - 1,
+        _ => line + 1,
+    };
+    let lines: Vec<&str> = s.split('\n').collect();
+    if target_line >= lines.len() {
+        return idx;
+    }
+    // Build byte offset of target_line's start.
+    let mut offset = 0usize;
+    for line_text in lines.iter().take(target_line) {
+        offset += line_text.len() + 1; // +1 for the '\n'
+    }
+    let target = lines[target_line];
+    // Walk char-by-char on the target line up to `col` chars.
+    let mut byte = 0usize;
+    for (i, ch) in target.char_indices() {
+        let chars_so_far = target[..i].chars().count();
+        if chars_so_far >= col {
+            return offset + i;
+        }
+        byte = i + ch.len_utf8();
+    }
+    offset + byte
 }
 
 async fn handle_browser_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
@@ -1647,6 +1836,16 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
+    let title = if app.history.is_empty() {
+        "  SQL Editor   Ctrl+R run  Esc browser  ".to_owned()
+    } else {
+        format!(
+            "  SQL Editor   Ctrl+R run  Ctrl+P/N history ({})  Esc browser  ",
+            app.history.len()
+        )
+    };
+
+    let editor_area = layout[0];
     f.render_widget(
         Paragraph::new(app.editor.as_str())
             .style(Style::default().fg(th.fg).bg(th.bg))
@@ -1654,7 +1853,7 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             .block(
                 Block::default()
                     .title(Span::styled(
-                        "  SQL Editor   Ctrl+R run  Esc browser  ",
+                        title,
                         Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                     ))
                     .borders(Borders::ALL)
@@ -1662,8 +1861,24 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                     .border_style(Style::default().fg(th.active_border))
                     .style(Style::default().bg(th.bg)),
             ),
-        layout[0],
+        editor_area,
     );
+
+    // Position the terminal's hardware cursor inside the editor pane so the
+    // user can see exactly where edits will land. Coordinates are computed
+    // from the (line, column) of `editor_cursor`. Note this ignores soft-wrap
+    // so very long lines may push the cursor off the visible width; that's a
+    // known limitation deferred to future work.
+    let inner = Rect {
+        x: editor_area.x + 1,
+        y: editor_area.y + 1,
+        width: editor_area.width.saturating_sub(2),
+        height: editor_area.height.saturating_sub(2),
+    };
+    let (line, col) = line_col(&app.editor, app.editor_cursor);
+    let cx = inner.x + (col as u16).min(inner.width.saturating_sub(1));
+    let cy = inner.y + (line as u16).min(inner.height.saturating_sub(1));
+    f.set_cursor_position((cx, cy));
 
     // Results from editor queries
     let result_text: String = if let Some(rec) = &app.records {
@@ -1740,7 +1955,10 @@ fn restore_terminal(
 
 #[cfg(test)]
 mod tests {
-    use super::{Theme, ALL_TABS};
+    use super::{
+        line_col, line_end, line_start, move_cursor_vertical, next_char_boundary,
+        prev_char_boundary, Theme, ALL_TABS,
+    };
 
     #[test]
     fn catppuccin_mocha_name() {
@@ -1760,5 +1978,60 @@ mod tests {
         for tab in ALL_TABS {
             assert!(!tab.label().is_empty());
         }
+    }
+
+    #[test]
+    fn char_boundary_walks_skip_utf8_continuation_bytes() {
+        // "ñ" is 2 bytes; cursor at 0 → next at 2, then prev → 0.
+        let s = "ñ";
+        assert_eq!(next_char_boundary(s, 0), 2);
+        assert_eq!(prev_char_boundary(s, 2), 0);
+        assert_eq!(prev_char_boundary("", 0), 0);
+        assert_eq!(next_char_boundary("", 0), 0);
+    }
+
+    #[test]
+    fn line_start_and_line_end_handle_multiline() {
+        let s = "select 1;\nselect 2;\nselect 3;";
+        // Cursor in the middle of line 1 (0-indexed)
+        let mid = 14;
+        assert_eq!(line_start(s, mid), 10, "line 1 starts after first newline");
+        assert_eq!(line_end(s, mid), 19, "line 1 ends at second newline");
+        // Beginning of buffer: line_start = 0
+        assert_eq!(line_start(s, 3), 0);
+        // Last line has no trailing newline: line_end is buffer length
+        assert_eq!(line_end(s, 25), s.len());
+    }
+
+    #[test]
+    fn line_col_counts_lines_and_columns() {
+        let s = "abc\ndé\nxyz";
+        // After 'b' on line 0 → (0, 1)
+        assert_eq!(line_col(s, 1), (0, 1));
+        // After 'é' on line 1: 'd' at byte 4, 'é' is 2 bytes ending at 7 → (1, 2)
+        assert_eq!(line_col(s, 7), (1, 2));
+        // Empty buffer
+        assert_eq!(line_col("", 0), (0, 0));
+    }
+
+    #[test]
+    fn vertical_cursor_preserves_column() {
+        let s = "abcdef\n12\nXYZ";
+        // From column 4 of line 0 (after 'd'): byte idx 4
+        // Down → line 1 has only 2 chars, so we land at end of "12" (byte 9).
+        assert_eq!(move_cursor_vertical(s, 4, 1), 9);
+        // Up from start does nothing
+        assert_eq!(move_cursor_vertical(s, 2, -1), 2);
+        // Down from last line does nothing
+        assert_eq!(move_cursor_vertical(s, s.len(), 1), s.len());
+    }
+
+    #[test]
+    fn vertical_cursor_round_trip() {
+        let s = "alpha\nbeta\ngamma";
+        // line 0, col 3 → byte 3
+        let down = move_cursor_vertical(s, 3, 1);
+        // back up should land on column 3 of line 0
+        assert_eq!(move_cursor_vertical(s, down, -1), 3);
     }
 }
