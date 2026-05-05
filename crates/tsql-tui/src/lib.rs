@@ -17,10 +17,7 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use tsql_core::{ConnectionConfig, DriverKind};
-use tsql_db::{
-    execute_script, fetch_overview, fetch_records, fetch_relationships, fetch_table_info,
-    DatabaseOverview, RelationshipEdge, StatementOutput, TableInfo,
-};
+use tsql_db::{DatabaseOverview, Pool, RelationshipEdge, StatementOutput, TableInfo};
 use tsql_sql::SqlDocument;
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -152,6 +149,7 @@ impl SidebarEntry {
 struct AppState {
     driver: DriverKind,
     url: String,
+    pool: Option<Pool>,
     saved_connections: Vec<(String, ConnectionConfig)>,
     connect_idx: usize,
     connect_focus: ConnectFocus,
@@ -188,6 +186,7 @@ impl AppState {
             driver,
             connect_input: url.clone(),
             url,
+            pool: None,
             saved_connections: Vec::new(),
             connect_idx: 0,
             connect_focus: ConnectFocus::Picker,
@@ -264,7 +263,7 @@ pub async fn run(driver: DriverKind, url: String) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = AppState::new(driver, url);
 
-    match fetch_overview(app.driver, &app.url).await {
+    match open_pool_and_overview(&mut app).await {
         Ok(ov) => {
             rebuild_sidebar(&mut app, &ov);
             app.overview = Some(ov);
@@ -414,7 +413,7 @@ async fn try_connect(app: &mut AppState, url: String) {
     app.url = url;
     app.last_error = None;
     app.status = format!("Connecting to {}…", app.url);
-    match fetch_overview(app.driver, &app.url).await {
+    match open_pool_and_overview(app).await {
         Ok(ov) => {
             rebuild_sidebar(app, &ov);
             app.overview = Some(ov);
@@ -428,6 +427,15 @@ async fn try_connect(app: &mut AppState, url: String) {
     }
 }
 
+/// Open a fresh `Pool` for the active driver/url and load the schema overview.
+/// The pool is stored on `app.pool` so subsequent metadata calls reuse it.
+async fn open_pool_and_overview(app: &mut AppState) -> Result<DatabaseOverview, tsql_db::DbError> {
+    let pool = Pool::connect(app.driver, &app.url).await?;
+    let overview = pool.fetch_overview().await?;
+    app.pool = Some(pool);
+    Ok(overview)
+}
+
 async fn handle_editor_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => {
@@ -438,7 +446,8 @@ async fn handle_editor_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
             app.last_error = None;
             app.status = "executing…".to_owned();
             let doc = SqlDocument::new(app.editor.clone());
-            match execute_script(app.driver, &app.url, &doc).await {
+            let pool = app.pool.as_ref().expect("connected pool in editor mode");
+            match pool.execute_script(&doc).await {
                 Ok(out) => {
                     if let Some(first) = out.statements.into_iter().next() {
                         let rows = first.rows.len();
@@ -564,7 +573,8 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 && !app.current_schema.is_empty()
             {
                 let schema = app.current_schema.clone();
-                match fetch_relationships(app.driver, &app.url, &schema).await {
+                let pool = app.pool.as_ref().expect("connected pool when browsing");
+                match pool.fetch_relationships(&schema).await {
                     Ok(rels) => {
                         app.relationships = rels;
                         app.status = format!(
@@ -648,7 +658,8 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 // ─── Data loaders ─────────────────────────────────────────────────────────────
 
 async fn load_table(app: &mut AppState, schema: &str, table: &str) {
-    match fetch_table_info(app.driver, &app.url, schema, table).await {
+    let pool = app.pool.as_ref().expect("connected pool when browsing");
+    match pool.fetch_table_info(schema, table).await {
         Ok(info) => {
             app.table_info = Some(info);
             app.detail_tab = DetailTab::Records;
@@ -663,7 +674,11 @@ async fn load_table(app: &mut AppState, schema: &str, table: &str) {
 }
 
 async fn load_records_page(app: &mut AppState, schema: &str, table: &str) {
-    match fetch_records(app.driver, &app.url, schema, table, 50, app.record_offset).await {
+    let pool = app.pool.as_ref().expect("connected pool when browsing");
+    match pool
+        .fetch_records(schema, table, 50, app.record_offset)
+        .await
+    {
         Ok(out) => {
             let rows = out.rows.len();
             app.records = Some(out);
