@@ -383,6 +383,9 @@ async fn fetch_postgres_table_info(
             ccu.table_name AS foreign_table_name,
             ccu.column_name AS foreign_column_name,
             tc.constraint_name
+        FROM ,
+            ccu.column_name AS foreign_column_name,
+            tc.constraint_name
         FROM 
             information_schema.table_constraints AS tc 
             JOIN information_schema.key_column_usage AS kcu
@@ -485,7 +488,7 @@ pub async fn fetch_relationships(
 }
 
 async fn execute_postgres(url: &str, statements: &[String]) -> Result<QueryOutput, DbError> {
-    let pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
+    let pool = postgres_pool(url).await?;
     let mut output = Vec::with_capacity(statements.len());
 
     for statement in statements {

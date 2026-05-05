@@ -18,6 +18,7 @@ fn tmp_db_url() -> (String, String) {
 
 #[tokio::test]
 async fn executes_sqlite_script() {
+    let db = TempDb::new("exec");
     let document = SqlDocument::new(
         r#"
         create table users(id integer primary key, name text not null);
@@ -26,7 +27,7 @@ async fn executes_sqlite_script() {
         "#,
     );
 
-    let output = execute_script(DriverKind::Sqlite, "sqlite::memory:", &document)
+    let output = execute_script(DriverKind::Sqlite, &db.url, &document)
         .await
         .expect("sqlite script executes");
 
