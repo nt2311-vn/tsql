@@ -6,11 +6,11 @@ Just run `tsql` to launch the TUI — it auto-loads saved connections from `~/.c
 
 ## Features
 
-- **Connection picker** — saved connections from config, or paste a new URL to connect instantly.
-- **Database browser** — schemas, tables, and 6 detail tabs: Records, Columns, Indexes, Keys, Constraints, ERD.
+- **Connection picker** — saved connections from config; paste a new URL to connect, then name it to persist back to `~/.config/tsql/config.toml` automatically.
+- **Database browser** — schemas, tables, and 6 detail tabs: Records, Columns, Indexes, Keys, Constraints, ERD. Jump tabs with `1`-`6`, close the active table with `Shift+X`.
 - **Vim navigation** — `j/k` up/down, `l/Enter` drill in, `h` back, `g/G` top/bottom, `Tab` switch panes.
-- **SQL editor** — `e` or `i` to open, paste multi-line SQL, `Ctrl+R` to execute.
-- **Records viewer** — paginated (50 rows), `y` yank cell, `Y` yank row, `[/]` scroll columns.
+- **SQL editor** — `e` or `i` to open. Line-number gutter, basic syntax highlighting, current-statement highlight, `Ctrl+R` runs all, `Ctrl+Enter` runs only the statement under the cursor, `Ctrl+S` / `:w [path]` save, `:e <path>` open. Per-connection on-disk history, recalled with `Ctrl+P`/`Ctrl+N`.
+- **Records viewer** — paginated (50 rows), zebra-striped grid with vertical column separators, `y` yank cell, `Y` yank row, `[/]` scroll columns.
 - **ERD view** — schema-scoped FK relationship tree.
 - **Catppuccin Mocha** — dark theme with PK/FK column coloring, NULL dimming, active highlights.
 - **XDG config** — auto-loads `~/.config/tsql/config.toml` with `${ENV_VAR}` expansion for secrets.
@@ -48,6 +48,11 @@ url = "sqlite:./dev.db"
 
 Use environment variables for secrets. Never commit database passwords.
 
+When you connect via `n new connection`, tsql prompts you for a friendly
+name and appends a `[connections.<name>]` block to the same file so the
+URL is saved for next time. The writer appends raw text — existing
+`${ENV_VAR}` placeholders, comments, and ordering are preserved.
+
 ## CLI Commands
 
 ```sh
@@ -80,10 +85,16 @@ tsql config check --config examples/tsql.toml
 | **Browser** | `h` | Collapse / go back |
 | **Browser** | `Tab` | Switch sidebar ↔ detail pane |
 | **Browser** | `l/h` (detail) | Cycle detail tabs |
+| **Browser** | `1`-`6` | Jump straight to a detail tab |
+| **Browser** | `Shift+X` | Close the active table |
 | **Browser** | `e` or `i` | Open SQL editor |
 | **Browser** | `y` | Yank cell value |
 | **Browser** | `Y` | Yank entire row (TSV) |
-| **Editor** | `Ctrl+R` | Execute SQL |
+| **Browser** | `:` | Open command palette (`:select`, `:w`, `:e`, `:help`, `:q`, …) |
+| **Editor** | `Ctrl+R` | Run all statements |
+| **Editor** | `Ctrl+Enter` | Run statement under cursor (also `Alt+Enter`) |
+| **Editor** | `Ctrl+S` | Save buffer to its file (set via `:w <path>`) |
+| **Editor** | `Ctrl+P` / `Ctrl+N` | Browse persistent history |
 | **Editor** | `Esc` | Back to browser |
 
 ## Development

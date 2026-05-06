@@ -1,6 +1,10 @@
 use std::collections::HashSet;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::time::Duration;
+
+mod editor;
+use editor::{append_history, highlight_line, history_path, load_history, statement_range_at};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -17,7 +21,7 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tsql_core::{ConnectionConfig, DriverKind};
+use tsql_core::{append_connection, default_config_path, ConnectionConfig, DriverKind};
 use tsql_db::{DatabaseOverview, Pool, RelationshipEdge, StatementOutput, TableInfo};
 use tsql_sql::SqlDocument;
 
@@ -64,6 +68,9 @@ pub struct Theme {
     pub sel_fg: Color,
     pub border: Color,
     pub active_border: Color,
+    /// Alternating row background for the records grid (zebra striping).
+    /// Sits between `bg` and `sel_bg` in lightness.
+    pub row_alt_bg: Color,
 }
 
 impl Theme {
@@ -83,6 +90,7 @@ impl Theme {
             sel_fg: Color::Rgb(205, 214, 244),
             border: Color::Rgb(69, 71, 90),
             active_border: Color::Rgb(137, 180, 250),
+            row_alt_bg: Color::Rgb(36, 36, 56),
         }
     }
 }
@@ -100,6 +108,10 @@ enum AppMode {
 enum ConnectFocus {
     Picker,
     NewUrl,
+    /// Prompt for a friendly name after a successful new-URL connect, so
+    /// the connection can be persisted to `~/.config/tsql/config.toml`.
+    /// Empty input + Enter (or Esc) skips saving.
+    NameNew,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +193,12 @@ struct AppState {
     connect_idx: usize,
     connect_focus: ConnectFocus,
     connect_input: String,
+    /// URL of the just-connected ad-hoc session, held while we prompt the
+    /// user for a name to persist it under. `None` outside the name flow.
+    pending_save: Option<(DriverKind, String)>,
+    /// Override for the config file path (test hook). When `None` we use
+    /// `tsql_core::default_config_path()`.
+    config_path_override: Option<PathBuf>,
     theme: Theme,
     mode: AppMode,
     pane: BrowserPane,
@@ -205,7 +223,14 @@ struct AppState {
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
     editor_cursor: usize,
-    /// Last 50 successfully-submitted queries, newest last.
+    /// Optional file backing the editor buffer (`Ctrl+S` writes here,
+    /// `:w <path>` retargets it). `None` means in-memory only.
+    editor_path: Option<PathBuf>,
+    /// On-disk history file path for the active connection. Computed
+    /// after a successful connect so each saved connection (and
+    /// hash-named ad-hoc URL) gets its own history.
+    history_path: Option<PathBuf>,
+    /// Last `MAX_HISTORY` successfully-submitted queries, newest last.
     history: Vec<String>,
     /// Index into `history` while the user is browsing it with
     /// Ctrl+P/Ctrl+N. `None` means the editor holds a fresh draft.
@@ -238,6 +263,8 @@ impl AppState {
             saved_connections: Vec::new(),
             connect_idx: 0,
             connect_focus: ConnectFocus::Picker,
+            pending_save: None,
+            config_path_override: None,
             theme: Theme::catppuccin_mocha(),
             mode: AppMode::Browser,
             pane: BrowserPane::Sidebar,
@@ -258,6 +285,8 @@ impl AppState {
             erd_selected: 0,
             editor: String::new(),
             editor_cursor: 0,
+            editor_path: None,
+            history_path: None,
             history: Vec::new(),
             history_idx: None,
             status: "Loading database overview…".to_owned(),
@@ -324,6 +353,7 @@ pub async fn run(driver: DriverKind, url: String) -> Result<()> {
         Ok(ov) => {
             rebuild_sidebar(&mut app, &ov);
             app.overview = Some(ov);
+            wire_history(&mut app).await;
             app.status = nav_hint();
         }
         Err(e) => {
@@ -358,7 +388,7 @@ pub async fn run_connect(connections: Vec<(String, ConnectionConfig)>) -> Result
 }
 
 fn nav_hint() -> String {
-    "j/k navigate  l/Enter expand  h collapse  Tab pane  e editor  q quit".to_owned()
+    "j/k nav  l/Enter expand  h collapse  Tab pane  1-6 tabs  X close  e editor  q quit".to_owned()
 }
 
 // ─── Event loop ───────────────────────────────────────────────────────────────
@@ -480,14 +510,18 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 
     // The command palette steals all input while open.
     if app.command_input.is_some() {
-        return handle_command_key(app, key);
+        return handle_command_key(app, key).await;
     }
 
     match (key.code, key.modifiers) {
         // q quits from any non-text-entry mode
         (KeyCode::Char('q'), KeyModifiers::NONE)
             if app.mode != AppMode::Editor
-                && !(app.mode == AppMode::Connect && app.connect_focus == ConnectFocus::NewUrl) =>
+                && !(app.mode == AppMode::Connect
+                    && matches!(
+                        app.connect_focus,
+                        ConnectFocus::NewUrl | ConnectFocus::NameNew
+                    )) =>
         {
             return Ok(true);
         }
@@ -510,7 +544,7 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 
 /// Handle key input while the `:` command palette is open. Returns
 /// `Ok(true)` only on `:q`/`:quit` to terminate the program.
-fn handle_command_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+async fn handle_command_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     let buf = app
         .command_input
         .as_mut()
@@ -529,7 +563,7 @@ fn handle_command_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         (KeyCode::Enter, _) => {
             let cmd = buf.trim().to_owned();
             app.command_input = None;
-            return run_command(app, &cmd);
+            return run_command(app, &cmd).await;
         }
         (KeyCode::Char(ch), m) if !m.contains(KeyModifiers::CONTROL) => {
             buf.push(ch);
@@ -541,14 +575,15 @@ fn handle_command_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 
 /// Execute a command typed into the `:` palette. Unknown commands set
 /// `last_error` and stay in Browser mode.
-fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
+async fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
     let cmd = command.trim();
-    let (head, _rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+    let (head, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+    let rest = rest.trim();
     match head {
         "" => {}
         "q" | "quit" => return Ok(true),
-        "select" | "s" => prefill_editor_with_select(app),
-        "insert" | "i" => prefill_editor_with_insert(app),
+        "select" => prefill_editor_with_select(app),
+        "insert" => prefill_editor_with_insert(app),
         "describe" | "desc" | "cols" | "columns" => switch_detail_tab(app, DetailTab::Columns),
         "indexes" | "idx" => switch_detail_tab(app, DetailTab::Indexes),
         "keys" => switch_detail_tab(app, DetailTab::Keys),
@@ -560,9 +595,26 @@ fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
                 spawn_relationships(app, schema);
             }
         }
+        // File IO
+        "w" | "write" | "save" => {
+            let target = if rest.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(rest))
+            };
+            save_editor_buffer(app, target).await;
+        }
+        "e" | "edit" | "open" => {
+            if rest.is_empty() {
+                app.last_error = Some("usage: :e <path>".to_owned());
+                app.status = ":e needs a path".to_owned();
+            } else {
+                open_editor_buffer(app, PathBuf::from(rest)).await;
+            }
+        }
         "help" | "h" | "?" => {
-            app.status = ":select :insert :describe :indexes :keys \
-                          :constraints :erd :help :q"
+            app.status = ":select :insert :describe :indexes :keys :constraints :erd \
+                          :w [path] :e <path> :help :q"
                 .to_owned();
         }
         other => {
@@ -571,6 +623,29 @@ fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+fn editor_hint() -> String {
+    "Ctrl+R run all  Ctrl+Enter run current  Ctrl+S save  Ctrl+O open  \
+     Ctrl+P/N history  Esc browser"
+        .to_owned()
+}
+
+/// Clear the active table selection so the detail pane returns to its
+/// empty placeholder. Triggered by Shift+X in Browser mode.
+fn close_current_table(app: &mut AppState) {
+    app.current_table.clear();
+    app.table_info = None;
+    app.records = None;
+    app.relationships.clear();
+    app.record_offset = 0;
+    app.record_row = 0;
+    app.record_col = 0;
+    app.record_table_state.select(Some(0));
+    app.pane = BrowserPane::Sidebar;
+    app.detail_tab = DetailTab::Records;
+    app.last_error = None;
+    app.status = "table closed — pick another from the sidebar".to_owned();
 }
 
 fn switch_detail_tab(app: &mut AppState, tab: DetailTab) {
@@ -638,6 +713,7 @@ async fn handle_connect_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     match app.connect_focus {
         ConnectFocus::Picker => handle_picker_key(app, key).await,
         ConnectFocus::NewUrl => handle_new_url_key(app, key).await,
+        ConnectFocus::NameNew => handle_name_new_key(app, key).await,
     }
 }
 
@@ -701,6 +777,7 @@ async fn handle_new_url_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 }
 
 async fn try_connect(app: &mut AppState, url: String) {
+    let was_new_url = app.mode == AppMode::Connect && app.connect_focus == ConnectFocus::NewUrl;
     app.url = url;
     app.last_error = None;
     app.status = format!("Connecting to {}…", app.url);
@@ -708,14 +785,129 @@ async fn try_connect(app: &mut AppState, url: String) {
         Ok(ov) => {
             rebuild_sidebar(app, &ov);
             app.overview = Some(ov);
-            app.mode = AppMode::Browser;
-            app.status = nav_hint();
+            // Wire up per-connection history. Saved-picker entries use
+            // their config name; ad-hoc URLs fall back to a hashed label
+            // until the user names them via NameNew.
+            wire_history(app).await;
+            // Ad-hoc URLs trigger a save prompt before dropping into the
+            // browser. Saved-picker entries skip the prompt.
+            if was_new_url {
+                app.pending_save = Some((app.driver, app.url.clone()));
+                app.connect_focus = ConnectFocus::NameNew;
+                app.connect_input.clear();
+                app.status = "Name this connection (Enter save, Esc skip)".to_owned();
+            } else {
+                app.mode = AppMode::Browser;
+                app.status = nav_hint();
+            }
         }
         Err(e) => {
             app.last_error = Some(e.to_string());
             app.status = format!("Connection failed: {e}");
         }
     }
+}
+
+/// Handle the post-connect 'name this connection' prompt. Enter with a
+/// non-empty buffer persists to disk; Enter empty or Esc skips. Either
+/// way we transition to Browser mode afterwards.
+async fn handle_name_new_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => finish_save_prompt(app, None).await,
+        KeyCode::Enter => {
+            let name = app.connect_input.trim().to_owned();
+            let chosen = if name.is_empty() { None } else { Some(name) };
+            finish_save_prompt(app, chosen).await;
+        }
+        KeyCode::Backspace => {
+            app.connect_input.pop();
+        }
+        KeyCode::Char(ch) if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' => {
+            // Restrict to TOML-safe key chars so the user can't type a
+            // name we'll have to reject on save.
+            app.connect_input.push(ch);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+async fn finish_save_prompt(app: &mut AppState, name: Option<String>) {
+    if let (Some(name), Some((driver, url))) = (name, app.pending_save.clone()) {
+        let unique = unique_connection_name(&name, &app.saved_connections);
+        let path = app
+            .config_path_override
+            .clone()
+            .unwrap_or_else(default_config_path);
+        let connection = ConnectionConfig {
+            driver,
+            url: url.clone(),
+        };
+        match append_connection(&path, &unique, &connection).await {
+            Ok(()) => {
+                app.saved_connections.push((unique.clone(), connection));
+                app.saved_connections.sort_by(|a, b| a.0.cmp(&b.0));
+                app.status = format!("saved connection '{unique}' to {}", path.display());
+            }
+            Err(e) => {
+                app.last_error = Some(format!("could not save connection: {e}"));
+                app.status = format!("save failed: {e}");
+            }
+        }
+    } else {
+        app.status = nav_hint();
+    }
+    app.pending_save = None;
+    app.connect_input.clear();
+    app.connect_focus = ConnectFocus::Picker;
+    app.mode = AppMode::Browser;
+}
+
+/// If `desired` is already taken in the saved list, append `-2`, `-3`, …
+/// until we land on a free key. The saved list is the source of truth
+/// for in-memory state; the on-disk file may have additional entries
+/// (created by other tsql sessions), but that's a corner case we accept.
+fn unique_connection_name(desired: &str, saved: &[(String, ConnectionConfig)]) -> String {
+    let taken: std::collections::HashSet<&str> = saved.iter().map(|(n, _)| n.as_str()).collect();
+    if !taken.contains(desired) {
+        return desired.to_owned();
+    }
+    for i in 2.. {
+        let candidate = format!("{desired}-{i}");
+        if !taken.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!("infinite range exhausted")
+}
+
+/// Compute and load the on-disk history for the active connection. The
+/// label is the saved-config name when the URL matches a known entry,
+/// or a short hex hash of the URL otherwise. Entries are loaded into
+/// `app.history` and capped at `MAX_HISTORY`.
+async fn wire_history(app: &mut AppState) {
+    let label = app
+        .saved_connections
+        .iter()
+        .find(|(_, c)| c.url == app.url)
+        .map(|(name, _)| name.clone())
+        .unwrap_or_else(|| short_hash(&app.url));
+    let path = history_path(&label);
+    let loaded = load_history(&path, MAX_HISTORY).await;
+    app.history = loaded;
+    app.history_idx = None;
+    app.history_path = Some(path);
+}
+
+/// 12-hex-char FNV-1a hash. Stable, deterministic, and never collides
+/// with a saved-config name (which is restricted to alphanumerics).
+fn short_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("url_{:012x}", h & 0x0000_ffff_ffff_ffff)
 }
 
 /// Open a fresh `Pool` for the active driver/url and load the schema overview.
@@ -734,7 +926,16 @@ async fn handle_editor_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
             app.status = nav_hint();
         }
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-            run_editor_query(app).await;
+            run_editor_query(app, RunScope::All).await;
+        }
+        // Ctrl+Enter (and Alt+Enter as a fallback for terminals that
+        // don't deliver Ctrl+Enter distinctly) runs only the statement
+        // under the cursor.
+        (KeyCode::Enter, KeyModifiers::CONTROL) | (KeyCode::Enter, KeyModifiers::ALT) => {
+            run_editor_query(app, RunScope::Current).await;
+        }
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+            save_editor_buffer(app, None).await;
         }
         // History recall (Ctrl+P / Ctrl+N). Up/Down stay free for line
         // navigation within multi-line queries.
@@ -783,13 +984,30 @@ async fn handle_editor_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     Ok(false)
 }
 
-async fn run_editor_query(app: &mut AppState) {
-    if app.editor.trim().is_empty() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunScope {
+    All,
+    Current,
+}
+
+async fn run_editor_query(app: &mut AppState, scope: RunScope) {
+    let snippet = match scope {
+        RunScope::All => app.editor.clone(),
+        RunScope::Current => {
+            let range = statement_range_at(&app.editor, app.editor_cursor);
+            app.editor[range].to_owned()
+        }
+    };
+    if snippet.trim().is_empty() {
+        app.status = "nothing to run".to_owned();
         return;
     }
     app.last_error = None;
-    app.status = "executing…".to_owned();
-    let doc = SqlDocument::new(app.editor.clone());
+    app.status = match scope {
+        RunScope::All => "executing all…".to_owned(),
+        RunScope::Current => "executing current statement…".to_owned(),
+    };
+    let doc = SqlDocument::new(snippet.clone());
     let pool = app.pool.as_ref().expect("connected pool in editor mode");
     match pool.execute_script(&doc).await {
         Ok(out) => {
@@ -800,12 +1018,64 @@ async fn run_editor_query(app: &mut AppState) {
                 app.record_col = 0;
                 app.record_table_state.select(Some(0));
                 app.status = format!("{rows} rows  Esc → browser");
+            } else {
+                app.status = "ok (no rows)  Esc → browser".to_owned();
             }
-            push_history(app);
+            push_history(app, snippet);
         }
         Err(e) => {
             app.last_error = Some(e.to_string());
             app.status = format!("error: {e}");
+        }
+    }
+}
+
+/// Save the editor buffer to disk. If `target` is `None`, write to the
+/// existing `editor_path`. If both are missing, surface an error so the
+/// user knows to use `:w <path>`.
+async fn save_editor_buffer(app: &mut AppState, target: Option<PathBuf>) {
+    let path = target.or_else(|| app.editor_path.clone());
+    let Some(path) = path else {
+        app.last_error = Some("no file: use :w <path> first".to_owned());
+        app.status = "save: no file".to_owned();
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                app.last_error = Some(format!("could not create dir: {e}"));
+                app.status = format!("save failed: {e}");
+                return;
+            }
+        }
+    }
+    match tokio::fs::write(&path, app.editor.as_bytes()).await {
+        Ok(()) => {
+            app.editor_path = Some(path.clone());
+            app.status = format!("saved {}", path.display());
+        }
+        Err(e) => {
+            app.last_error = Some(format!("save failed: {e}"));
+            app.status = format!("save failed: {e}");
+        }
+    }
+}
+
+/// Open `path` and replace the editor buffer with its contents. Sets
+/// `editor_path` so subsequent `Ctrl+S` writes back to the same file.
+async fn open_editor_buffer(app: &mut AppState, path: PathBuf) {
+    match tokio::fs::read_to_string(&path).await {
+        Ok(text) => {
+            app.editor = text;
+            app.editor_cursor = app.editor.len().min(app.editor_cursor);
+            app.editor_path = Some(path.clone());
+            app.history_idx = None;
+            app.mode = AppMode::Editor;
+            app.status = format!("opened {}", path.display());
+        }
+        Err(e) => {
+            app.last_error = Some(format!("open failed: {e}"));
+            app.status = format!("open failed: {e}");
         }
     }
 }
@@ -816,8 +1086,10 @@ fn editor_insert_str(app: &mut AppState, s: &str) {
     app.history_idx = None;
 }
 
-fn push_history(app: &mut AppState) {
-    let trimmed = app.editor.trim().to_owned();
+const MAX_HISTORY: usize = 500;
+
+fn push_history(app: &mut AppState, entry: String) {
+    let trimmed = entry.trim().to_owned();
     if trimmed.is_empty() {
         return;
     }
@@ -825,13 +1097,20 @@ fn push_history(app: &mut AppState) {
     if app.history.last().map(String::as_str) == Some(trimmed.as_str()) {
         return;
     }
-    app.history.push(trimmed);
-    const MAX_HISTORY: usize = 50;
+    app.history.push(trimmed.clone());
     if app.history.len() > MAX_HISTORY {
         let drop = app.history.len() - MAX_HISTORY;
         app.history.drain(..drop);
     }
     app.history_idx = None;
+    if let Some(path) = app.history_path.clone() {
+        // Best-effort: persist on a detached task so a slow disk doesn't
+        // hold up the editor. Failures surface only as a missing entry
+        // next session, which we accept.
+        tokio::spawn(async move {
+            let _ = append_history(&path, &trimmed).await;
+        });
+    }
 }
 
 fn history_prev(app: &mut AppState) {
@@ -954,7 +1233,33 @@ async fn handle_browser_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         }
         (KeyCode::Char('e'), _) | (KeyCode::Char('i'), _) => {
             app.mode = AppMode::Editor;
-            app.status = "Ctrl+R run  Esc back".to_owned();
+            app.status = editor_hint();
+        }
+        // Shift+X closes the active table and returns the user to the
+        // empty-detail placeholder so they can pick another table without
+        // collapsing the schema first.
+        (KeyCode::Char('X'), _) => {
+            close_current_table(app);
+        }
+        // Number keys jump straight to a detail tab. Mirrors the
+        // l/h cycling but lets the user land on any tab in one keystroke.
+        (KeyCode::Char(ch), _) if matches!(ch, '1'..='6') => {
+            let tab = match ch {
+                '1' => DetailTab::Records,
+                '2' => DetailTab::Columns,
+                '3' => DetailTab::Indexes,
+                '4' => DetailTab::Keys,
+                '5' => DetailTab::Constraints,
+                _ => DetailTab::Erd,
+            };
+            switch_detail_tab(app, tab);
+            if tab == DetailTab::Erd
+                && app.relationships.is_empty()
+                && !app.current_schema.is_empty()
+            {
+                let schema = app.current_schema.clone();
+                spawn_relationships(app, schema);
+            }
         }
         _ => match app.pane {
             BrowserPane::Sidebar => {
@@ -1278,7 +1583,7 @@ fn draw(f: &mut Frame<'_>, app: &AppState) {
         AppMode::Browser => {
             let body = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(24), Constraint::Percentage(76)])
+                .constraints([Constraint::Percentage(18), Constraint::Percentage(82)])
                 .split(root[1]);
             draw_sidebar(f, app, body[0]);
             draw_detail(f, app, body[1]);
@@ -1421,7 +1726,18 @@ fn draw_connect(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         th.border
     };
 
-    let url_display = if app.connect_input.is_empty() && app.connect_focus == ConnectFocus::NewUrl {
+    let in_name_prompt = app.connect_focus == ConnectFocus::NameNew;
+    let url_display = if in_name_prompt && app.connect_input.is_empty() {
+        Span::styled(
+            "  letters / digits / _ / -    Enter save    Esc skip",
+            Style::default().fg(th.muted),
+        )
+    } else if in_name_prompt {
+        Span::styled(
+            format!("  {}_", app.connect_input),
+            Style::default().fg(th.fg),
+        )
+    } else if app.connect_input.is_empty() && app.connect_focus == ConnectFocus::NewUrl {
         Span::styled(
             "  e.g. postgres://user:pass@localhost/db  or  sqlite:./my.db",
             Style::default().fg(th.muted),
@@ -1438,10 +1754,18 @@ fn draw_connect(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         )
     };
 
-    let url_title = if has_saved {
+    let url_title = if in_name_prompt {
+        "  Name this connection  "
+    } else if has_saved {
         "  New Connection (n)  "
     } else {
         "  Connection URL  "
+    };
+
+    let url_border = if in_name_prompt {
+        th.active_border
+    } else {
+        url_border
     };
 
     f.render_widget(
@@ -1664,45 +1988,64 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
+    // Build a zebra-striped grid with vertical column separators. The
+    // widths vector interleaves data columns with 1-wide separator
+    // columns so ratatui's Table draws them as siblings; we render a
+    // styled `│` glyph in each separator slot.
     let col_count = rec.columns.len().max(1);
-    let pct = (100 / col_count) as u16;
-    let widths: Vec<Constraint> = rec
-        .columns
-        .iter()
-        .map(|_| Constraint::Percentage(pct))
-        .collect();
+    let total_pct = 100u16;
+    let sep_count = col_count.saturating_sub(1) as u16;
+    let sep_width = sep_count; // 1 cell each
+    let data_pct = (total_pct.saturating_sub(sep_width) / col_count as u16).max(1);
+    let widths: Vec<Constraint> = build_grid_widths(col_count, data_pct);
 
-    let header: Row = Row::new(rec.columns.iter().enumerate().map(|(ci, name)| {
-        let st = if ci == app.record_col {
-            Style::default()
-                .fg(th.accent)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-        };
-        Cell::from(name.as_str()).style(st)
-    }))
-    .style(Style::default().bg(th.sel_bg))
-    .height(1);
+    let header_cells: Vec<Cell<'_>> = interleave_separators(
+        rec.columns.iter().enumerate().map(|(ci, name)| {
+            let st = if ci == app.record_col {
+                Style::default()
+                    .fg(th.accent)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+            };
+            Cell::from(name.as_str()).style(st)
+        }),
+        th,
+        /* row_bg */ th.sel_bg,
+    );
+    let header = Row::new(header_cells)
+        .style(Style::default().bg(th.sel_bg))
+        .height(1);
 
     let rows: Vec<Row> = rec
         .rows
         .iter()
         .enumerate()
         .map(|(ri, row)| {
-            let cells = row.iter().enumerate().map(|(ci, val)| {
-                let st = if ri == app.record_row && ci == app.record_col {
-                    Style::default().fg(th.bg).bg(th.accent)
-                } else if ri == app.record_row {
-                    Style::default().fg(th.sel_fg).bg(th.sel_bg)
-                } else if val == "NULL" {
-                    Style::default().fg(th.muted)
-                } else {
-                    Style::default().fg(th.fg)
-                };
-                Cell::from(val.as_str()).style(st)
-            });
-            Row::new(cells).height(1)
+            let row_bg = if ri == app.record_row {
+                th.sel_bg
+            } else if ri % 2 == 1 {
+                th.row_alt_bg
+            } else {
+                th.bg
+            };
+            let cells = interleave_separators(
+                row.iter().enumerate().map(|(ci, val)| {
+                    let st = if ri == app.record_row && ci == app.record_col {
+                        Style::default().fg(th.bg).bg(th.accent)
+                    } else if ri == app.record_row {
+                        Style::default().fg(th.sel_fg).bg(row_bg)
+                    } else if val == "NULL" {
+                        Style::default().fg(th.muted).bg(row_bg)
+                    } else {
+                        Style::default().fg(th.fg).bg(row_bg)
+                    };
+                    Cell::from(val.as_str()).style(st)
+                }),
+                th,
+                row_bg,
+            );
+            Row::new(cells).style(Style::default().bg(row_bg)).height(1)
         })
         .collect();
 
@@ -1714,6 +2057,47 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         area,
         &mut ts,
     );
+}
+
+/// Produce `[data, sep, data, sep, …, data]` width constraints for an
+/// `n`-column grid. Each `data` slot gets `data_pct` percent, separators
+/// are 1 cell wide. Returns just `[data]` when `n == 1`.
+fn build_grid_widths(n: usize, data_pct: u16) -> Vec<Constraint> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(2 * n - 1);
+    for i in 0..n {
+        if i > 0 {
+            out.push(Constraint::Length(1));
+        }
+        out.push(Constraint::Percentage(data_pct));
+    }
+    out
+}
+
+/// Interleave a `│` separator cell between every pair of data cells. The
+/// separator inherits the row's background so zebra striping stays
+/// consistent across the row.
+fn interleave_separators<'a, I>(cells: I, th: Theme, row_bg: Color) -> Vec<Cell<'a>>
+where
+    I: IntoIterator<Item = Cell<'a>>,
+{
+    let collected: Vec<Cell<'a>> = cells.into_iter().collect();
+    if collected.len() < 2 {
+        return collected;
+    }
+    let mut out = Vec::with_capacity(2 * collected.len() - 1);
+    let sep_style = Style::default().fg(th.border).bg(row_bg);
+    let mut iter = collected.into_iter();
+    if let Some(first) = iter.next() {
+        out.push(first);
+    }
+    for cell in iter {
+        out.push(Cell::from("│").style(sep_style));
+        out.push(cell);
+    }
+    out
 }
 
 // ─── Columns tab ──────────────────────────────────────────────────────────────
@@ -2095,83 +2479,115 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
-    let title = if app.history.is_empty() {
-        "  SQL Editor   Ctrl+R run  Esc browser  ".to_owned()
-    } else {
-        format!(
-            "  SQL Editor   Ctrl+R run  Ctrl+P/N history ({})  Esc browser  ",
-            app.history.len()
-        )
+    let title = {
+        let mut t = String::from("  SQL Editor  ");
+        if let Some(p) = &app.editor_path {
+            t.push_str(&p.display().to_string());
+            t.push_str("  ");
+        }
+        t.push_str("Ctrl+R run all  Ctrl+Enter run current  Ctrl+S save  ");
+        if !app.history.is_empty() {
+            t.push_str(&format!("Ctrl+P/N hist ({})  ", app.history.len()));
+        }
+        t.push_str("Esc browser  ");
+        t
     };
 
     let editor_area = layout[0];
-    f.render_widget(
-        Paragraph::new(app.editor.as_str())
-            .style(Style::default().fg(th.fg).bg(th.bg))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        title,
-                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(th.active_border))
-                    .style(Style::default().bg(th.bg)),
+    let editor_block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.active_border))
+        .style(Style::default().bg(th.bg));
+    let editor_inner = editor_block.inner(editor_area);
+    f.render_widget(editor_block, editor_area);
+
+    // Split the inner area into [gutter | text]. The gutter holds 1-indexed
+    // line numbers right-aligned to a 4-char column (max 9999 lines).
+    let line_count = app.editor.lines().count().max(1);
+    let gutter_width = (line_count.to_string().len() as u16 + 1).max(4);
+    let editor_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(gutter_width), Constraint::Min(0)])
+        .split(editor_inner);
+    let gutter_area = editor_layout[0];
+    let text_area = editor_layout[1];
+
+    // Current-statement byte range, used to highlight the active SQL.
+    let stmt_range = statement_range_at(&app.editor, app.editor_cursor);
+
+    let (cursor_line, cursor_col) = line_col(&app.editor, app.editor_cursor);
+
+    let mut byte_offset = 0usize;
+    let mut gutter_lines: Vec<Line> = Vec::new();
+    let mut text_lines: Vec<Line> = Vec::new();
+    for (idx, line) in app.editor.split('\n').enumerate() {
+        let line_start = byte_offset;
+        let line_end = line_start + line.len();
+        let in_stmt = stmt_range.start <= line_end && line_start <= stmt_range.end;
+        let line_bg = if in_stmt && !line.trim().is_empty() {
+            th.row_alt_bg
+        } else {
+            th.bg
+        };
+        let num_style = if idx == cursor_line {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.muted)
+        };
+        gutter_lines.push(Line::from(Span::styled(
+            format!(
+                "{:>width$} ",
+                idx + 1,
+                width = (gutter_width as usize).saturating_sub(1)
             ),
-        editor_area,
+            num_style.bg(line_bg),
+        )));
+
+        let mut spans = highlight_line(line, th);
+        for span in &mut spans {
+            // Apply the per-line background by patching each span's style.
+            let mut st = span.style;
+            st.bg = Some(line_bg);
+            span.style = st;
+        }
+        if spans.is_empty() {
+            spans.push(Span::styled(" ", Style::default().bg(line_bg)));
+        }
+        text_lines.push(Line::from(spans));
+        byte_offset = line_end + 1; // +1 for the '\n' we split on
+    }
+
+    f.render_widget(
+        Paragraph::new(gutter_lines).style(Style::default().bg(th.bg)),
+        gutter_area,
+    );
+    f.render_widget(
+        Paragraph::new(text_lines)
+            .style(Style::default().fg(th.fg).bg(th.bg))
+            .wrap(Wrap { trim: false }),
+        text_area,
     );
 
-    // Position the terminal's hardware cursor inside the editor pane so the
-    // user can see exactly where edits will land. Coordinates are computed
-    // from the (line, column) of `editor_cursor`. Note this ignores soft-wrap
-    // so very long lines may push the cursor off the visible width; that's a
-    // known limitation deferred to future work.
-    let inner = Rect {
-        x: editor_area.x + 1,
-        y: editor_area.y + 1,
-        width: editor_area.width.saturating_sub(2),
-        height: editor_area.height.saturating_sub(2),
-    };
-    let (line, col) = line_col(&app.editor, app.editor_cursor);
-    let cx = inner.x + (col as u16).min(inner.width.saturating_sub(1));
-    let cy = inner.y + (line as u16).min(inner.height.saturating_sub(1));
+    // Position the terminal's hardware cursor inside the text pane.
+    let cx = text_area.x + (cursor_col as u16).min(text_area.width.saturating_sub(1));
+    let cy = text_area.y + (cursor_line as u16).min(text_area.height.saturating_sub(1));
     f.set_cursor_position((cx, cy));
 
-    // Results from editor queries
-    let result_text: String = if let Some(rec) = &app.records {
-        if rec.columns.is_empty() {
-            format!("rows affected: {}", rec.rows_affected)
-        } else {
-            let mut s = rec.columns.join("  │  ");
-            s.push('\n');
-            s.push_str(&"─".repeat(60));
-            s.push('\n');
-            for row in rec.rows.iter().take(200) {
-                s.push_str(&row.join("  │  "));
-                s.push('\n');
-            }
-            s
-        }
-    } else {
-        String::new()
-    };
-
-    f.render_widget(
-        Paragraph::new(result_text.as_str())
-            .style(Style::default().fg(th.fg).bg(th.bg))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(Span::styled("  Results  ", Style::default().fg(th.muted)))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(th.border))
-                    .style(Style::default().bg(th.bg)),
-            ),
-        layout[1],
-    );
+    // ── Results pane: same grid as the Records tab ──
+    let results_block = Block::default()
+        .title(Span::styled("  Results  ", Style::default().fg(th.muted)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .style(Style::default().bg(th.bg));
+    let results_inner = results_block.inner(layout[1]);
+    f.render_widget(results_block, layout[1]);
+    draw_records(f, app, results_inner);
 }
 
 // ─── Status bar ───────────────────────────────────────────────────────────────
@@ -2223,8 +2639,9 @@ fn restore_terminal(
 #[cfg(test)]
 mod tests {
     use super::{
-        line_col, line_end, line_start, move_cursor_vertical, next_char_boundary,
-        prev_char_boundary, Theme, ALL_TABS,
+        close_current_table, line_col, line_end, line_start, move_cursor_vertical,
+        next_char_boundary, prev_char_boundary, short_hash, unique_connection_name, AppState,
+        ConnectionConfig, DetailTab, DriverKind, Theme, ALL_TABS,
     };
 
     #[test]
@@ -2300,5 +2717,51 @@ mod tests {
         let down = move_cursor_vertical(s, 3, 1);
         // back up should land on column 3 of line 0
         assert_eq!(move_cursor_vertical(s, down, -1), 3);
+    }
+
+    #[test]
+    fn close_current_table_clears_table_state() {
+        let mut app = AppState::new(DriverKind::Sqlite, "sqlite::memory:".to_owned());
+        app.current_schema = "public".to_owned();
+        app.current_table = "customers".to_owned();
+        app.detail_tab = DetailTab::Columns;
+        close_current_table(&mut app);
+        assert!(app.current_table.is_empty());
+        assert!(app.records.is_none());
+        assert!(app.table_info.is_none());
+        assert_eq!(app.detail_tab, DetailTab::Records);
+    }
+
+    #[test]
+    fn unique_name_appends_numeric_suffix_when_taken() {
+        let saved = vec![
+            (
+                "prod".to_owned(),
+                ConnectionConfig {
+                    driver: DriverKind::Postgres,
+                    url: "u1".to_owned(),
+                },
+            ),
+            (
+                "prod-2".to_owned(),
+                ConnectionConfig {
+                    driver: DriverKind::Postgres,
+                    url: "u2".to_owned(),
+                },
+            ),
+        ];
+        assert_eq!(unique_connection_name("prod", &saved), "prod-3");
+        assert_eq!(unique_connection_name("dev", &saved), "dev");
+    }
+
+    #[test]
+    fn short_hash_is_deterministic_and_alphanumeric() {
+        let a = short_hash("postgres://localhost/x");
+        let b = short_hash("postgres://localhost/x");
+        let c = short_hash("postgres://localhost/y");
+        assert_eq!(a, b, "same input produces same hash");
+        assert_ne!(a, c, "different input produces different hash");
+        assert!(a.starts_with("url_"));
+        assert!(a[4..].chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 }

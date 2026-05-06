@@ -8,6 +8,35 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ### Added
 
+- **Persist new connections.** After typing a URL via `n new
+  connection`, the connect screen prompts for a friendly name. Empty +
+  Enter (or Esc) skips; otherwise the URL is appended to
+  `~/.config/tsql/config.toml` so it shows in the picker next time.
+  `tsql_core::append_connection` writes raw TOML so existing
+  `${ENV_VAR}` placeholders and comments survive byte-for-byte. Name
+  collisions are resolved with a `-N` numeric suffix.
+- **Number-key tab navigation.** `1`-`6` jump straight to Records,
+  Columns, Indexes, Keys, Constraints, and ERD. `l`/`h` cycling stays
+  intact for muscle memory.
+- **`Shift+X` closes the active table** and returns to the empty-detail
+  placeholder, so you can pick another table without collapsing the
+  schema first.
+- **Records grid** — vertical column separators (`│`) and zebra-striped
+  rows, plus a new `theme.row_alt_bg` colour. Same renderer is reused
+  for the editor's results pane.
+- **Editor upgrade.** Line-number gutter, basic SQL syntax highlighting
+  (keywords / strings / numbers / comments), current-statement
+  highlight that follows the cursor, `Ctrl+Enter` (and `Alt+Enter` as a
+  terminal-compat fallback) runs only the statement under the cursor,
+  `Ctrl+S` saves to the buffer's file, `:w [path]` and `:e <path>`
+  palette commands for save/open, and per-connection persistent history
+  stored under `~/.local/share/tsql/history/<name>.txt` (capped at 500
+  deduped entries).
+- **Narrower sidebar.** Browser sidebar is now 18% of terminal width
+  (down from 24%), giving the detail pane more room.
+
+### Added (earlier)
+
 - **Postgres metadata integration tests** (`crates/tsql-db/tests/postgres.rs`):
   `postgres_overview_lists_tables_and_schemas`,
   `postgres_table_info_columns_and_pk`,

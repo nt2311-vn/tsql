@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -22,6 +24,13 @@ pub enum ConfigError {
     UnsupportedDriver(String),
     #[error("environment variable `{0}` is not set")]
     MissingEnvironmentVariable(String),
+    #[error("failed to write config file `{path}`: {source}")]
+    Write {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("connection name `{0}` is invalid (must be a non-empty TOML key)")]
+    InvalidConnectionName(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +110,91 @@ impl AppConfig {
     }
 }
 
+/// Append a `[connections.<name>]` block to the user's TOML config so a
+/// freshly-typed connection survives across sessions. We deliberately
+/// append raw text rather than round-tripping the parsed `AppConfig` —
+/// that way any `${ENV_VAR}` placeholders, comments, and ordering already
+/// in the file stay byte-for-byte intact. The file (and parent dir) are
+/// created on demand if they don't exist.
+///
+/// The `name` is validated as a bare TOML key (alphanumerics, `_`, `-`).
+/// Anything else returns `InvalidConnectionName` rather than producing
+/// a malformed file.
+pub async fn append_connection(
+    path: &Path,
+    name: &str,
+    connection: &ConnectionConfig,
+) -> Result<(), ConfigError> {
+    if !is_valid_connection_name(name) {
+        return Err(ConfigError::InvalidConnectionName(name.to_owned()));
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|source| ConfigError::Write {
+                    path: parent.display().to_string(),
+                    source,
+                })?;
+        }
+    }
+
+    let driver = match connection.driver {
+        DriverKind::Postgres => "postgres",
+        DriverKind::Sqlite => "sqlite",
+    };
+    let escaped_url = connection.url.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut block = String::new();
+    if path.exists() {
+        // Make sure we start the new block on its own line even if the
+        // previous file didn't end in a newline.
+        let existing = fs::read_to_string(path)
+            .await
+            .map_err(|source| ConfigError::Write {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            block.push('\n');
+        }
+        if !existing.is_empty() {
+            block.push('\n');
+        }
+    }
+    block.push_str(&format!(
+        "[connections.{name}]\ndriver = \"{driver}\"\nurl = \"{escaped_url}\"\n"
+    ));
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .map_err(|source| ConfigError::Write {
+            path: path.display().to_string(),
+            source,
+        })?;
+    file.write_all(block.as_bytes())
+        .await
+        .map_err(|source| ConfigError::Write {
+            path: path.display().to_string(),
+            source,
+        })?;
+    file.flush().await.map_err(|source| ConfigError::Write {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn is_valid_connection_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 pub fn default_config_path() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -173,8 +267,10 @@ pub fn expand_environment_variables(input: &str) -> Result<String, ConfigError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        default_config_path, expand_environment_variables, AppConfig, DriverKind, ProjectInfo,
+        append_connection, default_config_path, expand_environment_variables,
+        is_valid_connection_name, AppConfig, ConnectionConfig, DriverKind, ProjectInfo,
     };
+    use tempfile::tempdir;
 
     #[test]
     fn default_project_info_has_name() {
@@ -220,5 +316,68 @@ mod tests {
             expand_environment_variables(r#"url = "${TSQL_TEST_URL}""#).expect("expanded");
 
         assert_eq!(expanded, r#"url = "sqlite::memory:""#);
+    }
+
+    #[test]
+    fn connection_name_validator_rejects_unsafe_keys() {
+        assert!(is_valid_connection_name("prod"));
+        assert!(is_valid_connection_name("prod-2"));
+        assert!(is_valid_connection_name("dev_box_1"));
+        assert!(!is_valid_connection_name(""));
+        assert!(!is_valid_connection_name("has space"));
+        assert!(!is_valid_connection_name("a.b"));
+        assert!(!is_valid_connection_name("\"quoted\""));
+    }
+
+    #[tokio::test]
+    async fn append_connection_creates_file_when_missing() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("config.toml");
+        let conn = ConnectionConfig {
+            driver: DriverKind::Sqlite,
+            url: "sqlite::memory:".to_owned(),
+        };
+
+        append_connection(&path, "local", &conn)
+            .await
+            .expect("write succeeds");
+
+        let cfg = AppConfig::load(&path).await.expect("reloads");
+        assert_eq!(cfg.connection("local").unwrap().url, "sqlite::memory:");
+    }
+
+    #[tokio::test]
+    async fn append_connection_preserves_existing_env_var_placeholders() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let original = "[connections.prod]\ndriver = \"postgres\"\nurl = \"${DATABASE_URL}\"\n";
+        tokio::fs::write(&path, original).await.unwrap();
+
+        let conn = ConnectionConfig {
+            driver: DriverKind::Postgres,
+            url: "postgres://user:pass@localhost/dev".to_owned(),
+        };
+        append_connection(&path, "dev", &conn).await.unwrap();
+
+        // The raw text still contains ${DATABASE_URL}; the writer never
+        // expanded the placeholder when round-tripping.
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(raw.contains("${DATABASE_URL}"), "placeholder lost: {raw:?}");
+        assert!(raw.contains("[connections.dev]"));
+    }
+
+    #[tokio::test]
+    async fn append_connection_rejects_invalid_names() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let conn = ConnectionConfig {
+            driver: DriverKind::Sqlite,
+            url: "sqlite::memory:".to_owned(),
+        };
+        let err = append_connection(&path, "has space", &conn)
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, super::ConfigError::InvalidConnectionName(_)));
+        assert!(!path.exists(), "no file should have been created");
     }
 }
