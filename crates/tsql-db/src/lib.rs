@@ -365,9 +365,14 @@ async fn fetch_sqlite_table_info(
 }
 
 async fn fetch_postgres_overview(pool: &PgPool) -> Result<DatabaseOverview, DbError> {
+    // Hide every Postgres-internal schema. `information_schema.schemata`
+    // includes `pg_toast`, `pg_temp_*`, and `pg_toast_temp_*` alongside
+    // `pg_catalog`, so a literal NOT IN list isn't enough — match the
+    // whole `pg_%` family with LIKE plus information_schema explicitly.
     let schemas: Vec<(String,)> = sqlx::query_as(
-        "SELECT schema_name FROM information_schema.schemata 
-         WHERE schema_name NOT IN ('information_schema', 'pg_catalog') 
+        "SELECT schema_name FROM information_schema.schemata
+         WHERE schema_name NOT LIKE 'pg\\_%' ESCAPE '\\'
+           AND schema_name <> 'information_schema'
          ORDER BY schema_name",
     )
     .fetch_all(pool)

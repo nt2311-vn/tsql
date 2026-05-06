@@ -26,13 +26,23 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
   metadata now includes the PK index (previously filtered out) so the
   default btree backing each table is always visible. SQLite reports
   every regular index as btree (FTS/R*Tree live as virtual tables).
-- **Visual ERD.** Replaced the flat tree-style FK list with a 2-D
-  box-and-line diagram. Tables lay out on a `cols × rows` grid with
-  rounded-corner boxes; FK edges route as orthogonal L-shapes
-  (horizontal → bend → vertical → bend → horizontal) ending in a `▶`
-  / `◀` arrow head. The currently-selected edge (`j`/`k` cycles)
-  draws last in `theme.warning` so it always sits on top, with a
-  legend underneath spelling out source `column → target.column`.
+- **ERD focused-vertical view.** A first attempt at a 2-D
+  box-and-line diagram with routed orthogonal edges turned out to be
+  unreadable on dense schemas — edge routes ran straight through
+  table boxes. Replaced with a three-section vertical layout that
+  trades graph topology for clarity:
+  1. A compact chip strip of every table in the schema (referenced
+     tables in `accent`, standalone in `muted`).
+  2. The currently-selected relationship rendered as two stacked
+     rounded-corner boxes with a labelled vertical `FOREIGN KEY ▼`
+     arrow between them and the column names printed inside.
+  3. A numbered list of every relationship; `►` marks the active
+     row; `j`/`k` cycle, `Enter`/`o` jump to source/target table.
+- **Hide Postgres-internal schemas.** The schema picker previously
+  surfaced `pg_toast` (and `pg_temp_*` if present) because the query
+  only excluded `information_schema` and `pg_catalog`. Now uses
+  `NOT LIKE 'pg\_%'` so every internal schema disappears and only
+  user schemas remain.
 - **`Shift+X` closes the active table** and returns to the empty-detail
   placeholder, so you can pick another table without collapsing the
   schema first.

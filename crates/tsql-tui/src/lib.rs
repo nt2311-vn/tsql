@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -2371,28 +2371,27 @@ fn draw_constraints(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 
 // ─── ERD tab ──────────────────────────────────────────────────────────────────
 //
-// We render the ERD as a 2-D box-and-line diagram instead of a flat
-// list. Tables are laid out on a `cols × rows` grid (cols ≈ √N) so the
-// diagram fits a typical terminal at any schema size. Each table is a
-// rounded rectangle; FK edges are routed as orthogonal L-shapes
-// (horizontal → bend → vertical → bend → horizontal) with an arrow
-// head at the referenced-table side. The currently-selected edge is
-// drawn last in `theme.warning` so it sits on top of any crossings.
+// Earlier iterations of this view tried to draw a 2-D graph with
+// orthogonal-routed edges. On real schemas the routes ran straight
+// through table boxes and the result was unreadable. We've since
+// pivoted to a **focused vertical view** that trades graph topology
+// for clarity:
 //
-// We don't try to be a full graph autorouter — overlaps are accepted
-// because (a) the user can hop edges with `j/k` and the highlight
-// always wins visually, and (b) a real autorouter would need a much
-// larger code budget than this client deserves.
-
-/// One cell of the ERD char canvas. Tracks the glyph plus a tiny style
-/// payload (foreground colour + bold) so we can convert runs back into
-/// styled `Span`s when we hand the buffer to ratatui.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ErdCell {
-    ch: char,
-    fg: Color,
-    bold: bool,
-}
+//   1. **Tables** — a compact chip strip of every table in the active
+//      schema. Tables that participate in any FK render in `accent`;
+//      standalone tables in `muted` so the user sees the full set.
+//   2. **Selected edge focus** — two stacked rounded-corner boxes
+//      stacked vertically, source on top, target below, with a
+//      labelled vertical arrow between them and the column names
+//      printed inside each box. This is the "what does this edge
+//      mean" panel.
+//   3. **All edges** — a numbered list of every relationship with
+//      the selected one bolded and prefixed with `►`. `j/k` cycles
+//      the selection, `o` jumps to the target table.
+//
+// No autorouting, no overlapping lines, no cognitive load to decode
+// crossings. Every relationship is one Enter / `o` away from being
+// inspected in detail.
 
 fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let th = app.theme;
@@ -2414,6 +2413,11 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         }
     }
     let tables: Vec<String> = table_set.into_iter().collect();
+    let referenced: HashSet<&str> = app
+        .relationships
+        .iter()
+        .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
+        .collect();
 
     if tables.is_empty() {
         let hint = if schema.is_empty() {
@@ -2425,189 +2429,11 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
-    // ── Grid layout ─────────────────────────────────────────────────
-    let n = tables.len();
-    let cols = (n as f32).sqrt().ceil() as usize;
-    let cols = cols.max(1);
-    let rows = n.div_ceil(cols);
-    // Box wide enough for the longest table name, but never narrower
-    // than 12 cells so the diagram doesn't degenerate into stripes.
-    let name_max = tables.iter().map(|t| t.chars().count()).max().unwrap_or(8);
-    let box_w = name_max.max(10) + 4;
-    let box_h = 3usize;
-    let h_gap = 6usize;
-    let v_gap = 2usize;
+    // ── Build the lines top-down ───────────────────────────────────
+    let mut lines: Vec<Line> = Vec::new();
 
-    let canvas_w = cols * box_w + cols.saturating_sub(1) * h_gap;
-    let canvas_h = rows * box_h + rows.saturating_sub(1) * v_gap;
-
-    let blank = ErdCell {
-        ch: ' ',
-        fg: th.fg,
-        bold: false,
-    };
-    let mut buf: Vec<Vec<ErdCell>> = vec![vec![blank; canvas_w]; canvas_h];
-
-    let put = |buf: &mut Vec<Vec<ErdCell>>, x: usize, y: usize, ch: char, fg: Color, bold: bool| {
-        if y < buf.len() && x < buf[0].len() {
-            buf[y][x] = ErdCell { ch, fg, bold };
-        }
-    };
-
-    let pos_of = |idx: usize| -> (usize, usize) {
-        let r = idx / cols;
-        let c = idx % cols;
-        (c * (box_w + h_gap), r * (box_h + v_gap))
-    };
-
-    let table_idx: HashMap<&str, usize> = tables
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (t.as_str(), i))
-        .collect();
-    let referenced: HashSet<&str> = app
-        .relationships
-        .iter()
-        .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
-        .collect();
-
-    // ── Draw boxes ─────────────────────────────────────────────────
-    for (i, name) in tables.iter().enumerate() {
-        let (x, y) = pos_of(i);
-        let is_referenced = referenced.contains(name.as_str());
-        let title_color = if is_referenced { th.accent } else { th.muted };
-        // top
-        put(&mut buf, x, y, '╭', th.border, false);
-        put(&mut buf, x + box_w - 1, y, '╮', th.border, false);
-        for k in 1..box_w - 1 {
-            put(&mut buf, x + k, y, '─', th.border, false);
-        }
-        // middle
-        put(&mut buf, x, y + 1, '│', th.border, false);
-        put(&mut buf, x + box_w - 1, y + 1, '│', th.border, false);
-        for k in 1..box_w - 1 {
-            put(&mut buf, x + k, y + 1, ' ', th.fg, false);
-        }
-        let inner_w = box_w - 2;
-        let pad = inner_w.saturating_sub(name.chars().count()) / 2;
-        for (k, ch) in name.chars().enumerate() {
-            put(&mut buf, x + 1 + pad + k, y + 1, ch, title_color, true);
-        }
-        // bottom
-        put(&mut buf, x, y + 2, '╰', th.border, false);
-        put(&mut buf, x + box_w - 1, y + 2, '╯', th.border, false);
-        for k in 1..box_w - 1 {
-            put(&mut buf, x + k, y + 2, '─', th.border, false);
-        }
-    }
-
-    // ── Draw edges ─────────────────────────────────────────────────
-    // Two passes: non-selected first, selected last so the highlight
-    // sits on top of any crossings.
-    let selected = app.erd_selected;
-    let order: Vec<usize> = (0..app.relationships.len())
-        .filter(|i| *i != selected)
-        .chain(std::iter::once(selected).filter(|_| selected < app.relationships.len()))
-        .collect();
-    for eid in order {
-        let edge = &app.relationships[eid];
-        let Some(&from_i) = table_idx.get(edge.from_table.as_str()) else {
-            continue;
-        };
-        let Some(&to_i) = table_idx.get(edge.to_table.as_str()) else {
-            continue;
-        };
-        if from_i == to_i {
-            continue; // self-references aren't worth routing
-        }
-        let is_selected = eid == selected;
-        let edge_color = if is_selected { th.warning } else { th.muted };
-        let bold = is_selected;
-
-        let (fx, fy) = pos_of(from_i);
-        let (tx, ty) = pos_of(to_i);
-        let from_left_to_right = fx <= tx;
-        let (sx, sy) = if from_left_to_right {
-            (fx + box_w - 1, fy + box_h / 2)
-        } else {
-            (fx, fy + box_h / 2)
-        };
-        let (ex, ey) = if from_left_to_right {
-            (tx, ty + box_h / 2)
-        } else {
-            (tx + box_w - 1, ty + box_h / 2)
-        };
-
-        // Step out one cell from the source so we don't trample the
-        // box border.
-        let stub_x = if from_left_to_right {
-            sx + 1
-        } else {
-            sx.saturating_sub(1)
-        };
-        let target_x = if from_left_to_right {
-            ex.saturating_sub(1)
-        } else {
-            ex + 1
-        };
-        if stub_x < buf[0].len() && buf[sy][stub_x].ch == ' ' {
-            put(&mut buf, stub_x, sy, '─', edge_color, bold);
-        }
-
-        let mid_x = (stub_x + target_x) / 2;
-
-        // Segment 1: horizontal from stub to mid_x
-        let (a, b) = (stub_x.min(mid_x), stub_x.max(mid_x));
-        for x in a..=b {
-            if buf[sy][x].ch == ' ' || buf[sy][x].ch == '─' {
-                put(&mut buf, x, sy, '─', edge_color, bold);
-            }
-        }
-        // Segment 2: vertical at mid_x. Bend glyphs depend on which
-        // side the horizontal segment came from:
-        //   left → down  ╮      right → down  ╭
-        //   left → up    ╯      right → up    ╰
-        if sy != ey {
-            let going_down = ey > sy;
-            let bend_top = match (from_left_to_right, going_down) {
-                (true, true) => '╮',
-                (true, false) => '╯',
-                (false, true) => '╭',
-                (false, false) => '╰',
-            };
-            let bend_bot = match (from_left_to_right, going_down) {
-                (true, true) => '╰',
-                (true, false) => '╭',
-                (false, true) => '╯',
-                (false, false) => '╮',
-            };
-            put(&mut buf, mid_x, sy, bend_top, edge_color, bold);
-            let (a, b) = (sy.min(ey), sy.max(ey));
-            for y in (a + 1)..b {
-                if buf[y][mid_x].ch == ' ' {
-                    put(&mut buf, mid_x, y, '│', edge_color, bold);
-                }
-            }
-            put(&mut buf, mid_x, ey, bend_bot, edge_color, bold);
-        }
-        // Segment 3: horizontal from mid_x to target_x
-        let (a, b) = (mid_x.min(target_x), mid_x.max(target_x));
-        for x in a..=b {
-            if x == mid_x && sy != ey {
-                continue;
-            }
-            if buf[ey][x].ch == ' ' || buf[ey][x].ch == '─' {
-                put(&mut buf, x, ey, '─', edge_color, bold);
-            }
-        }
-        // Arrow head adjacent to the target box.
-        let head = if from_left_to_right { '▶' } else { '◀' };
-        let head_color = if is_selected { th.accent } else { edge_color };
-        put(&mut buf, target_x, ey, head, head_color, true);
-    }
-
-    // ── Convert buffer to styled lines ─────────────────────────────
-    let header = Line::from(vec![
+    // Banner.
+    lines.push(Line::from(vec![
         Span::styled(
             format!("  ERD  schema: {schema}  "),
             Style::default()
@@ -2617,60 +2443,168 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         ),
         Span::styled(
             format!(
-                "  {} table(s), {} edge(s)  j/k select  o jump  ",
+                "  {} table(s), {} relationship(s)  j/k select  o jump  ",
                 tables.len(),
                 app.relationships.len()
             ),
             Style::default().fg(th.muted),
         ),
-    ]);
-
-    let mut lines: Vec<Line> = Vec::with_capacity(canvas_h + 4);
-    lines.push(header);
+    ]));
     lines.push(Line::default());
-    for row in &buf {
-        let mut spans: Vec<Span> = Vec::new();
-        let mut current = String::new();
-        let mut current_style = Style::default().fg(th.fg);
-        for cell in row {
-            let mut st = Style::default().fg(cell.fg);
-            if cell.bold {
-                st = st.add_modifier(Modifier::BOLD);
-            }
-            if st != current_style && !current.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut current), current_style));
-            }
-            current.push(cell.ch);
-            current_style = st;
+
+    // ── Section 1: chip list of tables ─────────────────────────────
+    lines.push(Line::from(Span::styled(
+        "  Tables",
+        Style::default()
+            .fg(th.accent2)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )));
+    let mut chips: Vec<Span> = vec![Span::raw("  ")];
+    for (i, name) in tables.iter().enumerate() {
+        let style = if referenced.contains(name.as_str()) {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.muted)
+        };
+        chips.push(Span::styled(format!("◆ {}", name), style));
+        if i + 1 < tables.len() {
+            chips.push(Span::styled("   ", Style::default().fg(th.muted)));
         }
-        if !current.is_empty() {
-            spans.push(Span::styled(current, current_style));
-        }
-        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(chips));
+    lines.push(Line::default());
+
+    // ── Section 2: focused selected edge ───────────────────────────
+    let selected = app
+        .erd_selected
+        .min(app.relationships.len().saturating_sub(1));
+    if app.relationships.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No foreign-key relationships in this schema.",
+            Style::default().fg(th.muted),
+        )));
+    } else if let Some(edge) = app.relationships.get(selected) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  Relationship  {} / {}",
+                selected + 1,
+                app.relationships.len()
+            ),
+            Style::default()
+                .fg(th.accent2)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )));
+        lines.push(Line::default());
+        // Compute box width so both boxes share a consistent size and
+        // the column labels fit comfortably.
+        let from_label = format!("column: {}", edge.from_columns.join(", "));
+        let to_label = format!("column: {}", edge.to_columns.join(", "));
+        let inner_w = [
+            edge.from_table.chars().count(),
+            edge.to_table.chars().count(),
+            from_label.chars().count(),
+            to_label.chars().count(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(20)
+            + 6;
+        let inner_w = inner_w.max(28);
+        let indent = "         ";
+        // Source box (top).
+        lines.extend(render_erd_box(
+            indent,
+            &edge.from_table,
+            &from_label,
+            inner_w,
+            th,
+            true,
+        ));
+        // Vertical connector with the FK label centered.
+        let bar = format!("{}{:^w$}", indent, "│", w = inner_w);
+        let label_line = format!("{}{:^w$}", indent, " FOREIGN KEY ", w = inner_w);
+        let arrow = format!("{}{:^w$}", indent, "▼", w = inner_w);
+        lines.push(Line::from(Span::styled(
+            bar.clone(),
+            Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            label_line,
+            Style::default()
+                .fg(th.bg)
+                .bg(th.warning)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            bar,
+            Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            arrow,
+            Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+        )));
+        // Target box (bottom).
+        lines.extend(render_erd_box(
+            indent,
+            &edge.to_table,
+            &to_label,
+            inner_w,
+            th,
+            true,
+        ));
+        lines.push(Line::default());
     }
 
-    // Selected-edge legend underneath the diagram.
-    if let Some(edge) = app.relationships.get(selected) {
-        lines.push(Line::default());
-        lines.push(Line::from(vec![
-            Span::styled("  selected: ", Style::default().fg(th.muted)),
-            Span::styled(
-                edge.from_table.clone(),
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(".", Style::default().fg(th.muted)),
-            Span::styled(edge.from_columns.join(", "), Style::default().fg(th.fg)),
-            Span::styled(
-                "  ─▶  ",
-                Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                edge.to_table.clone(),
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(".", Style::default().fg(th.muted)),
-            Span::styled(edge.to_columns.join(", "), Style::default().fg(th.fg)),
-        ]));
+    // ── Section 3: numbered list of all edges ──────────────────────
+    if !app.relationships.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  All relationships",
+            Style::default()
+                .fg(th.accent2)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )));
+        let max_n = app.relationships.len();
+        let n_width = max_n.to_string().len();
+        for (idx, edge) in app.relationships.iter().enumerate() {
+            let is_sel = idx == selected;
+            let row_bg = if is_sel { th.sel_bg } else { th.bg };
+            let prefix = if is_sel { "►" } else { " " };
+            let prefix_style = if is_sel {
+                Style::default()
+                    .fg(th.warning)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.muted).bg(row_bg)
+            };
+            let num_style = Style::default().fg(th.muted).bg(row_bg);
+            let table_style = Style::default()
+                .fg(th.accent)
+                .bg(row_bg)
+                .add_modifier(Modifier::BOLD);
+            let col_style = Style::default().fg(th.fg).bg(row_bg);
+            let dot_style = Style::default().fg(th.muted).bg(row_bg);
+            let arrow_style = if is_sel {
+                Style::default()
+                    .fg(th.warning)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.muted).bg(row_bg)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {prefix} "), prefix_style),
+                Span::styled(format!("{:>w$}.", idx + 1, w = n_width), num_style),
+                Span::styled("  ", col_style),
+                Span::styled(edge.from_table.clone(), table_style),
+                Span::styled(".", dot_style),
+                Span::styled(edge.from_columns.join(", "), col_style),
+                Span::styled("  ─▶  ", arrow_style),
+                Span::styled(edge.to_table.clone(), table_style),
+                Span::styled(".", dot_style),
+                Span::styled(edge.to_columns.join(", "), col_style),
+            ]));
+        }
     }
 
     f.render_widget(
@@ -2679,6 +2613,71 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// Render one rounded-corner box centered at `indent` width `inner_w`,
+/// containing a bold title and a muted subtitle line. Returns three
+/// `Line`s: top border, title row, and a divider+subtitle+bottom row
+/// pair so the boxes always have the same height regardless of label.
+fn render_erd_box(
+    indent: &str,
+    title: &str,
+    subtitle: &str,
+    inner_w: usize,
+    th: Theme,
+    accented: bool,
+) -> Vec<Line<'static>> {
+    let border = Style::default().fg(th.border);
+    let title_style = if accented {
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th.fg).add_modifier(Modifier::BOLD)
+    };
+    let sub_style = Style::default().fg(th.muted);
+
+    let top = format!("╭{}╮", "─".repeat(inner_w));
+    let bottom = format!("╰{}╯", "─".repeat(inner_w));
+    let divider = format!("├{}┤", "─".repeat(inner_w));
+
+    let title_pad_l = inner_w.saturating_sub(title.chars().count()) / 2;
+    let title_pad_r = inner_w
+        .saturating_sub(title.chars().count())
+        .saturating_sub(title_pad_l);
+    let sub_pad_l = inner_w.saturating_sub(subtitle.chars().count()) / 2;
+    let sub_pad_r = inner_w
+        .saturating_sub(subtitle.chars().count())
+        .saturating_sub(sub_pad_l);
+
+    vec![
+        Line::from(vec![
+            Span::raw(indent.to_owned()),
+            Span::styled(top, border),
+        ]),
+        Line::from(vec![
+            Span::raw(indent.to_owned()),
+            Span::styled("│", border),
+            Span::raw(" ".repeat(title_pad_l)),
+            Span::styled(title.to_owned(), title_style),
+            Span::raw(" ".repeat(title_pad_r)),
+            Span::styled("│", border),
+        ]),
+        Line::from(vec![
+            Span::raw(indent.to_owned()),
+            Span::styled(divider, border),
+        ]),
+        Line::from(vec![
+            Span::raw(indent.to_owned()),
+            Span::styled("│", border),
+            Span::raw(" ".repeat(sub_pad_l)),
+            Span::styled(subtitle.to_owned(), sub_style),
+            Span::raw(" ".repeat(sub_pad_r)),
+            Span::styled("│", border),
+        ]),
+        Line::from(vec![
+            Span::raw(indent.to_owned()),
+            Span::styled(bottom, border),
+        ]),
+    ]
 }
 
 // ─── SQL editor pane ──────────────────────────────────────────────────────────
