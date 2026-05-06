@@ -97,6 +97,32 @@ just fmt            # Format
 just smoke-sqlite   # Quick SQLite smoke test
 ```
 
+## Sample ERP database
+
+A small lite-ERP dataset (customers, products, sales orders, sales-order
+items, work orders, invoices, payments) lives in `seed/`. The same SQL is
+portable across both supported drivers.
+
+Each driver has its own up/down recipe so you can pick the sandbox you
+want to poke at:
+
+```sh
+# Postgres (dockerized, seed scripts auto-run on first container start).
+just postgres-up                                 # alias: just up
+tsql tui --url postgres://tsql:tsql@127.0.0.1:54329/tsql
+just postgres-down                               # alias: just down
+just postgres-reseed                             # wipe volume + re-init
+
+# SQLite (local file, default ./erp.db).
+just sqlite-up                                   # alias: just seed-sqlite
+tsql tui --url sqlite:./erp.db
+just sqlite-down
+
+# Bring every driver up or down at once.
+just drivers-up
+just drivers-down
+```
+
 ## CI and Security
 
 Pull requests must pass:
