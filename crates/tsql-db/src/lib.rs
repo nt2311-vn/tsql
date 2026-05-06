@@ -81,6 +81,14 @@ pub struct IndexInfo {
     pub name: String,
     pub column_names: Vec<String>,
     pub is_unique: bool,
+    /// Whether this is the index backing the primary-key constraint.
+    /// SQLite reports this via `PRAGMA index_list.origin == 'pk'`;
+    /// Postgres via `pg_index.indisprimary`.
+    pub is_primary: bool,
+    /// Index access method, lowercased. Postgres: `btree`, `hash`,
+    /// `gin`, `gist`, `brin`, `spgist`. SQLite: always `btree`
+    /// (FTS / R*Tree show up as virtual tables, not in PRAGMA).
+    pub method: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,14 +327,15 @@ async fn fetch_sqlite_table_info(
         });
     }
 
-    // Indexes
+    // Indexes. PRAGMA index_list rows: (seq, name, unique, origin, partial).
+    // origin is 'c' (CREATE INDEX), 'u' (UNIQUE constraint), 'pk' (PK).
     let index_list: Vec<(i64, String, i64, String, i64)> =
         sqlx::query_as(&format!("PRAGMA index_list(\"{}\")", table))
             .fetch_all(pool)
             .await?;
 
     let mut indexes = Vec::new();
-    for (_, index_name, unique, _, _) in index_list {
+    for (_, index_name, unique, origin, _) in index_list {
         let index_info: Vec<(i64, i64, String)> =
             sqlx::query_as(&format!("PRAGMA index_info(\"{}\")", index_name))
                 .fetch_all(pool)
@@ -336,6 +345,11 @@ async fn fetch_sqlite_table_info(
             name: index_name,
             column_names: index_info.into_iter().map(|(_, _, name)| name).collect(),
             is_unique: unique == 1,
+            is_primary: origin == "pk",
+            // Every regular SQLite index uses a B-tree under the hood;
+            // FTS/R*Tree etc. live as virtual tables and don't appear
+            // in PRAGMA index_list.
+            method: "btree".to_owned(),
         });
     }
 
@@ -466,39 +480,49 @@ async fn fetch_postgres_table_info(
         })
         .collect();
 
-    // Indexes
-    let idx_rows: Vec<(String, String, bool)> = sqlx::query_as(
-        "SELECT i.relname AS index_name,
-                a.attname AS column_name,
-                ix.indisunique
+    // Indexes. Includes the primary-key index so users can see the
+    // default btree backing the PK; pg_am.amname carries the access
+    // method (btree/hash/gin/gist/brin/spgist).
+    let idx_rows: Vec<(String, String, bool, bool, String)> = sqlx::query_as(
+        "SELECT i.relname        AS index_name,
+                a.attname        AS column_name,
+                ix.indisunique   AS is_unique,
+                ix.indisprimary  AS is_primary,
+                am.amname        AS method
          FROM pg_class t
-         JOIN pg_index ix ON t.oid = ix.indrelid
-         JOIN pg_class i ON i.oid = ix.indexrelid
+         JOIN pg_index ix    ON t.oid = ix.indrelid
+         JOIN pg_class i     ON i.oid = ix.indexrelid
+         JOIN pg_am am       ON am.oid = i.relam
          JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
          JOIN pg_namespace n ON n.oid = t.relnamespace
-         WHERE n.nspname = $1 AND t.relname = $2 AND NOT ix.indisprimary
-         ORDER BY i.relname, a.attnum",
+         WHERE n.nspname = $1 AND t.relname = $2
+         ORDER BY ix.indisprimary DESC, ix.indisunique DESC, i.relname, a.attnum",
     )
     .bind(schema)
     .bind(table)
     .fetch_all(pool)
     .await?;
 
-    let mut idx_map: BTreeMap<String, (Vec<String>, bool)> = BTreeMap::new();
-    for (idx_name, col_name, is_unique) in idx_rows {
+    // (cols, is_unique, is_primary, method) keyed by index name.
+    let mut idx_map: BTreeMap<String, (Vec<String>, bool, bool, String)> = BTreeMap::new();
+    for (idx_name, col_name, is_unique, is_primary, method) in idx_rows {
         idx_map
             .entry(idx_name)
-            .or_insert_with(|| (Vec::new(), is_unique))
+            .or_insert_with(|| (Vec::new(), is_unique, is_primary, method))
             .0
             .push(col_name);
     }
     let indexes = idx_map
         .into_iter()
-        .map(|(name, (column_names, is_unique))| IndexInfo {
-            name,
-            column_names,
-            is_unique,
-        })
+        .map(
+            |(name, (column_names, is_unique, is_primary, method))| IndexInfo {
+                name,
+                column_names,
+                is_unique,
+                is_primary,
+                method,
+            },
+        )
         .collect();
 
     // Constraints (CHECK + UNIQUE)

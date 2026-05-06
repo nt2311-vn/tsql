@@ -16,8 +16,23 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
   `${ENV_VAR}` placeholders and comments survive byte-for-byte. Name
   collisions are resolved with a `-N` numeric suffix.
 - **Number-key tab navigation.** `1`-`6` jump straight to Records,
-  Columns, Indexes, Keys, Constraints, and ERD. `l`/`h` cycling stays
-  intact for muscle memory.
+  Columns, Indexes, Keys, Constraints, and ERD. The tab labels now
+  also display their hotkey (`1 Records`, `2 Columns`, …) so the
+  binding is discoverable. `l`/`h` cycling stays intact for muscle
+  memory.
+- **Index type + PK visibility.** The Indexes tab now surfaces the
+  access method (`BTREE`, `HASH`, `GIN`, `GIST`, `BRIN`, `SPGIST`)
+  and a `PK` column with a `★` for the primary-key index. Postgres
+  metadata now includes the PK index (previously filtered out) so the
+  default btree backing each table is always visible. SQLite reports
+  every regular index as btree (FTS/R*Tree live as virtual tables).
+- **Visual ERD.** Replaced the flat tree-style FK list with a 2-D
+  box-and-line diagram. Tables lay out on a `cols × rows` grid with
+  rounded-corner boxes; FK edges route as orthogonal L-shapes
+  (horizontal → bend → vertical → bend → horizontal) ending in a `▶`
+  / `◀` arrow head. The currently-selected edge (`j`/`k` cycles)
+  draws last in `theme.warning` so it always sits on top, with a
+  legend underneath spelling out source `column → target.column`.
 - **`Shift+X` closes the active table** and returns to the empty-detail
   placeholder, so you can pick another table without collapsing the
   schema first.

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -149,6 +149,13 @@ impl DetailTab {
             Self::Constraints => "Constraints",
             Self::Erd => "ERD",
         }
+    }
+
+    /// Tab label prefixed with its 1-based hotkey, e.g. `"1 Records"`.
+    /// The number matches the `1`-`6` keyboard shortcut, so users can
+    /// see which key jumps where.
+    fn hotkey_label(self) -> String {
+        format!("{} {}", self.index() + 1, self.label())
     }
 
     fn index(self) -> usize {
@@ -1929,7 +1936,7 @@ fn draw_detail(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             } else {
                 Style::default().fg(th.muted)
             };
-            Line::from(Span::styled(tab.label(), st))
+            Line::from(Span::styled(tab.hotkey_label(), st))
         })
         .collect();
 
@@ -2195,6 +2202,8 @@ fn draw_indexes(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let header = Row::new(vec![
         Cell::from("Index").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
         Cell::from("Columns").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+        Cell::from("Type").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+        Cell::from("PK").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
         Cell::from("Unique").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
     ])
     .style(Style::default().bg(th.sel_bg));
@@ -2203,9 +2212,33 @@ fn draw_indexes(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .indexes
         .iter()
         .map(|idx| {
+            // Type column: render the access method as an upper-case
+            // tag. Primary-key indexes get a `★ btree` prefix in their
+            // own column to make the default index unmistakable.
+            let method_label = idx.method.to_uppercase();
+            let method_style = match idx.method.as_str() {
+                "btree" => Style::default().fg(th.accent),
+                "hash" => Style::default().fg(th.warning),
+                "gin" | "gist" | "spgist" | "brin" => Style::default().fg(th.success),
+                _ => Style::default().fg(th.fg),
+            };
+            let pk_cell = if idx.is_primary {
+                Cell::from("★").style(Style::default().fg(th.warning).add_modifier(Modifier::BOLD))
+            } else {
+                Cell::from("—").style(Style::default().fg(th.muted))
+            };
+            // Highlight the index name in warning when it backs the PK
+            // so the eye lands on the default index first.
+            let name_style = if idx.is_primary {
+                Style::default().fg(th.warning).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.fg)
+            };
             Row::new(vec![
-                Cell::from(idx.name.as_str()).style(Style::default().fg(th.fg)),
+                Cell::from(idx.name.as_str()).style(name_style),
                 Cell::from(idx.column_names.join(", ")).style(Style::default().fg(th.accent2)),
+                Cell::from(method_label).style(method_style),
+                pk_cell,
                 Cell::from(if idx.is_unique { "✓" } else { "—" })
                     .style(Style::default().fg(if idx.is_unique { th.success } else { th.muted })),
             ])
@@ -2216,8 +2249,10 @@ fn draw_indexes(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         Table::new(
             rows,
             [
-                Constraint::Percentage(40),
-                Constraint::Percentage(45),
+                Constraint::Percentage(30),
+                Constraint::Percentage(35),
+                Constraint::Length(8),
+                Constraint::Length(4),
                 Constraint::Percentage(15),
             ],
         )
@@ -2335,131 +2370,307 @@ fn draw_constraints(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 // ─── ERD tab ──────────────────────────────────────────────────────────────────
+//
+// We render the ERD as a 2-D box-and-line diagram instead of a flat
+// list. Tables are laid out on a `cols × rows` grid (cols ≈ √N) so the
+// diagram fits a typical terminal at any schema size. Each table is a
+// rounded rectangle; FK edges are routed as orthogonal L-shapes
+// (horizontal → bend → vertical → bend → horizontal) with an arrow
+// head at the referenced-table side. The currently-selected edge is
+// drawn last in `theme.warning` so it sits on top of any crossings.
+//
+// We don't try to be a full graph autorouter — overlaps are accepted
+// because (a) the user can hop edges with `j/k` and the highlight
+// always wins visually, and (b) a real autorouter would need a much
+// larger code budget than this client deserves.
+
+/// One cell of the ERD char canvas. Tracks the glyph plus a tiny style
+/// payload (foreground colour + bold) so we can convert runs back into
+/// styled `Span`s when we hand the buffer to ratatui.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ErdCell {
+    ch: char,
+    fg: Color,
+    bold: bool,
+}
 
 fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let th = app.theme;
     let schema = &app.current_schema;
 
-    if app.relationships.is_empty() {
+    // Collect the table set: every table that participates in an edge,
+    // plus all tables in the active schema (so standalone tables still
+    // show as boxes).
+    let mut table_set: BTreeSet<String> = BTreeSet::new();
+    for e in &app.relationships {
+        table_set.insert(e.from_table.clone());
+        table_set.insert(e.to_table.clone());
+    }
+    if let Some(ov) = &app.overview {
+        if let Some(si) = ov.schemas.iter().find(|s| s.name == *schema) {
+            for t in &si.tables {
+                table_set.insert(t.clone());
+            }
+        }
+    }
+    let tables: Vec<String> = table_set.into_iter().collect();
+
+    if tables.is_empty() {
         let hint = if schema.is_empty() {
             "  No schema selected."
         } else {
-            "  No foreign-key relationships found in this schema."
+            "  No tables in this schema."
         };
         f.render_widget(muted_para(hint, th), area);
         return;
     }
 
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled(
-                format!("  ERD  schema: {schema}  "),
-                Style::default()
-                    .fg(th.bg)
-                    .bg(th.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {} relationship(s)  ", app.relationships.len()),
-                Style::default().fg(th.muted),
-            ),
-        ]),
-        Line::default(),
-    ];
+    // ── Grid layout ─────────────────────────────────────────────────
+    let n = tables.len();
+    let cols = (n as f32).sqrt().ceil() as usize;
+    let cols = cols.max(1);
+    let rows = n.div_ceil(cols);
+    // Box wide enough for the longest table name, but never narrower
+    // than 12 cells so the diagram doesn't degenerate into stripes.
+    let name_max = tables.iter().map(|t| t.chars().count()).max().unwrap_or(8);
+    let box_w = name_max.max(10) + 4;
+    let box_h = 3usize;
+    let h_gap = 6usize;
+    let v_gap = 2usize;
 
-    // Walk relationships in their (already-sorted) order so the flat
-    // index `erd_selected` lines up with the rendered rows.
-    let selected = app.erd_selected;
-    let mut prev_from: Option<&str> = None;
-    let mut group_remaining = 0usize;
-    for (idx, edge) in app.relationships.iter().enumerate() {
-        let from = edge.from_table.as_str();
-        if Some(from) != prev_from {
-            // Header for a new source-table group.
-            lines.push(Line::from(vec![Span::styled(
-                format!("  ┌─  {from}"),
-                Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
-            )]));
-            // Count consecutive edges that share this from_table.
-            group_remaining = app.relationships[idx..]
-                .iter()
-                .take_while(|e| e.from_table == edge.from_table)
-                .count();
-            prev_from = Some(from);
+    let canvas_w = cols * box_w + cols.saturating_sub(1) * h_gap;
+    let canvas_h = rows * box_h + rows.saturating_sub(1) * v_gap;
+
+    let blank = ErdCell {
+        ch: ' ',
+        fg: th.fg,
+        bold: false,
+    };
+    let mut buf: Vec<Vec<ErdCell>> = vec![vec![blank; canvas_w]; canvas_h];
+
+    let put = |buf: &mut Vec<Vec<ErdCell>>, x: usize, y: usize, ch: char, fg: Color, bold: bool| {
+        if y < buf.len() && x < buf[0].len() {
+            buf[y][x] = ErdCell { ch, fg, bold };
         }
-        let connector = if group_remaining == 1 { "└" } else { "├" };
-        group_remaining -= 1;
+    };
 
-        let is_selected = idx == selected;
-        let row_bg = if is_selected { th.sel_bg } else { th.bg };
-        let row_fg = if is_selected { th.sel_fg } else { th.fg };
-        let highlight = Style::default().fg(row_fg).bg(row_bg);
-        let arrow = if is_selected {
-            "  ━━▶  "
-        } else {
-            "  ──▶  "
-        };
+    let pos_of = |idx: usize| -> (usize, usize) {
+        let r = idx / cols;
+        let c = idx % cols;
+        (c * (box_w + h_gap), r * (box_h + v_gap))
+    };
 
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {connector}── "),
-                Style::default().fg(th.border).bg(row_bg),
-            ),
-            Span::styled(edge.from_columns.join(", "), highlight),
-            Span::styled(
-                arrow,
-                Style::default()
-                    .fg(if is_selected { th.accent } else { th.muted })
-                    .bg(row_bg)
-                    .add_modifier(if is_selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(
-                edge.to_table.clone(),
-                Style::default()
-                    .fg(th.accent)
-                    .bg(row_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(".", Style::default().fg(th.muted).bg(row_bg)),
-            Span::styled(edge.to_columns.join(", "), highlight),
-        ]));
+    let table_idx: HashMap<&str, usize> = tables
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i))
+        .collect();
+    let referenced: HashSet<&str> = app
+        .relationships
+        .iter()
+        .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
+        .collect();
 
-        if group_remaining == 0 {
-            lines.push(Line::default());
+    // ── Draw boxes ─────────────────────────────────────────────────
+    for (i, name) in tables.iter().enumerate() {
+        let (x, y) = pos_of(i);
+        let is_referenced = referenced.contains(name.as_str());
+        let title_color = if is_referenced { th.accent } else { th.muted };
+        // top
+        put(&mut buf, x, y, '╭', th.border, false);
+        put(&mut buf, x + box_w - 1, y, '╮', th.border, false);
+        for k in 1..box_w - 1 {
+            put(&mut buf, x + k, y, '─', th.border, false);
+        }
+        // middle
+        put(&mut buf, x, y + 1, '│', th.border, false);
+        put(&mut buf, x + box_w - 1, y + 1, '│', th.border, false);
+        for k in 1..box_w - 1 {
+            put(&mut buf, x + k, y + 1, ' ', th.fg, false);
+        }
+        let inner_w = box_w - 2;
+        let pad = inner_w.saturating_sub(name.chars().count()) / 2;
+        for (k, ch) in name.chars().enumerate() {
+            put(&mut buf, x + 1 + pad + k, y + 1, ch, title_color, true);
+        }
+        // bottom
+        put(&mut buf, x, y + 2, '╰', th.border, false);
+        put(&mut buf, x + box_w - 1, y + 2, '╯', th.border, false);
+        for k in 1..box_w - 1 {
+            put(&mut buf, x + k, y + 2, '─', th.border, false);
         }
     }
 
-    // Show unreferenced tables if we have the overview
-    if let Some(ov) = &app.overview {
-        if let Some(si) = ov.schemas.iter().find(|s| s.name == *schema) {
-            let referenced: HashSet<&str> = app
-                .relationships
-                .iter()
-                .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
-                .collect();
-            let standalone: Vec<&str> = si
-                .tables
-                .iter()
-                .map(String::as_str)
-                .filter(|name| !referenced.contains(*name))
-                .collect();
-            if !standalone.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "  Standalone tables (no FK edges):",
-                    Style::default().fg(th.muted),
-                )));
-                for name in standalone {
-                    lines.push(Line::from(vec![
-                        Span::styled("    ◆  ", Style::default().fg(th.muted)),
-                        Span::styled(name, Style::default().fg(th.fg)),
-                    ]));
-                }
+    // ── Draw edges ─────────────────────────────────────────────────
+    // Two passes: non-selected first, selected last so the highlight
+    // sits on top of any crossings.
+    let selected = app.erd_selected;
+    let order: Vec<usize> = (0..app.relationships.len())
+        .filter(|i| *i != selected)
+        .chain(std::iter::once(selected).filter(|_| selected < app.relationships.len()))
+        .collect();
+    for eid in order {
+        let edge = &app.relationships[eid];
+        let Some(&from_i) = table_idx.get(edge.from_table.as_str()) else {
+            continue;
+        };
+        let Some(&to_i) = table_idx.get(edge.to_table.as_str()) else {
+            continue;
+        };
+        if from_i == to_i {
+            continue; // self-references aren't worth routing
+        }
+        let is_selected = eid == selected;
+        let edge_color = if is_selected { th.warning } else { th.muted };
+        let bold = is_selected;
+
+        let (fx, fy) = pos_of(from_i);
+        let (tx, ty) = pos_of(to_i);
+        let from_left_to_right = fx <= tx;
+        let (sx, sy) = if from_left_to_right {
+            (fx + box_w - 1, fy + box_h / 2)
+        } else {
+            (fx, fy + box_h / 2)
+        };
+        let (ex, ey) = if from_left_to_right {
+            (tx, ty + box_h / 2)
+        } else {
+            (tx + box_w - 1, ty + box_h / 2)
+        };
+
+        // Step out one cell from the source so we don't trample the
+        // box border.
+        let stub_x = if from_left_to_right {
+            sx + 1
+        } else {
+            sx.saturating_sub(1)
+        };
+        let target_x = if from_left_to_right {
+            ex.saturating_sub(1)
+        } else {
+            ex + 1
+        };
+        if stub_x < buf[0].len() && buf[sy][stub_x].ch == ' ' {
+            put(&mut buf, stub_x, sy, '─', edge_color, bold);
+        }
+
+        let mid_x = (stub_x + target_x) / 2;
+
+        // Segment 1: horizontal from stub to mid_x
+        let (a, b) = (stub_x.min(mid_x), stub_x.max(mid_x));
+        for x in a..=b {
+            if buf[sy][x].ch == ' ' || buf[sy][x].ch == '─' {
+                put(&mut buf, x, sy, '─', edge_color, bold);
             }
         }
+        // Segment 2: vertical at mid_x. Bend glyphs depend on which
+        // side the horizontal segment came from:
+        //   left → down  ╮      right → down  ╭
+        //   left → up    ╯      right → up    ╰
+        if sy != ey {
+            let going_down = ey > sy;
+            let bend_top = match (from_left_to_right, going_down) {
+                (true, true) => '╮',
+                (true, false) => '╯',
+                (false, true) => '╭',
+                (false, false) => '╰',
+            };
+            let bend_bot = match (from_left_to_right, going_down) {
+                (true, true) => '╰',
+                (true, false) => '╭',
+                (false, true) => '╯',
+                (false, false) => '╮',
+            };
+            put(&mut buf, mid_x, sy, bend_top, edge_color, bold);
+            let (a, b) = (sy.min(ey), sy.max(ey));
+            for y in (a + 1)..b {
+                if buf[y][mid_x].ch == ' ' {
+                    put(&mut buf, mid_x, y, '│', edge_color, bold);
+                }
+            }
+            put(&mut buf, mid_x, ey, bend_bot, edge_color, bold);
+        }
+        // Segment 3: horizontal from mid_x to target_x
+        let (a, b) = (mid_x.min(target_x), mid_x.max(target_x));
+        for x in a..=b {
+            if x == mid_x && sy != ey {
+                continue;
+            }
+            if buf[ey][x].ch == ' ' || buf[ey][x].ch == '─' {
+                put(&mut buf, x, ey, '─', edge_color, bold);
+            }
+        }
+        // Arrow head adjacent to the target box.
+        let head = if from_left_to_right { '▶' } else { '◀' };
+        let head_color = if is_selected { th.accent } else { edge_color };
+        put(&mut buf, target_x, ey, head, head_color, true);
+    }
+
+    // ── Convert buffer to styled lines ─────────────────────────────
+    let header = Line::from(vec![
+        Span::styled(
+            format!("  ERD  schema: {schema}  "),
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  {} table(s), {} edge(s)  j/k select  o jump  ",
+                tables.len(),
+                app.relationships.len()
+            ),
+            Style::default().fg(th.muted),
+        ),
+    ]);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(canvas_h + 4);
+    lines.push(header);
+    lines.push(Line::default());
+    for row in &buf {
+        let mut spans: Vec<Span> = Vec::new();
+        let mut current = String::new();
+        let mut current_style = Style::default().fg(th.fg);
+        for cell in row {
+            let mut st = Style::default().fg(cell.fg);
+            if cell.bold {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            if st != current_style && !current.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut current), current_style));
+            }
+            current.push(cell.ch);
+            current_style = st;
+        }
+        if !current.is_empty() {
+            spans.push(Span::styled(current, current_style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Selected-edge legend underneath the diagram.
+    if let Some(edge) = app.relationships.get(selected) {
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled("  selected: ", Style::default().fg(th.muted)),
+            Span::styled(
+                edge.from_table.clone(),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(".", Style::default().fg(th.muted)),
+            Span::styled(edge.from_columns.join(", "), Style::default().fg(th.fg)),
+            Span::styled(
+                "  ─▶  ",
+                Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                edge.to_table.clone(),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(".", Style::default().fg(th.muted)),
+            Span::styled(edge.to_columns.join(", "), Style::default().fg(th.fg)),
+        ]));
     }
 
     f.render_widget(
@@ -2661,6 +2872,16 @@ mod tests {
     fn all_tabs_have_labels() {
         for tab in ALL_TABS {
             assert!(!tab.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn hotkey_label_prefixes_index() {
+        // Tab order is fixed by ALL_TABS, so labels must start with
+        // their 1-based hotkey to match the `1`-`6` shortcuts.
+        for (idx, tab) in ALL_TABS.iter().enumerate() {
+            let expected = format!("{} {}", idx + 1, tab.label());
+            assert_eq!(tab.hotkey_label(), expected);
         }
     }
 
