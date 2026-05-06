@@ -97,6 +97,25 @@ just fmt            # Format
 just smoke-sqlite   # Quick SQLite smoke test
 ```
 
+## Sample ERP database
+
+A small lite-ERP dataset (customers, products, sales orders, sales-order
+items, work orders, invoices, payments) lives in `seed/`. The same SQL is
+portable across both supported drivers.
+
+```sh
+# Postgres: seed scripts auto-run on first container start.
+just up
+tsql tui --url postgres://tsql:tsql@127.0.0.1:54329/tsql
+
+# Re-run the seed (drops the volume, re-initializes).
+just reseed
+
+# SQLite: apply the same schema + data to a local file.
+just seed-sqlite              # writes ./erp.db
+tsql tui --url sqlite:./erp.db
+```
+
 ## CI and Security
 
 Pull requests must pass:

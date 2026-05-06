@@ -8,6 +8,14 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ### Added
 
+- **Lite ERP seed dataset** in `seed/` (`01_schema.sql`, `02_data.sql`):
+  customers, products, sales orders, sales-order items, work orders,
+  invoices, payments. The Postgres compose service mounts `seed/` at
+  `/docker-entrypoint-initdb.d`, so `just up` produces a ready-to-browse
+  database. New justfile recipes: `reseed` (drop volume + re-init) and
+  `seed-sqlite [db]` (apply the same SQL to a SQLite file). The SQL is
+  portable across Postgres and SQLite so both drivers can be exercised
+  against identical data.
 - **Postgres metadata integration tests** (`crates/tsql-db/tests/postgres.rs`):
   `postgres_overview_lists_tables_and_schemas`,
   `postgres_table_info_columns_and_pk`,

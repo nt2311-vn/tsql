@@ -61,6 +61,19 @@ up:
 down:
     {{docker_compose}} down --remove-orphans
 
+# Wipe the Postgres volume so the next `just up` re-runs the seed scripts.
+reseed:
+    {{docker_compose}} down --volumes --remove-orphans
+    {{docker_compose}} up -d --wait
+
+# Apply the same ERP seed to a SQLite file (default: ./erp.db). Drop the file
+# first so re-runs are idempotent. Use with `tsql tui --url sqlite:./erp.db`.
+seed-sqlite db="erp.db":
+    rm -f {{db}}
+    sqlite3 {{db}} < seed/01_schema.sql
+    sqlite3 {{db}} < seed/02_data.sql
+    @echo "seeded {{db}} — try: tsql tui --url sqlite:./{{db}}"
+
 # ─── Security ─────────────────────────────────────────────────────────────────
 
 # Audit dependencies against the RustSec advisory database.
