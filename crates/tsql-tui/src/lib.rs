@@ -12,7 +12,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -2015,7 +2015,7 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             } else {
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
             };
-            Cell::from(name.as_str()).style(st)
+            ccell(name.as_str(), st)
         }),
         th,
         /* row_bg */ th.sel_bg,
@@ -2047,7 +2047,7 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                     } else {
                         Style::default().fg(th.fg).bg(row_bg)
                     };
-                    Cell::from(val.as_str()).style(st)
+                    ccell(val.as_str(), st)
                 }),
                 th,
                 row_bg,
@@ -2064,6 +2064,12 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         area,
         &mut ts,
     );
+}
+
+/// Build a centred `Cell` with the given style. Used by every detail
+/// tab so headers and body values share the same alignment treatment.
+fn ccell<'a>(content: impl Into<std::borrow::Cow<'a, str>>, style: Style) -> Cell<'a> {
+    Cell::from(Line::from(Span::raw(content)).alignment(Alignment::Center)).style(style)
 }
 
 /// Produce `[data, sep, data, sep, …, data]` width constraints for an
@@ -2128,13 +2134,14 @@ fn draw_columns(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .flat_map(|fk| fk.column_names.iter().map(String::as_str))
         .collect();
 
+    let head_st = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
     let header = Row::new(vec![
-        Cell::from("Column").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Type").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("PK").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("FK").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Nullable").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Default").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+        ccell("Column", head_st),
+        ccell("Type", head_st),
+        ccell("PK", head_st),
+        ccell("FK", head_st),
+        ccell("Nullable", head_st),
+        ccell("Default", head_st),
     ])
     .style(Style::default().bg(th.sel_bg));
 
@@ -2151,20 +2158,27 @@ fn draw_columns(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             } else {
                 Style::default().fg(th.fg)
             };
+            let null_st = Style::default().fg(if col.is_nullable {
+                th.muted
+            } else {
+                th.success
+            });
             Row::new(vec![
-                Cell::from(col.name.as_str()).style(name_st),
-                Cell::from(col.data_type.as_str()).style(Style::default().fg(th.accent2)),
-                Cell::from(if is_pk { "✓" } else { "" }).style(Style::default().fg(th.warning)),
-                Cell::from(if is_fk { "✓" } else { "" }).style(Style::default().fg(th.accent2)),
-                Cell::from(if col.is_nullable { "yes" } else { "no" }).style(Style::default().fg(
-                    if col.is_nullable {
-                        th.muted
-                    } else {
-                        th.success
-                    },
-                )),
-                Cell::from(col.default_value.as_deref().unwrap_or("—"))
-                    .style(Style::default().fg(th.muted)),
+                ccell(col.name.as_str(), name_st),
+                ccell(col.data_type.as_str(), Style::default().fg(th.accent2)),
+                ccell(
+                    if is_pk { "✓" } else { "" },
+                    Style::default().fg(th.warning),
+                ),
+                ccell(
+                    if is_fk { "✓" } else { "" },
+                    Style::default().fg(th.accent2),
+                ),
+                ccell(if col.is_nullable { "yes" } else { "no" }, null_st),
+                ccell(
+                    col.default_value.as_deref().unwrap_or("—"),
+                    Style::default().fg(th.muted),
+                ),
             ])
         })
         .collect();
@@ -2199,12 +2213,13 @@ fn draw_indexes(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
+    let head_st = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
     let header = Row::new(vec![
-        Cell::from("Index").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Columns").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Type").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("PK").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Unique").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+        ccell("Index", head_st),
+        ccell("Columns", head_st),
+        ccell("Type", head_st),
+        ccell("PK", head_st),
+        ccell("Unique", head_st),
     ])
     .style(Style::default().bg(th.sel_bg));
 
@@ -2223,9 +2238,12 @@ fn draw_indexes(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                 _ => Style::default().fg(th.fg),
             };
             let pk_cell = if idx.is_primary {
-                Cell::from("★").style(Style::default().fg(th.warning).add_modifier(Modifier::BOLD))
+                ccell(
+                    "★",
+                    Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+                )
             } else {
-                Cell::from("—").style(Style::default().fg(th.muted))
+                ccell("—", Style::default().fg(th.muted))
             };
             // Highlight the index name in warning when it backs the PK
             // so the eye lands on the default index first.
@@ -2234,13 +2252,13 @@ fn draw_indexes(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             } else {
                 Style::default().fg(th.fg)
             };
+            let unique_st = Style::default().fg(if idx.is_unique { th.success } else { th.muted });
             Row::new(vec![
-                Cell::from(idx.name.as_str()).style(name_style),
-                Cell::from(idx.column_names.join(", ")).style(Style::default().fg(th.accent2)),
-                Cell::from(method_label).style(method_style),
+                ccell(idx.name.as_str(), name_style),
+                ccell(idx.column_names.join(", "), Style::default().fg(th.accent2)),
+                ccell(method_label, method_style),
                 pk_cell,
-                Cell::from(if idx.is_unique { "✓" } else { "—" })
-                    .style(Style::default().fg(if idx.is_unique { th.success } else { th.muted })),
+                ccell(if idx.is_unique { "✓" } else { "—" }, unique_st),
             ])
         })
         .collect();
@@ -2270,61 +2288,65 @@ fn draw_keys(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     };
 
-    let mut lines: Vec<Line> = vec![Line::default()];
+    if info.primary_key.is_none() && info.foreign_keys.is_empty() {
+        f.render_widget(muted_para("  No keys defined.", th), area);
+        return;
+    }
+
+    let head_st = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
+    let header = Row::new(vec![
+        ccell("Kind", head_st),
+        ccell("Name", head_st),
+        ccell("Columns", head_st),
+        ccell("References", head_st),
+    ])
+    .style(Style::default().bg(th.sel_bg));
+
+    let mut rows: Vec<Row> = Vec::new();
 
     if let Some(pk) = &info.primary_key {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "  PRIMARY KEY ",
-                Style::default()
-                    .fg(th.bg)
-                    .bg(th.warning)
-                    .add_modifier(Modifier::BOLD),
+        rows.push(Row::new(vec![
+            ccell(
+                "PK",
+                Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled(
+            ccell(pk.name.as_str(), Style::default().fg(th.muted)),
+            ccell(
                 pk.column_names.join(", "),
                 Style::default().fg(th.fg).add_modifier(Modifier::BOLD),
             ),
+            ccell("—", Style::default().fg(th.muted)),
         ]));
-        lines.push(Line::default());
-    }
-
-    if info.foreign_keys.is_empty() && info.primary_key.is_none() {
-        lines.push(Line::from(Span::styled(
-            "  No keys defined.",
-            Style::default().fg(th.muted),
-        )));
     }
 
     for fk in &info.foreign_keys {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "  FK ",
-                Style::default()
-                    .fg(th.bg)
-                    .bg(th.accent2)
-                    .add_modifier(Modifier::BOLD),
+        let target = format!(
+            "{}.{}",
+            fk.referenced_table,
+            fk.referenced_columns.join(", "),
+        );
+        rows.push(Row::new(vec![
+            ccell(
+                "FK",
+                Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled(&fk.name, Style::default().fg(th.muted)),
+            ccell(fk.name.as_str(), Style::default().fg(th.muted)),
+            ccell(fk.column_names.join(", "), Style::default().fg(th.fg)),
+            ccell(target, Style::default().fg(th.accent)),
         ]));
-        lines.push(Line::from(vec![
-            Span::raw("       "),
-            Span::styled(fk.column_names.join(", "), Style::default().fg(th.fg)),
-            Span::styled("  →  ", Style::default().fg(th.muted)),
-            Span::styled(
-                &fk.referenced_table,
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(".", Style::default().fg(th.muted)),
-            Span::styled(fk.referenced_columns.join(", "), Style::default().fg(th.fg)),
-        ]));
-        lines.push(Line::default());
     }
 
     f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(th.bg)),
+        Table::new(
+            rows,
+            [
+                Constraint::Length(6),
+                Constraint::Percentage(30),
+                Constraint::Percentage(30),
+                Constraint::Percentage(34),
+            ],
+        )
+        .header(header),
         area,
     );
 }
