@@ -51,28 +51,48 @@ smoke-sqlite:
 smoke-metadata:
     TSQL_TEST_POSTGRES_URL=postgres://tsql:tsql@127.0.0.1:54329/tsql cargo test -p tsql-db --test metadata -- --ignored
 
-# ─── Docker compose for tests ─────────────────────────────────────────────────
+# ─── Driver sandboxes ─────────────────────────────────────────────────────────
+# Per-driver up/down recipes spin up a seeded sandbox so you can poke at tsql
+# against any supported driver without remembering compose flags. The seed
+# scripts in seed/ are portable, so every driver gets the same ERP dataset.
 
-# Start the dockerized Postgres on localhost:54329 and wait for health-check OK.
-up:
-    {{docker_compose}} up -d --wait
+# Start the dockerized Postgres (localhost:54329) seeded from seed/.
+postgres-up:
+    {{docker_compose}} up -d --wait postgres
+    @echo "postgres ready — try: tsql tui --url postgres://tsql:tsql@127.0.0.1:54329/tsql"
 
-# Stop the dockerized Postgres service and remove any orphan containers.
-down:
+# Stop the dockerized Postgres and remove orphan containers (keeps the volume).
+postgres-down:
     {{docker_compose}} down --remove-orphans
 
-# Wipe the Postgres volume so the next `just up` re-runs the seed scripts.
-reseed:
+# Wipe the Postgres volume so the next `postgres-up` re-runs the seed scripts.
+postgres-reseed:
     {{docker_compose}} down --volumes --remove-orphans
-    {{docker_compose}} up -d --wait
+    just postgres-up
 
-# Apply the same ERP seed to a SQLite file (default: ./erp.db). Drop the file
-# first so re-runs are idempotent. Use with `tsql tui --url sqlite:./erp.db`.
-seed-sqlite db="erp.db":
+# Create + seed a local SQLite file (default: ./erp.db). Idempotent.
+sqlite-up db="erp.db":
     rm -f {{db}}
     sqlite3 {{db}} < seed/01_schema.sql
     sqlite3 {{db}} < seed/02_data.sql
-    @echo "seeded {{db}} — try: tsql tui --url sqlite:./{{db}}"
+    @echo "sqlite ready — try: tsql tui --url sqlite:./{{db}}"
+
+# Remove the local SQLite sandbox file (default: ./erp.db).
+sqlite-down db="erp.db":
+    rm -f {{db}}
+    @echo "removed {{db}}"
+
+# Bring up every driver sandbox at once.
+drivers-up: postgres-up sqlite-up
+
+# Tear down every driver sandbox at once.
+drivers-down: postgres-down sqlite-down
+
+# Backward-compatible aliases for the original Postgres-only recipes.
+alias up := postgres-up
+alias down := postgres-down
+alias reseed := postgres-reseed
+alias seed-sqlite := sqlite-up
 
 # ─── Security ─────────────────────────────────────────────────────────────────
 
