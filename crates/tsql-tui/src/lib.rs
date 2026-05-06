@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -2474,7 +2474,30 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     lines.push(Line::from(chips));
     lines.push(Line::default());
 
-    // ── Section 2: focused selected edge ───────────────────────────
+    // ── Section 2: visual layered diagram ──────────────────────────
+    // Render the whole-schema picture as a Sugiyama-lite layered graph:
+    // tables are grouped into columns by foreign-key depth (referenced
+    // tables on the LEFT, dependent tables on the RIGHT) and FK edges
+    // are routed through vertical channels between columns. The active
+    // edge is drawn last on `theme.warning` so it always wins on
+    // crossings.
+    if !app.relationships.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  Diagram",
+            Style::default()
+                .fg(th.accent2)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )));
+        lines.extend(render_layered_erd(
+            &tables,
+            &app.relationships,
+            app.erd_selected,
+            th,
+        ));
+        lines.push(Line::default());
+    }
+
+    // ── Section 3: focused selected edge ───────────────────────────
     let selected = app
         .erd_selected
         .min(app.relationships.len().saturating_sub(1));
@@ -2555,7 +2578,7 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         lines.push(Line::default());
     }
 
-    // ── Section 3: numbered list of all edges ──────────────────────
+    // ── Section 4: numbered list of all edges ──────────────────────
     if !app.relationships.is_empty() {
         lines.push(Line::from(Span::styled(
             "  All relationships",
@@ -2678,6 +2701,338 @@ fn render_erd_box(
             Span::styled(bottom, border),
         ]),
     ]
+}
+
+/// One cell of the layered-ERD char canvas.
+#[derive(Clone, Copy)]
+struct ErdCell {
+    ch: char,
+    fg: Color,
+    bold: bool,
+}
+
+/// Render a Sugiyama-lite layered ERD into a list of styled lines.
+///
+/// Layout algorithm:
+///   1. **Layer assignment.** For each table, layer = longest path
+///      along outgoing FK edges to a sink (a table that references
+///      nothing). Sinks land at layer 0 (leftmost); the most
+///      dependent tables end up at the highest layer (rightmost).
+///      Cycles are broken by marking nodes on the recursion stack as
+///      layer 0.
+///   2. **Within-layer ordering.** Alphabetical for determinism.
+///   3. **Channel routing.** Edges going from layer F to layer T (F > T)
+///      route through the channel just to the right of layer T's
+///      boxes. Each edge in a given channel is given a unique mid-X
+///      so parallel edges don't overlap. The route is
+///      `source-left-edge → horizontal → bend → vertical → bend →
+///      horizontal → target-right-edge ◀`.
+///   4. **Selected edge wins.** All non-selected edges paint first;
+///      the active edge paints last in `theme.warning` + bold so it
+///      sits on top of any crossings.
+///
+/// Limitations: multi-layer hops (F > T+1) currently route through a
+/// single channel and may overlap intermediate-layer boxes. Acceptable
+/// for v1 — most schemas have ≤3 layers and the active-edge highlight
+/// keeps the focus readable regardless.
+fn render_layered_erd(
+    tables: &[String],
+    edges: &[RelationshipEdge],
+    selected: usize,
+    th: Theme,
+) -> Vec<Line<'static>> {
+    if tables.is_empty() {
+        return Vec::new();
+    }
+
+    // ── 1. Build outgoing-edge adjacency (table → referenced tables) ──
+    let mut out: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in edges {
+        out.entry(e.from_table.as_str())
+            .or_default()
+            .push(e.to_table.as_str());
+    }
+
+    // ── 2. Layer assignment via memoised longest-path-to-sink. ────
+    fn compute_layer<'a>(
+        node: &'a str,
+        out: &HashMap<&'a str, Vec<&'a str>>,
+        memo: &mut HashMap<&'a str, usize>,
+        on_stack: &mut HashSet<&'a str>,
+    ) -> usize {
+        if let Some(&l) = memo.get(node) {
+            return l;
+        }
+        if on_stack.contains(node) {
+            // Cycle: pin to 0 to break it.
+            return 0;
+        }
+        on_stack.insert(node);
+        let layer = match out.get(node) {
+            None => 0,
+            Some(targets) => targets
+                .iter()
+                .map(|t| compute_layer(t, out, memo, on_stack) + 1)
+                .max()
+                .unwrap_or(0),
+        };
+        on_stack.remove(node);
+        memo.insert(node, layer);
+        layer
+    }
+
+    let mut memo: HashMap<&str, usize> = HashMap::new();
+    let mut on_stack: HashSet<&str> = HashSet::new();
+    let mut node_layer: HashMap<&str, usize> = HashMap::new();
+    for t in tables {
+        let l = compute_layer(t.as_str(), &out, &mut memo, &mut on_stack);
+        node_layer.insert(t.as_str(), l);
+    }
+    let max_layer = node_layer.values().copied().max().unwrap_or(0);
+
+    // ── 3. Group tables by layer, sort alphabetically. ────────────
+    let mut layers: Vec<Vec<&str>> = vec![Vec::new(); max_layer + 1];
+    for t in tables {
+        let l = node_layer[t.as_str()];
+        layers[l].push(t.as_str());
+    }
+    for v in layers.iter_mut() {
+        v.sort();
+    }
+
+    // ── 4. Compute layer geometry. ────────────────────────────────
+    const BOX_H: usize = 3;
+    const V_GAP: usize = 1;
+    const CHANNEL_W: usize = 8; // horizontal gap between layers
+
+    let layer_w: Vec<usize> = layers
+        .iter()
+        .map(|ts| {
+            ts.iter()
+                .map(|t| t.chars().count())
+                .max()
+                .unwrap_or(8)
+                .max(10)
+                + 4
+        })
+        .collect();
+
+    let mut layer_x: Vec<usize> = Vec::with_capacity(layers.len());
+    let mut x_cursor = 0;
+    for (i, w) in layer_w.iter().enumerate() {
+        layer_x.push(x_cursor);
+        x_cursor += w;
+        if i + 1 < layer_w.len() {
+            x_cursor += CHANNEL_W;
+        }
+    }
+    let canvas_w = x_cursor;
+
+    let mut node_y: HashMap<&str, usize> = HashMap::new();
+    let mut max_h = 0;
+    for ts in &layers {
+        for (i, t) in ts.iter().enumerate() {
+            node_y.insert(*t, i * (BOX_H + V_GAP));
+        }
+        let h = ts.len() * (BOX_H + V_GAP);
+        if h > max_h {
+            max_h = h;
+        }
+    }
+    let canvas_h = max_h.max(BOX_H);
+
+    let blank = ErdCell {
+        ch: ' ',
+        fg: th.fg,
+        bold: false,
+    };
+    let mut buf: Vec<Vec<ErdCell>> = vec![vec![blank; canvas_w]; canvas_h];
+
+    let put = |buf: &mut Vec<Vec<ErdCell>>, x: usize, y: usize, ch: char, fg: Color, bold: bool| {
+        if y < buf.len() && x < buf[0].len() {
+            buf[y][x] = ErdCell { ch, fg, bold };
+        }
+    };
+
+    let referenced: HashSet<&str> = edges
+        .iter()
+        .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
+        .collect();
+
+    // ── 5. Draw boxes. ────────────────────────────────────────────
+    for (l, ts) in layers.iter().enumerate() {
+        let x0 = layer_x[l];
+        let w = layer_w[l];
+        for name in ts {
+            let y0 = node_y[*name];
+            let title_color = if referenced.contains(name) {
+                th.accent
+            } else {
+                th.muted
+            };
+            // Top
+            put(&mut buf, x0, y0, '╭', th.border, false);
+            put(&mut buf, x0 + w - 1, y0, '╮', th.border, false);
+            for k in 1..w - 1 {
+                put(&mut buf, x0 + k, y0, '─', th.border, false);
+            }
+            // Middle
+            put(&mut buf, x0, y0 + 1, '│', th.border, false);
+            put(&mut buf, x0 + w - 1, y0 + 1, '│', th.border, false);
+            for k in 1..w - 1 {
+                put(&mut buf, x0 + k, y0 + 1, ' ', th.fg, false);
+            }
+            let inner = w - 2;
+            let pad = inner.saturating_sub(name.chars().count()) / 2;
+            for (k, ch) in name.chars().enumerate() {
+                put(&mut buf, x0 + 1 + pad + k, y0 + 1, ch, title_color, true);
+            }
+            // Bottom
+            put(&mut buf, x0, y0 + 2, '╰', th.border, false);
+            put(&mut buf, x0 + w - 1, y0 + 2, '╯', th.border, false);
+            for k in 1..w - 1 {
+                put(&mut buf, x0 + k, y0 + 2, '─', th.border, false);
+            }
+        }
+    }
+
+    // ── 6. Pre-allocate one mid_x per edge inside its channel so
+    //       parallel edges don't overlap. Each channel gets evenly-
+    //       spaced track positions.
+    let mut by_channel: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (eid, edge) in edges.iter().enumerate() {
+        let Some(&fl) = node_layer.get(edge.from_table.as_str()) else {
+            continue;
+        };
+        let Some(&tl) = node_layer.get(edge.to_table.as_str()) else {
+            continue;
+        };
+        if fl <= tl || edge.from_table == edge.to_table {
+            continue;
+        }
+        // Use the channel immediately to the right of the target's layer.
+        by_channel.entry(tl).or_default().push(eid);
+    }
+    let mut edge_mid_x: HashMap<usize, usize> = HashMap::new();
+    for (tl, eids) in &by_channel {
+        let channel_start = layer_x[*tl] + layer_w[*tl]; // first cell after target box
+        let channel_end = if tl + 1 < layer_x.len() {
+            layer_x[tl + 1] // first cell of next layer's box
+        } else {
+            channel_start + CHANNEL_W
+        };
+        let span = channel_end.saturating_sub(channel_start).max(1);
+        let n = eids.len();
+        for (i, &eid) in eids.iter().enumerate() {
+            // Distribute mid_x evenly across the channel: positions
+            // 1..=n out of n+1 slots so neither edge sits on a box
+            // border.
+            let mx = channel_start + (i + 1) * span / (n + 1);
+            edge_mid_x.insert(eid, mx.max(channel_start).min(channel_end - 1));
+        }
+    }
+
+    // ── 7. Route edges: non-selected first, selected last so it
+    //       wins on crossings.
+    let order: Vec<usize> = (0..edges.len())
+        .filter(|i| *i != selected)
+        .chain(std::iter::once(selected).filter(|_| selected < edges.len()))
+        .collect();
+    for eid in order {
+        let edge = &edges[eid];
+        let Some(&fl) = node_layer.get(edge.from_table.as_str()) else {
+            continue;
+        };
+        let Some(&tl) = node_layer.get(edge.to_table.as_str()) else {
+            continue;
+        };
+        if fl <= tl || edge.from_table == edge.to_table {
+            continue; // skip same-layer + self-references for v1
+        }
+        let Some(&mid_x) = edge_mid_x.get(&eid) else {
+            continue;
+        };
+        let is_sel = eid == selected;
+        let color = if is_sel { th.warning } else { th.muted };
+        let bold = is_sel;
+
+        // Source: left edge of from-box (which is on the right since fl > tl).
+        let from_x_left = layer_x[fl];
+        let from_y_mid = node_y[edge.from_table.as_str()] + BOX_H / 2;
+        // Target: right edge of to-box.
+        let to_x_right = layer_x[tl] + layer_w[tl] - 1;
+        let to_y_mid = node_y[edge.to_table.as_str()] + BOX_H / 2;
+
+        // Stub one cell out of source to the left.
+        let stub_x = from_x_left.saturating_sub(1);
+        let target_stub = to_x_right + 1; // cell holding the arrowhead
+
+        // Segment 1: horizontal at from_y_mid from mid_x → stub_x
+        let (a, b) = (mid_x.min(stub_x), mid_x.max(stub_x));
+        for x in a..=b {
+            let cell = buf[from_y_mid][x];
+            if cell.ch == ' ' || cell.ch == '─' || is_sel {
+                put(&mut buf, x, from_y_mid, '─', color, bold);
+            }
+        }
+
+        // Segment 2: vertical at mid_x from from_y_mid → to_y_mid
+        if from_y_mid != to_y_mid {
+            let going_down = to_y_mid > from_y_mid;
+            // We came in from the right (going left), now turn up/down.
+            let bend_top = if going_down { '╭' } else { '╰' };
+            let bend_bot = if going_down { '╯' } else { '╮' };
+            put(&mut buf, mid_x, from_y_mid, bend_top, color, bold);
+            let (a, b) = (from_y_mid.min(to_y_mid), from_y_mid.max(to_y_mid));
+            for y in (a + 1)..b {
+                let cell = buf[y][mid_x];
+                if cell.ch == ' ' || cell.ch == '│' || is_sel {
+                    put(&mut buf, mid_x, y, '│', color, bold);
+                }
+            }
+            put(&mut buf, mid_x, to_y_mid, bend_bot, color, bold);
+        }
+
+        // Segment 3: horizontal at to_y_mid from target_stub → mid_x
+        let (a, b) = (mid_x.min(target_stub), mid_x.max(target_stub));
+        for x in a..=b {
+            if x == mid_x && from_y_mid != to_y_mid {
+                continue; // don't trample the bend
+            }
+            let cell = buf[to_y_mid][x];
+            if cell.ch == ' ' || cell.ch == '─' || is_sel {
+                put(&mut buf, x, to_y_mid, '─', color, bold);
+            }
+        }
+
+        // Arrowhead pointing into the target box's right edge.
+        let head_color = if is_sel { th.accent } else { color };
+        put(&mut buf, target_stub, to_y_mid, '◀', head_color, true);
+    }
+
+    // ── 8. Convert canvas to styled lines. ────────────────────────
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(canvas_h + 2);
+    for row in &buf {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut current = String::new();
+        let mut current_style = Style::default().fg(th.fg);
+        for cell in row {
+            let mut st = Style::default().fg(cell.fg);
+            if cell.bold {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            if st != current_style && !current.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut current), current_style));
+            }
+            current.push(cell.ch);
+            current_style = st;
+        }
+        if !current.is_empty() {
+            spans.push(Span::styled(current, current_style));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 // ─── SQL editor pane ──────────────────────────────────────────────────────────

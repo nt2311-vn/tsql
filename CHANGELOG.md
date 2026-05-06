@@ -26,17 +26,24 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
   metadata now includes the PK index (previously filtered out) so the
   default btree backing each table is always visible. SQLite reports
   every regular index as btree (FTS/R*Tree live as virtual tables).
-- **ERD focused-vertical view.** A first attempt at a 2-D
-  box-and-line diagram with routed orthogonal edges turned out to be
-  unreadable on dense schemas — edge routes ran straight through
-  table boxes. Replaced with a three-section vertical layout that
-  trades graph topology for clarity:
-  1. A compact chip strip of every table in the schema (referenced
-     tables in `accent`, standalone in `muted`).
-  2. The currently-selected relationship rendered as two stacked
-     rounded-corner boxes with a labelled vertical `FOREIGN KEY ▼`
-     arrow between them and the column names printed inside.
-  3. A numbered list of every relationship; `►` marks the active
+- **ERD: layered visual diagram + focused detail.** The ERD tab now
+  has four stacked sections so the user gets the whole-schema
+  picture and the active edge in detail at the same time:
+  1. **Chip strip** of every table (referenced → `accent`,
+     standalone → `muted`).
+  2. **Layered Sugiyama-lite diagram.** Tables are grouped into
+     columns by FK depth (referenced tables on the LEFT, dependent
+     tables on the RIGHT — longest-path-to-sink layering with cycle
+     break) and edges route through vertical channels between
+     columns. Each channel pre-allocates a unique mid-X per edge so
+     parallel arrows don't overlap. The active edge draws last in
+     `theme.warning` + bold so it always wins on crossings, with a
+     `◀` arrowhead pointing at the referenced box.
+  3. **Focused detail.** The currently-selected relationship is
+     rendered as two stacked rounded-corner boxes with a labelled
+     vertical `FOREIGN KEY ▼` arrow between them and the column
+     names printed inside.
+  4. **Numbered list** of every relationship; `►` marks the active
      row; `j`/`k` cycle, `Enter`/`o` jump to source/target table.
 - **Hide Postgres-internal schemas.** The schema picker previously
   surfaced `pg_toast` (and `pg_temp_*` if present) because the query
