@@ -673,6 +673,9 @@ fn column_names(columns: &[impl Column]) -> Vec<String> {
 }
 
 fn postgres_cell(row: &PgRow, index: usize) -> String {
+    use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+    use sqlx::types::{BigDecimal, JsonValue, Uuid};
+
     if row
         .try_get_raw(index)
         .is_ok_and(|value| ValueRef::is_null(&value))
@@ -680,17 +683,47 @@ fn postgres_cell(row: &PgRow, index: usize) -> String {
         return "NULL".to_owned();
     }
 
+    // Try the most specific decoders first. sqlx is strict about Postgres
+    // OIDs — `try_get::<String>` on a `numeric` or `timestamptz` returns
+    // an error, so without these branches every NUMERIC / TIMESTAMP /
+    // DATE / TIME / UUID / JSON cell falls back to `<type_name>` and
+    // looks like a NULL or seed bug.
     row.try_get::<String, _>(index)
-        .or_else(|_| row.try_get::<i64, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<i32, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<i16, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<f64, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<f32, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<bool, _>(index).map(|value| value.to_string()))
+        .or_else(|_| row.try_get::<i64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<i32, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<i16, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<f64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<f32, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<bool, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<BigDecimal, _>(index).map(|v| v.to_string()))
+        .or_else(|_| {
+            row.try_get::<DateTime<Utc>, _>(index)
+                .map(|v| v.to_rfc3339())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveDateTime, _>(index)
+                .map(|v| v.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveDate, _>(index)
+                .map(|v| v.format("%Y-%m-%d").to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveTime, _>(index)
+                .map(|v| v.format("%H:%M:%S%.f").to_string())
+        })
+        .or_else(|_| row.try_get::<Uuid, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<JsonValue, _>(index).map(|v| v.to_string()))
+        .or_else(|_| {
+            row.try_get::<Vec<u8>, _>(index)
+                .map(|v| format!("0x{}", hex_encode(&v)))
+        })
         .unwrap_or_else(|_| format!("<{}>", row.columns()[index].type_info().name()))
 }
 
 fn sqlite_cell(row: &SqliteRow, index: usize) -> String {
+    use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+
     if row
         .try_get_raw(index)
         .is_ok_and(|value| ValueRef::is_null(&value))
@@ -698,12 +731,33 @@ fn sqlite_cell(row: &SqliteRow, index: usize) -> String {
         return "NULL".to_owned();
     }
 
+    // SQLite stores most values as TEXT, INTEGER, or REAL, but declared
+    // TIMESTAMP / DATE columns may also decode as the chrono types
+    // depending on storage. Try chrono after the simple primitives so
+    // the canonical 'YYYY-MM-DD HH:MM:SS' text form takes priority.
     row.try_get::<String, _>(index)
-        .or_else(|_| row.try_get::<i64, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<f64, _>(index).map(|value| value.to_string()))
+        .or_else(|_| row.try_get::<i64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<f64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<bool, _>(index).map(|v| v.to_string()))
+        .or_else(|_| {
+            row.try_get::<DateTime<Utc>, _>(index)
+                .map(|v| v.to_rfc3339())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveDateTime, _>(index)
+                .map(|v| v.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveDate, _>(index)
+                .map(|v| v.format("%Y-%m-%d").to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveTime, _>(index)
+                .map(|v| v.format("%H:%M:%S%.f").to_string())
+        })
         .or_else(|_| {
             row.try_get::<Vec<u8>, _>(index)
-                .map(|value| format!("0x{}", hex_encode(&value)))
+                .map(|v| format!("0x{}", hex_encode(&v)))
         })
         .unwrap_or_else(|_| format!("<{}>", row.columns()[index].type_info().name()))
 }

@@ -45,6 +45,22 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
      names printed inside.
   4. **Numbered list** of every relationship; `►` marks the active
      row; `j`/`k` cycle, `Enter`/`o` jump to source/target table.
+- **Decode timestamp / numeric / uuid / json cells properly.**
+  Records previously rendered every `NUMERIC`, `TIMESTAMP`,
+  `TIMESTAMPTZ`, `DATE`, `TIME`, `UUID`, `JSON`, and `JSONB` value as
+  the literal placeholder `<timestamp>` / `<numeric>` / etc. — they
+  looked like NULLs or seed bugs. Root cause: `postgres_cell` /
+  `sqlite_cell` only tried `String` / `i64` / `f64` / `bool`, which
+  sqlx rejects for those Postgres OIDs. Enabled the sqlx `chrono`,
+  `bigdecimal`, `uuid`, and `json` features and added explicit
+  decode branches: `BigDecimal` → plain decimal, `DateTime<Utc>` →
+  RFC 3339, `NaiveDateTime` → `YYYY-MM-DD HH:MM:SS`, `Uuid` →
+  hyphenated, `JsonValue` → compact JSON. Bytes still fall through
+  to `0x…` hex.
+- **Audit ignore for unfixable RSA advisory.** `RUSTSEC-2023-0071`
+  (RSA timing sidechannel) reaches us only transitively through
+  `sqlx-mysql` (we don't use MySQL) and has no upstream fix.
+  Documented + ignored in `just audit` so CI stays green.
 - **Hide Postgres-internal schemas.** The schema picker previously
   surfaced `pg_toast` (and `pg_temp_*` if present) because the query
   only excluded `information_schema` and `pg_catalog`. Now uses
