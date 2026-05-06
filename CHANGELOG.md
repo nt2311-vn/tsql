@@ -8,17 +8,83 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ### Added
 
-- **Lite ERP seed dataset** in `seed/` (`01_schema.sql`, `02_data.sql`):
-  customers, products, sales orders, sales-order items, work orders,
-  invoices, payments. The Postgres compose service mounts `seed/` at
-  `/docker-entrypoint-initdb.d`, so the sandbox is ready to browse on
-  first start. The SQL is portable across Postgres and SQLite so both
-  drivers can be exercised against identical data.
-- **Driver-explicit justfile recipes**: `postgres-up`, `postgres-down`,
-  `postgres-reseed`, `sqlite-up [db]`, `sqlite-down [db]`, plus
-  `drivers-up` / `drivers-down` to bring every sandbox up or down at
-  once. Old `up` / `down` / `reseed` / `seed-sqlite` are kept as
-  backward-compatible aliases.
+- **Persist new connections.** After typing a URL via `n new
+  connection`, the connect screen prompts for a friendly name. Empty +
+  Enter (or Esc) skips; otherwise the URL is appended to
+  `~/.config/tsql/config.toml` so it shows in the picker next time.
+  `tsql_core::append_connection` writes raw TOML so existing
+  `${ENV_VAR}` placeholders and comments survive byte-for-byte. Name
+  collisions are resolved with a `-N` numeric suffix.
+- **Number-key tab navigation.** `1`-`6` jump straight to Records,
+  Columns, Indexes, Keys, Constraints, and ERD. The tab labels now
+  also display their hotkey (`1 Records`, `2 Columns`, …) so the
+  binding is discoverable. `l`/`h` cycling stays intact for muscle
+  memory.
+- **Index type + PK visibility.** The Indexes tab now surfaces the
+  access method (`BTREE`, `HASH`, `GIN`, `GIST`, `BRIN`, `SPGIST`)
+  and a `PK` column with a `★` for the primary-key index. Postgres
+  metadata now includes the PK index (previously filtered out) so the
+  default btree backing each table is always visible. SQLite reports
+  every regular index as btree (FTS/R*Tree live as virtual tables).
+- **ERD: layered visual diagram + focused detail.** The ERD tab now
+  has four stacked sections so the user gets the whole-schema
+  picture and the active edge in detail at the same time:
+  1. **Chip strip** of every table (referenced → `accent`,
+     standalone → `muted`).
+  2. **Layered Sugiyama-lite diagram.** Tables are grouped into
+     columns by FK depth (referenced tables on the LEFT, dependent
+     tables on the RIGHT — longest-path-to-sink layering with cycle
+     break) and edges route through vertical channels between
+     columns. Each channel pre-allocates a unique mid-X per edge so
+     parallel arrows don't overlap. The active edge draws last in
+     `theme.warning` + bold so it always wins on crossings, with a
+     `◀` arrowhead pointing at the referenced box.
+  3. **Focused detail.** The currently-selected relationship is
+     rendered as two stacked rounded-corner boxes with a labelled
+     vertical `FOREIGN KEY ▼` arrow between them and the column
+     names printed inside.
+  4. **Numbered list** of every relationship; `►` marks the active
+     row; `j`/`k` cycle, `Enter`/`o` jump to source/target table.
+- **Decode timestamp / numeric / uuid / json cells properly.**
+  Records previously rendered every `NUMERIC`, `TIMESTAMP`,
+  `TIMESTAMPTZ`, `DATE`, `TIME`, `UUID`, `JSON`, and `JSONB` value as
+  the literal placeholder `<timestamp>` / `<numeric>` / etc. — they
+  looked like NULLs or seed bugs. Root cause: `postgres_cell` /
+  `sqlite_cell` only tried `String` / `i64` / `f64` / `bool`, which
+  sqlx rejects for those Postgres OIDs. Enabled the sqlx `chrono`,
+  `bigdecimal`, `uuid`, and `json` features and added explicit
+  decode branches: `BigDecimal` → plain decimal, `DateTime<Utc>` →
+  RFC 3339, `NaiveDateTime` → `YYYY-MM-DD HH:MM:SS`, `Uuid` →
+  hyphenated, `JsonValue` → compact JSON. Bytes still fall through
+  to `0x…` hex.
+- **Audit ignore for unfixable RSA advisory.** `RUSTSEC-2023-0071`
+  (RSA timing sidechannel) reaches us only transitively through
+  `sqlx-mysql` (we don't use MySQL) and has no upstream fix.
+  Documented + ignored in `just audit` so CI stays green.
+- **Hide Postgres-internal schemas.** The schema picker previously
+  surfaced `pg_toast` (and `pg_temp_*` if present) because the query
+  only excluded `information_schema` and `pg_catalog`. Now uses
+  `NOT LIKE 'pg\_%'` so every internal schema disappears and only
+  user schemas remain.
+- **`Shift+X` closes the active table** and returns to the empty-detail
+  placeholder, so you can pick another table without collapsing the
+  schema first.
+- **Records grid** — vertical column separators (`│`) and zebra-striped
+  rows, plus a new `theme.row_alt_bg` colour. Same renderer is reused
+  for the editor's results pane.
+- **Editor upgrade.** Line-number gutter, basic SQL syntax highlighting
+  (keywords / strings / numbers / comments), current-statement
+  highlight that follows the cursor, `Ctrl+Enter` (and `Alt+Enter` as a
+  terminal-compat fallback) runs only the statement under the cursor,
+  `Ctrl+S` saves to the buffer's file, `:w [path]` and `:e <path>`
+  palette commands for save/open, and per-connection persistent history
+  stored under `~/.local/share/tsql/history/<name>.txt` (capped at 500
+  deduped entries).
+- **Narrower sidebar.** Browser sidebar is now 18% of terminal width
+  (down from 24%), giving the detail pane more room.
+
+### Added (earlier)
+
 - **Postgres metadata integration tests** (`crates/tsql-db/tests/postgres.rs`):
   `postgres_overview_lists_tables_and_schemas`,
   `postgres_table_info_columns_and_pk`,

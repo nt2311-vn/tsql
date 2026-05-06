@@ -97,8 +97,13 @@ alias seed-sqlite := sqlite-up
 # ─── Security ─────────────────────────────────────────────────────────────────
 
 # Audit dependencies against the RustSec advisory database.
+#
+# RUSTSEC-2023-0071 (RSA timing sidechannel) has no upstream fix and
+# only reaches us transitively through `sqlx-mysql`, which we don't
+# enable. Ignore it explicitly so CI stays green; revisit when sqlx
+# 0.9 publishes a patched MySQL driver.
 audit:
-    cargo audit
+    cargo audit --ignore RUSTSEC-2023-0071
 
 # Run cargo audit and remind that TruffleHog/Gitleaks/Semgrep/Trivy live in CI.
 security: audit

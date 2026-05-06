@@ -77,7 +77,12 @@ jobs:
         uses: taiki-e/install-action@cargo-audit
 
       - name: Audit dependencies
-        run: cargo audit
+        # RUSTSEC-2023-0071 (RSA Marvin timing sidechannel) has no
+        # upstream fix and only reaches us transitively through
+        # `sqlx-mysql`, which we don't enable. Mirror the ignore in
+        # `just audit` so the workflow stays green; revisit when
+        # sqlx 0.9 ships with a patched MySQL driver.
+        run: cargo audit --ignore RUSTSEC-2023-0071
 
   postgres-integration:
     name: postgres-integration

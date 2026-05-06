@@ -81,6 +81,14 @@ pub struct IndexInfo {
     pub name: String,
     pub column_names: Vec<String>,
     pub is_unique: bool,
+    /// Whether this is the index backing the primary-key constraint.
+    /// SQLite reports this via `PRAGMA index_list.origin == 'pk'`;
+    /// Postgres via `pg_index.indisprimary`.
+    pub is_primary: bool,
+    /// Index access method, lowercased. Postgres: `btree`, `hash`,
+    /// `gin`, `gist`, `brin`, `spgist`. SQLite: always `btree`
+    /// (FTS / R*Tree show up as virtual tables, not in PRAGMA).
+    pub method: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,14 +327,15 @@ async fn fetch_sqlite_table_info(
         });
     }
 
-    // Indexes
+    // Indexes. PRAGMA index_list rows: (seq, name, unique, origin, partial).
+    // origin is 'c' (CREATE INDEX), 'u' (UNIQUE constraint), 'pk' (PK).
     let index_list: Vec<(i64, String, i64, String, i64)> =
         sqlx::query_as(&format!("PRAGMA index_list(\"{}\")", table))
             .fetch_all(pool)
             .await?;
 
     let mut indexes = Vec::new();
-    for (_, index_name, unique, _, _) in index_list {
+    for (_, index_name, unique, origin, _) in index_list {
         let index_info: Vec<(i64, i64, String)> =
             sqlx::query_as(&format!("PRAGMA index_info(\"{}\")", index_name))
                 .fetch_all(pool)
@@ -336,6 +345,11 @@ async fn fetch_sqlite_table_info(
             name: index_name,
             column_names: index_info.into_iter().map(|(_, _, name)| name).collect(),
             is_unique: unique == 1,
+            is_primary: origin == "pk",
+            // Every regular SQLite index uses a B-tree under the hood;
+            // FTS/R*Tree etc. live as virtual tables and don't appear
+            // in PRAGMA index_list.
+            method: "btree".to_owned(),
         });
     }
 
@@ -351,9 +365,14 @@ async fn fetch_sqlite_table_info(
 }
 
 async fn fetch_postgres_overview(pool: &PgPool) -> Result<DatabaseOverview, DbError> {
+    // Hide every Postgres-internal schema. `information_schema.schemata`
+    // includes `pg_toast`, `pg_temp_*`, and `pg_toast_temp_*` alongside
+    // `pg_catalog`, so a literal NOT IN list isn't enough — match the
+    // whole `pg_%` family with LIKE plus information_schema explicitly.
     let schemas: Vec<(String,)> = sqlx::query_as(
-        "SELECT schema_name FROM information_schema.schemata 
-         WHERE schema_name NOT IN ('information_schema', 'pg_catalog') 
+        "SELECT schema_name FROM information_schema.schemata
+         WHERE schema_name NOT LIKE 'pg\\_%' ESCAPE '\\'
+           AND schema_name <> 'information_schema'
          ORDER BY schema_name",
     )
     .fetch_all(pool)
@@ -466,39 +485,49 @@ async fn fetch_postgres_table_info(
         })
         .collect();
 
-    // Indexes
-    let idx_rows: Vec<(String, String, bool)> = sqlx::query_as(
-        "SELECT i.relname AS index_name,
-                a.attname AS column_name,
-                ix.indisunique
+    // Indexes. Includes the primary-key index so users can see the
+    // default btree backing the PK; pg_am.amname carries the access
+    // method (btree/hash/gin/gist/brin/spgist).
+    let idx_rows: Vec<(String, String, bool, bool, String)> = sqlx::query_as(
+        "SELECT i.relname        AS index_name,
+                a.attname        AS column_name,
+                ix.indisunique   AS is_unique,
+                ix.indisprimary  AS is_primary,
+                am.amname        AS method
          FROM pg_class t
-         JOIN pg_index ix ON t.oid = ix.indrelid
-         JOIN pg_class i ON i.oid = ix.indexrelid
+         JOIN pg_index ix    ON t.oid = ix.indrelid
+         JOIN pg_class i     ON i.oid = ix.indexrelid
+         JOIN pg_am am       ON am.oid = i.relam
          JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
          JOIN pg_namespace n ON n.oid = t.relnamespace
-         WHERE n.nspname = $1 AND t.relname = $2 AND NOT ix.indisprimary
-         ORDER BY i.relname, a.attnum",
+         WHERE n.nspname = $1 AND t.relname = $2
+         ORDER BY ix.indisprimary DESC, ix.indisunique DESC, i.relname, a.attnum",
     )
     .bind(schema)
     .bind(table)
     .fetch_all(pool)
     .await?;
 
-    let mut idx_map: BTreeMap<String, (Vec<String>, bool)> = BTreeMap::new();
-    for (idx_name, col_name, is_unique) in idx_rows {
+    // (cols, is_unique, is_primary, method) keyed by index name.
+    let mut idx_map: BTreeMap<String, (Vec<String>, bool, bool, String)> = BTreeMap::new();
+    for (idx_name, col_name, is_unique, is_primary, method) in idx_rows {
         idx_map
             .entry(idx_name)
-            .or_insert_with(|| (Vec::new(), is_unique))
+            .or_insert_with(|| (Vec::new(), is_unique, is_primary, method))
             .0
             .push(col_name);
     }
     let indexes = idx_map
         .into_iter()
-        .map(|(name, (column_names, is_unique))| IndexInfo {
-            name,
-            column_names,
-            is_unique,
-        })
+        .map(
+            |(name, (column_names, is_unique, is_primary, method))| IndexInfo {
+                name,
+                column_names,
+                is_unique,
+                is_primary,
+                method,
+            },
+        )
         .collect();
 
     // Constraints (CHECK + UNIQUE)
@@ -644,6 +673,9 @@ fn column_names(columns: &[impl Column]) -> Vec<String> {
 }
 
 fn postgres_cell(row: &PgRow, index: usize) -> String {
+    use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+    use sqlx::types::{BigDecimal, JsonValue, Uuid};
+
     if row
         .try_get_raw(index)
         .is_ok_and(|value| ValueRef::is_null(&value))
@@ -651,17 +683,47 @@ fn postgres_cell(row: &PgRow, index: usize) -> String {
         return "NULL".to_owned();
     }
 
+    // Try the most specific decoders first. sqlx is strict about Postgres
+    // OIDs — `try_get::<String>` on a `numeric` or `timestamptz` returns
+    // an error, so without these branches every NUMERIC / TIMESTAMP /
+    // DATE / TIME / UUID / JSON cell falls back to `<type_name>` and
+    // looks like a NULL or seed bug.
     row.try_get::<String, _>(index)
-        .or_else(|_| row.try_get::<i64, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<i32, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<i16, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<f64, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<f32, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<bool, _>(index).map(|value| value.to_string()))
+        .or_else(|_| row.try_get::<i64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<i32, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<i16, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<f64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<f32, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<bool, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<BigDecimal, _>(index).map(|v| v.to_string()))
+        .or_else(|_| {
+            row.try_get::<DateTime<Utc>, _>(index)
+                .map(|v| v.to_rfc3339())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveDateTime, _>(index)
+                .map(|v| v.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveDate, _>(index)
+                .map(|v| v.format("%Y-%m-%d").to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveTime, _>(index)
+                .map(|v| v.format("%H:%M:%S%.f").to_string())
+        })
+        .or_else(|_| row.try_get::<Uuid, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<JsonValue, _>(index).map(|v| v.to_string()))
+        .or_else(|_| {
+            row.try_get::<Vec<u8>, _>(index)
+                .map(|v| format!("0x{}", hex_encode(&v)))
+        })
         .unwrap_or_else(|_| format!("<{}>", row.columns()[index].type_info().name()))
 }
 
 fn sqlite_cell(row: &SqliteRow, index: usize) -> String {
+    use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+
     if row
         .try_get_raw(index)
         .is_ok_and(|value| ValueRef::is_null(&value))
@@ -669,12 +731,33 @@ fn sqlite_cell(row: &SqliteRow, index: usize) -> String {
         return "NULL".to_owned();
     }
 
+    // SQLite stores most values as TEXT, INTEGER, or REAL, but declared
+    // TIMESTAMP / DATE columns may also decode as the chrono types
+    // depending on storage. Try chrono after the simple primitives so
+    // the canonical 'YYYY-MM-DD HH:MM:SS' text form takes priority.
     row.try_get::<String, _>(index)
-        .or_else(|_| row.try_get::<i64, _>(index).map(|value| value.to_string()))
-        .or_else(|_| row.try_get::<f64, _>(index).map(|value| value.to_string()))
+        .or_else(|_| row.try_get::<i64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<f64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<bool, _>(index).map(|v| v.to_string()))
+        .or_else(|_| {
+            row.try_get::<DateTime<Utc>, _>(index)
+                .map(|v| v.to_rfc3339())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveDateTime, _>(index)
+                .map(|v| v.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveDate, _>(index)
+                .map(|v| v.format("%Y-%m-%d").to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveTime, _>(index)
+                .map(|v| v.format("%H:%M:%S%.f").to_string())
+        })
         .or_else(|_| {
             row.try_get::<Vec<u8>, _>(index)
-                .map(|value| format!("0x{}", hex_encode(&value)))
+                .map(|v| format!("0x{}", hex_encode(&v)))
         })
         .unwrap_or_else(|_| format!("<{}>", row.columns()[index].type_info().name()))
 }

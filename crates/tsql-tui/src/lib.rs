@@ -1,6 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::time::Duration;
+
+mod editor;
+use editor::{append_history, highlight_line, history_path, load_history, statement_range_at};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -8,7 +12,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -17,7 +21,7 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tsql_core::{ConnectionConfig, DriverKind};
+use tsql_core::{append_connection, default_config_path, ConnectionConfig, DriverKind};
 use tsql_db::{DatabaseOverview, Pool, RelationshipEdge, StatementOutput, TableInfo};
 use tsql_sql::SqlDocument;
 
@@ -64,6 +68,9 @@ pub struct Theme {
     pub sel_fg: Color,
     pub border: Color,
     pub active_border: Color,
+    /// Alternating row background for the records grid (zebra striping).
+    /// Sits between `bg` and `sel_bg` in lightness.
+    pub row_alt_bg: Color,
 }
 
 impl Theme {
@@ -83,6 +90,7 @@ impl Theme {
             sel_fg: Color::Rgb(205, 214, 244),
             border: Color::Rgb(69, 71, 90),
             active_border: Color::Rgb(137, 180, 250),
+            row_alt_bg: Color::Rgb(36, 36, 56),
         }
     }
 }
@@ -100,6 +108,10 @@ enum AppMode {
 enum ConnectFocus {
     Picker,
     NewUrl,
+    /// Prompt for a friendly name after a successful new-URL connect, so
+    /// the connection can be persisted to `~/.config/tsql/config.toml`.
+    /// Empty input + Enter (or Esc) skips saving.
+    NameNew,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +149,13 @@ impl DetailTab {
             Self::Constraints => "Constraints",
             Self::Erd => "ERD",
         }
+    }
+
+    /// Tab label prefixed with its 1-based hotkey, e.g. `"1 Records"`.
+    /// The number matches the `1`-`6` keyboard shortcut, so users can
+    /// see which key jumps where.
+    fn hotkey_label(self) -> String {
+        format!("{} {}", self.index() + 1, self.label())
     }
 
     fn index(self) -> usize {
@@ -181,6 +200,12 @@ struct AppState {
     connect_idx: usize,
     connect_focus: ConnectFocus,
     connect_input: String,
+    /// URL of the just-connected ad-hoc session, held while we prompt the
+    /// user for a name to persist it under. `None` outside the name flow.
+    pending_save: Option<(DriverKind, String)>,
+    /// Override for the config file path (test hook). When `None` we use
+    /// `tsql_core::default_config_path()`.
+    config_path_override: Option<PathBuf>,
     theme: Theme,
     mode: AppMode,
     pane: BrowserPane,
@@ -205,7 +230,14 @@ struct AppState {
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
     editor_cursor: usize,
-    /// Last 50 successfully-submitted queries, newest last.
+    /// Optional file backing the editor buffer (`Ctrl+S` writes here,
+    /// `:w <path>` retargets it). `None` means in-memory only.
+    editor_path: Option<PathBuf>,
+    /// On-disk history file path for the active connection. Computed
+    /// after a successful connect so each saved connection (and
+    /// hash-named ad-hoc URL) gets its own history.
+    history_path: Option<PathBuf>,
+    /// Last `MAX_HISTORY` successfully-submitted queries, newest last.
     history: Vec<String>,
     /// Index into `history` while the user is browsing it with
     /// Ctrl+P/Ctrl+N. `None` means the editor holds a fresh draft.
@@ -238,6 +270,8 @@ impl AppState {
             saved_connections: Vec::new(),
             connect_idx: 0,
             connect_focus: ConnectFocus::Picker,
+            pending_save: None,
+            config_path_override: None,
             theme: Theme::catppuccin_mocha(),
             mode: AppMode::Browser,
             pane: BrowserPane::Sidebar,
@@ -258,6 +292,8 @@ impl AppState {
             erd_selected: 0,
             editor: String::new(),
             editor_cursor: 0,
+            editor_path: None,
+            history_path: None,
             history: Vec::new(),
             history_idx: None,
             status: "Loading database overview…".to_owned(),
@@ -324,6 +360,7 @@ pub async fn run(driver: DriverKind, url: String) -> Result<()> {
         Ok(ov) => {
             rebuild_sidebar(&mut app, &ov);
             app.overview = Some(ov);
+            wire_history(&mut app).await;
             app.status = nav_hint();
         }
         Err(e) => {
@@ -358,7 +395,7 @@ pub async fn run_connect(connections: Vec<(String, ConnectionConfig)>) -> Result
 }
 
 fn nav_hint() -> String {
-    "j/k navigate  l/Enter expand  h collapse  Tab pane  e editor  q quit".to_owned()
+    "j/k nav  l/Enter expand  h collapse  Tab pane  1-6 tabs  X close  e editor  q quit".to_owned()
 }
 
 // ─── Event loop ───────────────────────────────────────────────────────────────
@@ -480,14 +517,18 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 
     // The command palette steals all input while open.
     if app.command_input.is_some() {
-        return handle_command_key(app, key);
+        return handle_command_key(app, key).await;
     }
 
     match (key.code, key.modifiers) {
         // q quits from any non-text-entry mode
         (KeyCode::Char('q'), KeyModifiers::NONE)
             if app.mode != AppMode::Editor
-                && !(app.mode == AppMode::Connect && app.connect_focus == ConnectFocus::NewUrl) =>
+                && !(app.mode == AppMode::Connect
+                    && matches!(
+                        app.connect_focus,
+                        ConnectFocus::NewUrl | ConnectFocus::NameNew
+                    )) =>
         {
             return Ok(true);
         }
@@ -510,7 +551,7 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 
 /// Handle key input while the `:` command palette is open. Returns
 /// `Ok(true)` only on `:q`/`:quit` to terminate the program.
-fn handle_command_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+async fn handle_command_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     let buf = app
         .command_input
         .as_mut()
@@ -529,7 +570,7 @@ fn handle_command_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         (KeyCode::Enter, _) => {
             let cmd = buf.trim().to_owned();
             app.command_input = None;
-            return run_command(app, &cmd);
+            return run_command(app, &cmd).await;
         }
         (KeyCode::Char(ch), m) if !m.contains(KeyModifiers::CONTROL) => {
             buf.push(ch);
@@ -541,14 +582,15 @@ fn handle_command_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 
 /// Execute a command typed into the `:` palette. Unknown commands set
 /// `last_error` and stay in Browser mode.
-fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
+async fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
     let cmd = command.trim();
-    let (head, _rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+    let (head, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+    let rest = rest.trim();
     match head {
         "" => {}
         "q" | "quit" => return Ok(true),
-        "select" | "s" => prefill_editor_with_select(app),
-        "insert" | "i" => prefill_editor_with_insert(app),
+        "select" => prefill_editor_with_select(app),
+        "insert" => prefill_editor_with_insert(app),
         "describe" | "desc" | "cols" | "columns" => switch_detail_tab(app, DetailTab::Columns),
         "indexes" | "idx" => switch_detail_tab(app, DetailTab::Indexes),
         "keys" => switch_detail_tab(app, DetailTab::Keys),
@@ -560,9 +602,26 @@ fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
                 spawn_relationships(app, schema);
             }
         }
+        // File IO
+        "w" | "write" | "save" => {
+            let target = if rest.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(rest))
+            };
+            save_editor_buffer(app, target).await;
+        }
+        "e" | "edit" | "open" => {
+            if rest.is_empty() {
+                app.last_error = Some("usage: :e <path>".to_owned());
+                app.status = ":e needs a path".to_owned();
+            } else {
+                open_editor_buffer(app, PathBuf::from(rest)).await;
+            }
+        }
         "help" | "h" | "?" => {
-            app.status = ":select :insert :describe :indexes :keys \
-                          :constraints :erd :help :q"
+            app.status = ":select :insert :describe :indexes :keys :constraints :erd \
+                          :w [path] :e <path> :help :q"
                 .to_owned();
         }
         other => {
@@ -571,6 +630,29 @@ fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+fn editor_hint() -> String {
+    "Ctrl+R run all  Ctrl+Enter run current  Ctrl+S save  Ctrl+O open  \
+     Ctrl+P/N history  Esc browser"
+        .to_owned()
+}
+
+/// Clear the active table selection so the detail pane returns to its
+/// empty placeholder. Triggered by Shift+X in Browser mode.
+fn close_current_table(app: &mut AppState) {
+    app.current_table.clear();
+    app.table_info = None;
+    app.records = None;
+    app.relationships.clear();
+    app.record_offset = 0;
+    app.record_row = 0;
+    app.record_col = 0;
+    app.record_table_state.select(Some(0));
+    app.pane = BrowserPane::Sidebar;
+    app.detail_tab = DetailTab::Records;
+    app.last_error = None;
+    app.status = "table closed — pick another from the sidebar".to_owned();
 }
 
 fn switch_detail_tab(app: &mut AppState, tab: DetailTab) {
@@ -638,6 +720,7 @@ async fn handle_connect_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     match app.connect_focus {
         ConnectFocus::Picker => handle_picker_key(app, key).await,
         ConnectFocus::NewUrl => handle_new_url_key(app, key).await,
+        ConnectFocus::NameNew => handle_name_new_key(app, key).await,
     }
 }
 
@@ -701,6 +784,7 @@ async fn handle_new_url_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 }
 
 async fn try_connect(app: &mut AppState, url: String) {
+    let was_new_url = app.mode == AppMode::Connect && app.connect_focus == ConnectFocus::NewUrl;
     app.url = url;
     app.last_error = None;
     app.status = format!("Connecting to {}…", app.url);
@@ -708,14 +792,129 @@ async fn try_connect(app: &mut AppState, url: String) {
         Ok(ov) => {
             rebuild_sidebar(app, &ov);
             app.overview = Some(ov);
-            app.mode = AppMode::Browser;
-            app.status = nav_hint();
+            // Wire up per-connection history. Saved-picker entries use
+            // their config name; ad-hoc URLs fall back to a hashed label
+            // until the user names them via NameNew.
+            wire_history(app).await;
+            // Ad-hoc URLs trigger a save prompt before dropping into the
+            // browser. Saved-picker entries skip the prompt.
+            if was_new_url {
+                app.pending_save = Some((app.driver, app.url.clone()));
+                app.connect_focus = ConnectFocus::NameNew;
+                app.connect_input.clear();
+                app.status = "Name this connection (Enter save, Esc skip)".to_owned();
+            } else {
+                app.mode = AppMode::Browser;
+                app.status = nav_hint();
+            }
         }
         Err(e) => {
             app.last_error = Some(e.to_string());
             app.status = format!("Connection failed: {e}");
         }
     }
+}
+
+/// Handle the post-connect 'name this connection' prompt. Enter with a
+/// non-empty buffer persists to disk; Enter empty or Esc skips. Either
+/// way we transition to Browser mode afterwards.
+async fn handle_name_new_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => finish_save_prompt(app, None).await,
+        KeyCode::Enter => {
+            let name = app.connect_input.trim().to_owned();
+            let chosen = if name.is_empty() { None } else { Some(name) };
+            finish_save_prompt(app, chosen).await;
+        }
+        KeyCode::Backspace => {
+            app.connect_input.pop();
+        }
+        KeyCode::Char(ch) if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' => {
+            // Restrict to TOML-safe key chars so the user can't type a
+            // name we'll have to reject on save.
+            app.connect_input.push(ch);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+async fn finish_save_prompt(app: &mut AppState, name: Option<String>) {
+    if let (Some(name), Some((driver, url))) = (name, app.pending_save.clone()) {
+        let unique = unique_connection_name(&name, &app.saved_connections);
+        let path = app
+            .config_path_override
+            .clone()
+            .unwrap_or_else(default_config_path);
+        let connection = ConnectionConfig {
+            driver,
+            url: url.clone(),
+        };
+        match append_connection(&path, &unique, &connection).await {
+            Ok(()) => {
+                app.saved_connections.push((unique.clone(), connection));
+                app.saved_connections.sort_by(|a, b| a.0.cmp(&b.0));
+                app.status = format!("saved connection '{unique}' to {}", path.display());
+            }
+            Err(e) => {
+                app.last_error = Some(format!("could not save connection: {e}"));
+                app.status = format!("save failed: {e}");
+            }
+        }
+    } else {
+        app.status = nav_hint();
+    }
+    app.pending_save = None;
+    app.connect_input.clear();
+    app.connect_focus = ConnectFocus::Picker;
+    app.mode = AppMode::Browser;
+}
+
+/// If `desired` is already taken in the saved list, append `-2`, `-3`, …
+/// until we land on a free key. The saved list is the source of truth
+/// for in-memory state; the on-disk file may have additional entries
+/// (created by other tsql sessions), but that's a corner case we accept.
+fn unique_connection_name(desired: &str, saved: &[(String, ConnectionConfig)]) -> String {
+    let taken: std::collections::HashSet<&str> = saved.iter().map(|(n, _)| n.as_str()).collect();
+    if !taken.contains(desired) {
+        return desired.to_owned();
+    }
+    for i in 2.. {
+        let candidate = format!("{desired}-{i}");
+        if !taken.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!("infinite range exhausted")
+}
+
+/// Compute and load the on-disk history for the active connection. The
+/// label is the saved-config name when the URL matches a known entry,
+/// or a short hex hash of the URL otherwise. Entries are loaded into
+/// `app.history` and capped at `MAX_HISTORY`.
+async fn wire_history(app: &mut AppState) {
+    let label = app
+        .saved_connections
+        .iter()
+        .find(|(_, c)| c.url == app.url)
+        .map(|(name, _)| name.clone())
+        .unwrap_or_else(|| short_hash(&app.url));
+    let path = history_path(&label);
+    let loaded = load_history(&path, MAX_HISTORY).await;
+    app.history = loaded;
+    app.history_idx = None;
+    app.history_path = Some(path);
+}
+
+/// 12-hex-char FNV-1a hash. Stable, deterministic, and never collides
+/// with a saved-config name (which is restricted to alphanumerics).
+fn short_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("url_{:012x}", h & 0x0000_ffff_ffff_ffff)
 }
 
 /// Open a fresh `Pool` for the active driver/url and load the schema overview.
@@ -734,7 +933,16 @@ async fn handle_editor_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
             app.status = nav_hint();
         }
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-            run_editor_query(app).await;
+            run_editor_query(app, RunScope::All).await;
+        }
+        // Ctrl+Enter (and Alt+Enter as a fallback for terminals that
+        // don't deliver Ctrl+Enter distinctly) runs only the statement
+        // under the cursor.
+        (KeyCode::Enter, KeyModifiers::CONTROL) | (KeyCode::Enter, KeyModifiers::ALT) => {
+            run_editor_query(app, RunScope::Current).await;
+        }
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+            save_editor_buffer(app, None).await;
         }
         // History recall (Ctrl+P / Ctrl+N). Up/Down stay free for line
         // navigation within multi-line queries.
@@ -783,13 +991,30 @@ async fn handle_editor_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     Ok(false)
 }
 
-async fn run_editor_query(app: &mut AppState) {
-    if app.editor.trim().is_empty() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunScope {
+    All,
+    Current,
+}
+
+async fn run_editor_query(app: &mut AppState, scope: RunScope) {
+    let snippet = match scope {
+        RunScope::All => app.editor.clone(),
+        RunScope::Current => {
+            let range = statement_range_at(&app.editor, app.editor_cursor);
+            app.editor[range].to_owned()
+        }
+    };
+    if snippet.trim().is_empty() {
+        app.status = "nothing to run".to_owned();
         return;
     }
     app.last_error = None;
-    app.status = "executing…".to_owned();
-    let doc = SqlDocument::new(app.editor.clone());
+    app.status = match scope {
+        RunScope::All => "executing all…".to_owned(),
+        RunScope::Current => "executing current statement…".to_owned(),
+    };
+    let doc = SqlDocument::new(snippet.clone());
     let pool = app.pool.as_ref().expect("connected pool in editor mode");
     match pool.execute_script(&doc).await {
         Ok(out) => {
@@ -800,12 +1025,64 @@ async fn run_editor_query(app: &mut AppState) {
                 app.record_col = 0;
                 app.record_table_state.select(Some(0));
                 app.status = format!("{rows} rows  Esc → browser");
+            } else {
+                app.status = "ok (no rows)  Esc → browser".to_owned();
             }
-            push_history(app);
+            push_history(app, snippet);
         }
         Err(e) => {
             app.last_error = Some(e.to_string());
             app.status = format!("error: {e}");
+        }
+    }
+}
+
+/// Save the editor buffer to disk. If `target` is `None`, write to the
+/// existing `editor_path`. If both are missing, surface an error so the
+/// user knows to use `:w <path>`.
+async fn save_editor_buffer(app: &mut AppState, target: Option<PathBuf>) {
+    let path = target.or_else(|| app.editor_path.clone());
+    let Some(path) = path else {
+        app.last_error = Some("no file: use :w <path> first".to_owned());
+        app.status = "save: no file".to_owned();
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                app.last_error = Some(format!("could not create dir: {e}"));
+                app.status = format!("save failed: {e}");
+                return;
+            }
+        }
+    }
+    match tokio::fs::write(&path, app.editor.as_bytes()).await {
+        Ok(()) => {
+            app.editor_path = Some(path.clone());
+            app.status = format!("saved {}", path.display());
+        }
+        Err(e) => {
+            app.last_error = Some(format!("save failed: {e}"));
+            app.status = format!("save failed: {e}");
+        }
+    }
+}
+
+/// Open `path` and replace the editor buffer with its contents. Sets
+/// `editor_path` so subsequent `Ctrl+S` writes back to the same file.
+async fn open_editor_buffer(app: &mut AppState, path: PathBuf) {
+    match tokio::fs::read_to_string(&path).await {
+        Ok(text) => {
+            app.editor = text;
+            app.editor_cursor = app.editor.len().min(app.editor_cursor);
+            app.editor_path = Some(path.clone());
+            app.history_idx = None;
+            app.mode = AppMode::Editor;
+            app.status = format!("opened {}", path.display());
+        }
+        Err(e) => {
+            app.last_error = Some(format!("open failed: {e}"));
+            app.status = format!("open failed: {e}");
         }
     }
 }
@@ -816,8 +1093,10 @@ fn editor_insert_str(app: &mut AppState, s: &str) {
     app.history_idx = None;
 }
 
-fn push_history(app: &mut AppState) {
-    let trimmed = app.editor.trim().to_owned();
+const MAX_HISTORY: usize = 500;
+
+fn push_history(app: &mut AppState, entry: String) {
+    let trimmed = entry.trim().to_owned();
     if trimmed.is_empty() {
         return;
     }
@@ -825,13 +1104,20 @@ fn push_history(app: &mut AppState) {
     if app.history.last().map(String::as_str) == Some(trimmed.as_str()) {
         return;
     }
-    app.history.push(trimmed);
-    const MAX_HISTORY: usize = 50;
+    app.history.push(trimmed.clone());
     if app.history.len() > MAX_HISTORY {
         let drop = app.history.len() - MAX_HISTORY;
         app.history.drain(..drop);
     }
     app.history_idx = None;
+    if let Some(path) = app.history_path.clone() {
+        // Best-effort: persist on a detached task so a slow disk doesn't
+        // hold up the editor. Failures surface only as a missing entry
+        // next session, which we accept.
+        tokio::spawn(async move {
+            let _ = append_history(&path, &trimmed).await;
+        });
+    }
 }
 
 fn history_prev(app: &mut AppState) {
@@ -954,7 +1240,33 @@ async fn handle_browser_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         }
         (KeyCode::Char('e'), _) | (KeyCode::Char('i'), _) => {
             app.mode = AppMode::Editor;
-            app.status = "Ctrl+R run  Esc back".to_owned();
+            app.status = editor_hint();
+        }
+        // Shift+X closes the active table and returns the user to the
+        // empty-detail placeholder so they can pick another table without
+        // collapsing the schema first.
+        (KeyCode::Char('X'), _) => {
+            close_current_table(app);
+        }
+        // Number keys jump straight to a detail tab. Mirrors the
+        // l/h cycling but lets the user land on any tab in one keystroke.
+        (KeyCode::Char(ch), _) if matches!(ch, '1'..='6') => {
+            let tab = match ch {
+                '1' => DetailTab::Records,
+                '2' => DetailTab::Columns,
+                '3' => DetailTab::Indexes,
+                '4' => DetailTab::Keys,
+                '5' => DetailTab::Constraints,
+                _ => DetailTab::Erd,
+            };
+            switch_detail_tab(app, tab);
+            if tab == DetailTab::Erd
+                && app.relationships.is_empty()
+                && !app.current_schema.is_empty()
+            {
+                let schema = app.current_schema.clone();
+                spawn_relationships(app, schema);
+            }
         }
         _ => match app.pane {
             BrowserPane::Sidebar => {
@@ -1278,7 +1590,7 @@ fn draw(f: &mut Frame<'_>, app: &AppState) {
         AppMode::Browser => {
             let body = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(24), Constraint::Percentage(76)])
+                .constraints([Constraint::Percentage(18), Constraint::Percentage(82)])
                 .split(root[1]);
             draw_sidebar(f, app, body[0]);
             draw_detail(f, app, body[1]);
@@ -1421,7 +1733,18 @@ fn draw_connect(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         th.border
     };
 
-    let url_display = if app.connect_input.is_empty() && app.connect_focus == ConnectFocus::NewUrl {
+    let in_name_prompt = app.connect_focus == ConnectFocus::NameNew;
+    let url_display = if in_name_prompt && app.connect_input.is_empty() {
+        Span::styled(
+            "  letters / digits / _ / -    Enter save    Esc skip",
+            Style::default().fg(th.muted),
+        )
+    } else if in_name_prompt {
+        Span::styled(
+            format!("  {}_", app.connect_input),
+            Style::default().fg(th.fg),
+        )
+    } else if app.connect_input.is_empty() && app.connect_focus == ConnectFocus::NewUrl {
         Span::styled(
             "  e.g. postgres://user:pass@localhost/db  or  sqlite:./my.db",
             Style::default().fg(th.muted),
@@ -1438,10 +1761,18 @@ fn draw_connect(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         )
     };
 
-    let url_title = if has_saved {
+    let url_title = if in_name_prompt {
+        "  Name this connection  "
+    } else if has_saved {
         "  New Connection (n)  "
     } else {
         "  Connection URL  "
+    };
+
+    let url_border = if in_name_prompt {
+        th.active_border
+    } else {
+        url_border
     };
 
     f.render_widget(
@@ -1605,7 +1936,7 @@ fn draw_detail(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             } else {
                 Style::default().fg(th.muted)
             };
-            Line::from(Span::styled(tab.label(), st))
+            Line::from(Span::styled(tab.hotkey_label(), st))
         })
         .collect();
 
@@ -1664,45 +1995,64 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
+    // Build a zebra-striped grid with vertical column separators. The
+    // widths vector interleaves data columns with 1-wide separator
+    // columns so ratatui's Table draws them as siblings; we render a
+    // styled `│` glyph in each separator slot.
     let col_count = rec.columns.len().max(1);
-    let pct = (100 / col_count) as u16;
-    let widths: Vec<Constraint> = rec
-        .columns
-        .iter()
-        .map(|_| Constraint::Percentage(pct))
-        .collect();
+    let total_pct = 100u16;
+    let sep_count = col_count.saturating_sub(1) as u16;
+    let sep_width = sep_count; // 1 cell each
+    let data_pct = (total_pct.saturating_sub(sep_width) / col_count as u16).max(1);
+    let widths: Vec<Constraint> = build_grid_widths(col_count, data_pct);
 
-    let header: Row = Row::new(rec.columns.iter().enumerate().map(|(ci, name)| {
-        let st = if ci == app.record_col {
-            Style::default()
-                .fg(th.accent)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-        };
-        Cell::from(name.as_str()).style(st)
-    }))
-    .style(Style::default().bg(th.sel_bg))
-    .height(1);
+    let header_cells: Vec<Cell<'_>> = interleave_separators(
+        rec.columns.iter().enumerate().map(|(ci, name)| {
+            let st = if ci == app.record_col {
+                Style::default()
+                    .fg(th.accent)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+            };
+            ccell(name.as_str(), st)
+        }),
+        th,
+        /* row_bg */ th.sel_bg,
+    );
+    let header = Row::new(header_cells)
+        .style(Style::default().bg(th.sel_bg))
+        .height(1);
 
     let rows: Vec<Row> = rec
         .rows
         .iter()
         .enumerate()
         .map(|(ri, row)| {
-            let cells = row.iter().enumerate().map(|(ci, val)| {
-                let st = if ri == app.record_row && ci == app.record_col {
-                    Style::default().fg(th.bg).bg(th.accent)
-                } else if ri == app.record_row {
-                    Style::default().fg(th.sel_fg).bg(th.sel_bg)
-                } else if val == "NULL" {
-                    Style::default().fg(th.muted)
-                } else {
-                    Style::default().fg(th.fg)
-                };
-                Cell::from(val.as_str()).style(st)
-            });
-            Row::new(cells).height(1)
+            let row_bg = if ri == app.record_row {
+                th.sel_bg
+            } else if ri % 2 == 1 {
+                th.row_alt_bg
+            } else {
+                th.bg
+            };
+            let cells = interleave_separators(
+                row.iter().enumerate().map(|(ci, val)| {
+                    let st = if ri == app.record_row && ci == app.record_col {
+                        Style::default().fg(th.bg).bg(th.accent)
+                    } else if ri == app.record_row {
+                        Style::default().fg(th.sel_fg).bg(row_bg)
+                    } else if val == "NULL" {
+                        Style::default().fg(th.muted).bg(row_bg)
+                    } else {
+                        Style::default().fg(th.fg).bg(row_bg)
+                    };
+                    ccell(val.as_str(), st)
+                }),
+                th,
+                row_bg,
+            );
+            Row::new(cells).style(Style::default().bg(row_bg)).height(1)
         })
         .collect();
 
@@ -1714,6 +2064,53 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         area,
         &mut ts,
     );
+}
+
+/// Build a centred `Cell` with the given style. Used by every detail
+/// tab so headers and body values share the same alignment treatment.
+fn ccell<'a>(content: impl Into<std::borrow::Cow<'a, str>>, style: Style) -> Cell<'a> {
+    Cell::from(Line::from(Span::raw(content)).alignment(Alignment::Center)).style(style)
+}
+
+/// Produce `[data, sep, data, sep, …, data]` width constraints for an
+/// `n`-column grid. Each `data` slot gets `data_pct` percent, separators
+/// are 1 cell wide. Returns just `[data]` when `n == 1`.
+fn build_grid_widths(n: usize, data_pct: u16) -> Vec<Constraint> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(2 * n - 1);
+    for i in 0..n {
+        if i > 0 {
+            out.push(Constraint::Length(1));
+        }
+        out.push(Constraint::Percentage(data_pct));
+    }
+    out
+}
+
+/// Interleave a `│` separator cell between every pair of data cells. The
+/// separator inherits the row's background so zebra striping stays
+/// consistent across the row.
+fn interleave_separators<'a, I>(cells: I, th: Theme, row_bg: Color) -> Vec<Cell<'a>>
+where
+    I: IntoIterator<Item = Cell<'a>>,
+{
+    let collected: Vec<Cell<'a>> = cells.into_iter().collect();
+    if collected.len() < 2 {
+        return collected;
+    }
+    let mut out = Vec::with_capacity(2 * collected.len() - 1);
+    let sep_style = Style::default().fg(th.border).bg(row_bg);
+    let mut iter = collected.into_iter();
+    if let Some(first) = iter.next() {
+        out.push(first);
+    }
+    for cell in iter {
+        out.push(Cell::from("│").style(sep_style));
+        out.push(cell);
+    }
+    out
 }
 
 // ─── Columns tab ──────────────────────────────────────────────────────────────
@@ -1737,13 +2134,14 @@ fn draw_columns(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .flat_map(|fk| fk.column_names.iter().map(String::as_str))
         .collect();
 
+    let head_st = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
     let header = Row::new(vec![
-        Cell::from("Column").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Type").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("PK").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("FK").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Nullable").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Default").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+        ccell("Column", head_st),
+        ccell("Type", head_st),
+        ccell("PK", head_st),
+        ccell("FK", head_st),
+        ccell("Nullable", head_st),
+        ccell("Default", head_st),
     ])
     .style(Style::default().bg(th.sel_bg));
 
@@ -1760,20 +2158,27 @@ fn draw_columns(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             } else {
                 Style::default().fg(th.fg)
             };
+            let null_st = Style::default().fg(if col.is_nullable {
+                th.muted
+            } else {
+                th.success
+            });
             Row::new(vec![
-                Cell::from(col.name.as_str()).style(name_st),
-                Cell::from(col.data_type.as_str()).style(Style::default().fg(th.accent2)),
-                Cell::from(if is_pk { "✓" } else { "" }).style(Style::default().fg(th.warning)),
-                Cell::from(if is_fk { "✓" } else { "" }).style(Style::default().fg(th.accent2)),
-                Cell::from(if col.is_nullable { "yes" } else { "no" }).style(Style::default().fg(
-                    if col.is_nullable {
-                        th.muted
-                    } else {
-                        th.success
-                    },
-                )),
-                Cell::from(col.default_value.as_deref().unwrap_or("—"))
-                    .style(Style::default().fg(th.muted)),
+                ccell(col.name.as_str(), name_st),
+                ccell(col.data_type.as_str(), Style::default().fg(th.accent2)),
+                ccell(
+                    if is_pk { "✓" } else { "" },
+                    Style::default().fg(th.warning),
+                ),
+                ccell(
+                    if is_fk { "✓" } else { "" },
+                    Style::default().fg(th.accent2),
+                ),
+                ccell(if col.is_nullable { "yes" } else { "no" }, null_st),
+                ccell(
+                    col.default_value.as_deref().unwrap_or("—"),
+                    Style::default().fg(th.muted),
+                ),
             ])
         })
         .collect();
@@ -1808,10 +2213,13 @@ fn draw_indexes(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
+    let head_st = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
     let header = Row::new(vec![
-        Cell::from("Index").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Columns").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
-        Cell::from("Unique").style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+        ccell("Index", head_st),
+        ccell("Columns", head_st),
+        ccell("Type", head_st),
+        ccell("PK", head_st),
+        ccell("Unique", head_st),
     ])
     .style(Style::default().bg(th.sel_bg));
 
@@ -1819,11 +2227,38 @@ fn draw_indexes(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .indexes
         .iter()
         .map(|idx| {
+            // Type column: render the access method as an upper-case
+            // tag. Primary-key indexes get a `★ btree` prefix in their
+            // own column to make the default index unmistakable.
+            let method_label = idx.method.to_uppercase();
+            let method_style = match idx.method.as_str() {
+                "btree" => Style::default().fg(th.accent),
+                "hash" => Style::default().fg(th.warning),
+                "gin" | "gist" | "spgist" | "brin" => Style::default().fg(th.success),
+                _ => Style::default().fg(th.fg),
+            };
+            let pk_cell = if idx.is_primary {
+                ccell(
+                    "★",
+                    Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ccell("—", Style::default().fg(th.muted))
+            };
+            // Highlight the index name in warning when it backs the PK
+            // so the eye lands on the default index first.
+            let name_style = if idx.is_primary {
+                Style::default().fg(th.warning).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.fg)
+            };
+            let unique_st = Style::default().fg(if idx.is_unique { th.success } else { th.muted });
             Row::new(vec![
-                Cell::from(idx.name.as_str()).style(Style::default().fg(th.fg)),
-                Cell::from(idx.column_names.join(", ")).style(Style::default().fg(th.accent2)),
-                Cell::from(if idx.is_unique { "✓" } else { "—" })
-                    .style(Style::default().fg(if idx.is_unique { th.success } else { th.muted })),
+                ccell(idx.name.as_str(), name_style),
+                ccell(idx.column_names.join(", "), Style::default().fg(th.accent2)),
+                ccell(method_label, method_style),
+                pk_cell,
+                ccell(if idx.is_unique { "✓" } else { "—" }, unique_st),
             ])
         })
         .collect();
@@ -1832,8 +2267,10 @@ fn draw_indexes(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         Table::new(
             rows,
             [
-                Constraint::Percentage(40),
-                Constraint::Percentage(45),
+                Constraint::Percentage(30),
+                Constraint::Percentage(35),
+                Constraint::Length(8),
+                Constraint::Length(4),
                 Constraint::Percentage(15),
             ],
         )
@@ -1851,61 +2288,65 @@ fn draw_keys(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     };
 
-    let mut lines: Vec<Line> = vec![Line::default()];
+    if info.primary_key.is_none() && info.foreign_keys.is_empty() {
+        f.render_widget(muted_para("  No keys defined.", th), area);
+        return;
+    }
+
+    let head_st = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
+    let header = Row::new(vec![
+        ccell("Kind", head_st),
+        ccell("Name", head_st),
+        ccell("Columns", head_st),
+        ccell("References", head_st),
+    ])
+    .style(Style::default().bg(th.sel_bg));
+
+    let mut rows: Vec<Row> = Vec::new();
 
     if let Some(pk) = &info.primary_key {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "  PRIMARY KEY ",
-                Style::default()
-                    .fg(th.bg)
-                    .bg(th.warning)
-                    .add_modifier(Modifier::BOLD),
+        rows.push(Row::new(vec![
+            ccell(
+                "PK",
+                Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled(
+            ccell(pk.name.as_str(), Style::default().fg(th.muted)),
+            ccell(
                 pk.column_names.join(", "),
                 Style::default().fg(th.fg).add_modifier(Modifier::BOLD),
             ),
+            ccell("—", Style::default().fg(th.muted)),
         ]));
-        lines.push(Line::default());
-    }
-
-    if info.foreign_keys.is_empty() && info.primary_key.is_none() {
-        lines.push(Line::from(Span::styled(
-            "  No keys defined.",
-            Style::default().fg(th.muted),
-        )));
     }
 
     for fk in &info.foreign_keys {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "  FK ",
-                Style::default()
-                    .fg(th.bg)
-                    .bg(th.accent2)
-                    .add_modifier(Modifier::BOLD),
+        let target = format!(
+            "{}.{}",
+            fk.referenced_table,
+            fk.referenced_columns.join(", "),
+        );
+        rows.push(Row::new(vec![
+            ccell(
+                "FK",
+                Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled(&fk.name, Style::default().fg(th.muted)),
+            ccell(fk.name.as_str(), Style::default().fg(th.muted)),
+            ccell(fk.column_names.join(", "), Style::default().fg(th.fg)),
+            ccell(target, Style::default().fg(th.accent)),
         ]));
-        lines.push(Line::from(vec![
-            Span::raw("       "),
-            Span::styled(fk.column_names.join(", "), Style::default().fg(th.fg)),
-            Span::styled("  →  ", Style::default().fg(th.muted)),
-            Span::styled(
-                &fk.referenced_table,
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(".", Style::default().fg(th.muted)),
-            Span::styled(fk.referenced_columns.join(", "), Style::default().fg(th.fg)),
-        ]));
-        lines.push(Line::default());
     }
 
     f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(th.bg)),
+        Table::new(
+            rows,
+            [
+                Constraint::Length(6),
+                Constraint::Percentage(30),
+                Constraint::Percentage(30),
+                Constraint::Percentage(34),
+            ],
+        )
+        .header(header),
         area,
     );
 }
@@ -1951,130 +2392,263 @@ fn draw_constraints(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 // ─── ERD tab ──────────────────────────────────────────────────────────────────
+//
+// Earlier iterations of this view tried to draw a 2-D graph with
+// orthogonal-routed edges. On real schemas the routes ran straight
+// through table boxes and the result was unreadable. We've since
+// pivoted to a **focused vertical view** that trades graph topology
+// for clarity:
+//
+//   1. **Tables** — a compact chip strip of every table in the active
+//      schema. Tables that participate in any FK render in `accent`;
+//      standalone tables in `muted` so the user sees the full set.
+//   2. **Selected edge focus** — two stacked rounded-corner boxes
+//      stacked vertically, source on top, target below, with a
+//      labelled vertical arrow between them and the column names
+//      printed inside each box. This is the "what does this edge
+//      mean" panel.
+//   3. **All edges** — a numbered list of every relationship with
+//      the selected one bolded and prefixed with `►`. `j/k` cycles
+//      the selection, `o` jumps to the target table.
+//
+// No autorouting, no overlapping lines, no cognitive load to decode
+// crossings. Every relationship is one Enter / `o` away from being
+// inspected in detail.
 
 fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let th = app.theme;
     let schema = &app.current_schema;
 
-    if app.relationships.is_empty() {
+    // Collect the table set: every table that participates in an edge,
+    // plus all tables in the active schema (so standalone tables still
+    // show as boxes).
+    let mut table_set: BTreeSet<String> = BTreeSet::new();
+    for e in &app.relationships {
+        table_set.insert(e.from_table.clone());
+        table_set.insert(e.to_table.clone());
+    }
+    if let Some(ov) = &app.overview {
+        if let Some(si) = ov.schemas.iter().find(|s| s.name == *schema) {
+            for t in &si.tables {
+                table_set.insert(t.clone());
+            }
+        }
+    }
+    let tables: Vec<String> = table_set.into_iter().collect();
+    let referenced: HashSet<&str> = app
+        .relationships
+        .iter()
+        .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
+        .collect();
+
+    if tables.is_empty() {
         let hint = if schema.is_empty() {
             "  No schema selected."
         } else {
-            "  No foreign-key relationships found in this schema."
+            "  No tables in this schema."
         };
         f.render_widget(muted_para(hint, th), area);
         return;
     }
 
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled(
-                format!("  ERD  schema: {schema}  "),
-                Style::default()
-                    .fg(th.bg)
-                    .bg(th.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {} relationship(s)  ", app.relationships.len()),
-                Style::default().fg(th.muted),
-            ),
-        ]),
-        Line::default(),
-    ];
+    // ── Build the lines top-down ───────────────────────────────────
+    let mut lines: Vec<Line> = Vec::new();
 
-    // Walk relationships in their (already-sorted) order so the flat
-    // index `erd_selected` lines up with the rendered rows.
-    let selected = app.erd_selected;
-    let mut prev_from: Option<&str> = None;
-    let mut group_remaining = 0usize;
-    for (idx, edge) in app.relationships.iter().enumerate() {
-        let from = edge.from_table.as_str();
-        if Some(from) != prev_from {
-            // Header for a new source-table group.
-            lines.push(Line::from(vec![Span::styled(
-                format!("  ┌─  {from}"),
-                Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
-            )]));
-            // Count consecutive edges that share this from_table.
-            group_remaining = app.relationships[idx..]
-                .iter()
-                .take_while(|e| e.from_table == edge.from_table)
-                .count();
-            prev_from = Some(from);
-        }
-        let connector = if group_remaining == 1 { "└" } else { "├" };
-        group_remaining -= 1;
+    // Banner.
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  ERD  schema: {schema}  "),
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  {} table(s), {} relationship(s)  j/k select  o jump  ",
+                tables.len(),
+                app.relationships.len()
+            ),
+            Style::default().fg(th.muted),
+        ),
+    ]));
+    lines.push(Line::default());
 
-        let is_selected = idx == selected;
-        let row_bg = if is_selected { th.sel_bg } else { th.bg };
-        let row_fg = if is_selected { th.sel_fg } else { th.fg };
-        let highlight = Style::default().fg(row_fg).bg(row_bg);
-        let arrow = if is_selected {
-            "  ━━▶  "
+    // ── Section 1: chip list of tables ─────────────────────────────
+    lines.push(Line::from(Span::styled(
+        "  Tables",
+        Style::default()
+            .fg(th.accent2)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )));
+    let mut chips: Vec<Span> = vec![Span::raw("  ")];
+    for (i, name) in tables.iter().enumerate() {
+        let style = if referenced.contains(name.as_str()) {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
         } else {
-            "  ──▶  "
+            Style::default().fg(th.muted)
         };
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {connector}── "),
-                Style::default().fg(th.border).bg(row_bg),
-            ),
-            Span::styled(edge.from_columns.join(", "), highlight),
-            Span::styled(
-                arrow,
-                Style::default()
-                    .fg(if is_selected { th.accent } else { th.muted })
-                    .bg(row_bg)
-                    .add_modifier(if is_selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(
-                edge.to_table.clone(),
-                Style::default()
-                    .fg(th.accent)
-                    .bg(row_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(".", Style::default().fg(th.muted).bg(row_bg)),
-            Span::styled(edge.to_columns.join(", "), highlight),
-        ]));
-
-        if group_remaining == 0 {
-            lines.push(Line::default());
+        chips.push(Span::styled(format!("◆ {}", name), style));
+        if i + 1 < tables.len() {
+            chips.push(Span::styled("   ", Style::default().fg(th.muted)));
         }
     }
+    lines.push(Line::from(chips));
+    lines.push(Line::default());
 
-    // Show unreferenced tables if we have the overview
-    if let Some(ov) = &app.overview {
-        if let Some(si) = ov.schemas.iter().find(|s| s.name == *schema) {
-            let referenced: HashSet<&str> = app
-                .relationships
-                .iter()
-                .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
-                .collect();
-            let standalone: Vec<&str> = si
-                .tables
-                .iter()
-                .map(String::as_str)
-                .filter(|name| !referenced.contains(*name))
-                .collect();
-            if !standalone.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "  Standalone tables (no FK edges):",
-                    Style::default().fg(th.muted),
-                )));
-                for name in standalone {
-                    lines.push(Line::from(vec![
-                        Span::styled("    ◆  ", Style::default().fg(th.muted)),
-                        Span::styled(name, Style::default().fg(th.fg)),
-                    ]));
-                }
-            }
+    // ── Section 2: visual layered diagram ──────────────────────────
+    // Render the whole-schema picture as a Sugiyama-lite layered graph:
+    // tables are grouped into columns by foreign-key depth (referenced
+    // tables on the LEFT, dependent tables on the RIGHT) and FK edges
+    // are routed through vertical channels between columns. The active
+    // edge is drawn last on `theme.warning` so it always wins on
+    // crossings.
+    if !app.relationships.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  Diagram",
+            Style::default()
+                .fg(th.accent2)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )));
+        lines.extend(render_layered_erd(
+            &tables,
+            &app.relationships,
+            app.erd_selected,
+            th,
+        ));
+        lines.push(Line::default());
+    }
+
+    // ── Section 3: focused selected edge ───────────────────────────
+    let selected = app
+        .erd_selected
+        .min(app.relationships.len().saturating_sub(1));
+    if app.relationships.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No foreign-key relationships in this schema.",
+            Style::default().fg(th.muted),
+        )));
+    } else if let Some(edge) = app.relationships.get(selected) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  Relationship  {} / {}",
+                selected + 1,
+                app.relationships.len()
+            ),
+            Style::default()
+                .fg(th.accent2)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )));
+        lines.push(Line::default());
+        // Compute box width so both boxes share a consistent size and
+        // the column labels fit comfortably.
+        let from_label = format!("column: {}", edge.from_columns.join(", "));
+        let to_label = format!("column: {}", edge.to_columns.join(", "));
+        let inner_w = [
+            edge.from_table.chars().count(),
+            edge.to_table.chars().count(),
+            from_label.chars().count(),
+            to_label.chars().count(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(20)
+            + 6;
+        let inner_w = inner_w.max(28);
+        let indent = "         ";
+        // Source box (top).
+        lines.extend(render_erd_box(
+            indent,
+            &edge.from_table,
+            &from_label,
+            inner_w,
+            th,
+            true,
+        ));
+        // Vertical connector with the FK label centered.
+        let bar = format!("{}{:^w$}", indent, "│", w = inner_w);
+        let label_line = format!("{}{:^w$}", indent, " FOREIGN KEY ", w = inner_w);
+        let arrow = format!("{}{:^w$}", indent, "▼", w = inner_w);
+        lines.push(Line::from(Span::styled(
+            bar.clone(),
+            Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            label_line,
+            Style::default()
+                .fg(th.bg)
+                .bg(th.warning)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            bar,
+            Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            arrow,
+            Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+        )));
+        // Target box (bottom).
+        lines.extend(render_erd_box(
+            indent,
+            &edge.to_table,
+            &to_label,
+            inner_w,
+            th,
+            true,
+        ));
+        lines.push(Line::default());
+    }
+
+    // ── Section 4: numbered list of all edges ──────────────────────
+    if !app.relationships.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  All relationships",
+            Style::default()
+                .fg(th.accent2)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )));
+        let max_n = app.relationships.len();
+        let n_width = max_n.to_string().len();
+        for (idx, edge) in app.relationships.iter().enumerate() {
+            let is_sel = idx == selected;
+            let row_bg = if is_sel { th.sel_bg } else { th.bg };
+            let prefix = if is_sel { "►" } else { " " };
+            let prefix_style = if is_sel {
+                Style::default()
+                    .fg(th.warning)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.muted).bg(row_bg)
+            };
+            let num_style = Style::default().fg(th.muted).bg(row_bg);
+            let table_style = Style::default()
+                .fg(th.accent)
+                .bg(row_bg)
+                .add_modifier(Modifier::BOLD);
+            let col_style = Style::default().fg(th.fg).bg(row_bg);
+            let dot_style = Style::default().fg(th.muted).bg(row_bg);
+            let arrow_style = if is_sel {
+                Style::default()
+                    .fg(th.warning)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.muted).bg(row_bg)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {prefix} "), prefix_style),
+                Span::styled(format!("{:>w$}.", idx + 1, w = n_width), num_style),
+                Span::styled("  ", col_style),
+                Span::styled(edge.from_table.clone(), table_style),
+                Span::styled(".", dot_style),
+                Span::styled(edge.from_columns.join(", "), col_style),
+                Span::styled("  ─▶  ", arrow_style),
+                Span::styled(edge.to_table.clone(), table_style),
+                Span::styled(".", dot_style),
+                Span::styled(edge.to_columns.join(", "), col_style),
+            ]));
         }
     }
 
@@ -2086,6 +2660,403 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     );
 }
 
+/// Render one rounded-corner box centered at `indent` width `inner_w`,
+/// containing a bold title and a muted subtitle line. Returns three
+/// `Line`s: top border, title row, and a divider+subtitle+bottom row
+/// pair so the boxes always have the same height regardless of label.
+fn render_erd_box(
+    indent: &str,
+    title: &str,
+    subtitle: &str,
+    inner_w: usize,
+    th: Theme,
+    accented: bool,
+) -> Vec<Line<'static>> {
+    let border = Style::default().fg(th.border);
+    let title_style = if accented {
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th.fg).add_modifier(Modifier::BOLD)
+    };
+    let sub_style = Style::default().fg(th.muted);
+
+    let top = format!("╭{}╮", "─".repeat(inner_w));
+    let bottom = format!("╰{}╯", "─".repeat(inner_w));
+    let divider = format!("├{}┤", "─".repeat(inner_w));
+
+    let title_pad_l = inner_w.saturating_sub(title.chars().count()) / 2;
+    let title_pad_r = inner_w
+        .saturating_sub(title.chars().count())
+        .saturating_sub(title_pad_l);
+    let sub_pad_l = inner_w.saturating_sub(subtitle.chars().count()) / 2;
+    let sub_pad_r = inner_w
+        .saturating_sub(subtitle.chars().count())
+        .saturating_sub(sub_pad_l);
+
+    vec![
+        Line::from(vec![
+            Span::raw(indent.to_owned()),
+            Span::styled(top, border),
+        ]),
+        Line::from(vec![
+            Span::raw(indent.to_owned()),
+            Span::styled("│", border),
+            Span::raw(" ".repeat(title_pad_l)),
+            Span::styled(title.to_owned(), title_style),
+            Span::raw(" ".repeat(title_pad_r)),
+            Span::styled("│", border),
+        ]),
+        Line::from(vec![
+            Span::raw(indent.to_owned()),
+            Span::styled(divider, border),
+        ]),
+        Line::from(vec![
+            Span::raw(indent.to_owned()),
+            Span::styled("│", border),
+            Span::raw(" ".repeat(sub_pad_l)),
+            Span::styled(subtitle.to_owned(), sub_style),
+            Span::raw(" ".repeat(sub_pad_r)),
+            Span::styled("│", border),
+        ]),
+        Line::from(vec![
+            Span::raw(indent.to_owned()),
+            Span::styled(bottom, border),
+        ]),
+    ]
+}
+
+/// One cell of the layered-ERD char canvas.
+#[derive(Clone, Copy)]
+struct ErdCell {
+    ch: char,
+    fg: Color,
+    bold: bool,
+}
+
+/// Render a Sugiyama-lite layered ERD into a list of styled lines.
+///
+/// Layout algorithm:
+///   1. **Layer assignment.** For each table, layer = longest path
+///      along outgoing FK edges to a sink (a table that references
+///      nothing). Sinks land at layer 0 (leftmost); the most
+///      dependent tables end up at the highest layer (rightmost).
+///      Cycles are broken by marking nodes on the recursion stack as
+///      layer 0.
+///   2. **Within-layer ordering.** Alphabetical for determinism.
+///   3. **Channel routing.** Edges going from layer F to layer T (F > T)
+///      route through the channel just to the right of layer T's
+///      boxes. Each edge in a given channel is given a unique mid-X
+///      so parallel edges don't overlap. The route is
+///      `source-left-edge → horizontal → bend → vertical → bend →
+///      horizontal → target-right-edge ◀`.
+///   4. **Selected edge wins.** All non-selected edges paint first;
+///      the active edge paints last in `theme.warning` + bold so it
+///      sits on top of any crossings.
+///
+/// Limitations: multi-layer hops (F > T+1) currently route through a
+/// single channel and may overlap intermediate-layer boxes. Acceptable
+/// for v1 — most schemas have ≤3 layers and the active-edge highlight
+/// keeps the focus readable regardless.
+fn render_layered_erd(
+    tables: &[String],
+    edges: &[RelationshipEdge],
+    selected: usize,
+    th: Theme,
+) -> Vec<Line<'static>> {
+    if tables.is_empty() {
+        return Vec::new();
+    }
+
+    // ── 1. Build outgoing-edge adjacency (table → referenced tables) ──
+    let mut out: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in edges {
+        out.entry(e.from_table.as_str())
+            .or_default()
+            .push(e.to_table.as_str());
+    }
+
+    // ── 2. Layer assignment via memoised longest-path-to-sink. ────
+    fn compute_layer<'a>(
+        node: &'a str,
+        out: &HashMap<&'a str, Vec<&'a str>>,
+        memo: &mut HashMap<&'a str, usize>,
+        on_stack: &mut HashSet<&'a str>,
+    ) -> usize {
+        if let Some(&l) = memo.get(node) {
+            return l;
+        }
+        if on_stack.contains(node) {
+            // Cycle: pin to 0 to break it.
+            return 0;
+        }
+        on_stack.insert(node);
+        let layer = match out.get(node) {
+            None => 0,
+            Some(targets) => targets
+                .iter()
+                .map(|t| compute_layer(t, out, memo, on_stack) + 1)
+                .max()
+                .unwrap_or(0),
+        };
+        on_stack.remove(node);
+        memo.insert(node, layer);
+        layer
+    }
+
+    let mut memo: HashMap<&str, usize> = HashMap::new();
+    let mut on_stack: HashSet<&str> = HashSet::new();
+    let mut node_layer: HashMap<&str, usize> = HashMap::new();
+    for t in tables {
+        let l = compute_layer(t.as_str(), &out, &mut memo, &mut on_stack);
+        node_layer.insert(t.as_str(), l);
+    }
+    let max_layer = node_layer.values().copied().max().unwrap_or(0);
+
+    // ── 3. Group tables by layer, sort alphabetically. ────────────
+    let mut layers: Vec<Vec<&str>> = vec![Vec::new(); max_layer + 1];
+    for t in tables {
+        let l = node_layer[t.as_str()];
+        layers[l].push(t.as_str());
+    }
+    for v in layers.iter_mut() {
+        v.sort();
+    }
+
+    // ── 4. Compute layer geometry. ────────────────────────────────
+    const BOX_H: usize = 3;
+    const V_GAP: usize = 1;
+    const CHANNEL_W: usize = 8; // horizontal gap between layers
+
+    let layer_w: Vec<usize> = layers
+        .iter()
+        .map(|ts| {
+            ts.iter()
+                .map(|t| t.chars().count())
+                .max()
+                .unwrap_or(8)
+                .max(10)
+                + 4
+        })
+        .collect();
+
+    let mut layer_x: Vec<usize> = Vec::with_capacity(layers.len());
+    let mut x_cursor = 0;
+    for (i, w) in layer_w.iter().enumerate() {
+        layer_x.push(x_cursor);
+        x_cursor += w;
+        if i + 1 < layer_w.len() {
+            x_cursor += CHANNEL_W;
+        }
+    }
+    let canvas_w = x_cursor;
+
+    let mut node_y: HashMap<&str, usize> = HashMap::new();
+    let mut max_h = 0;
+    for ts in &layers {
+        for (i, t) in ts.iter().enumerate() {
+            node_y.insert(*t, i * (BOX_H + V_GAP));
+        }
+        let h = ts.len() * (BOX_H + V_GAP);
+        if h > max_h {
+            max_h = h;
+        }
+    }
+    let canvas_h = max_h.max(BOX_H);
+
+    let blank = ErdCell {
+        ch: ' ',
+        fg: th.fg,
+        bold: false,
+    };
+    let mut buf: Vec<Vec<ErdCell>> = vec![vec![blank; canvas_w]; canvas_h];
+
+    let put = |buf: &mut Vec<Vec<ErdCell>>, x: usize, y: usize, ch: char, fg: Color, bold: bool| {
+        if y < buf.len() && x < buf[0].len() {
+            buf[y][x] = ErdCell { ch, fg, bold };
+        }
+    };
+
+    let referenced: HashSet<&str> = edges
+        .iter()
+        .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
+        .collect();
+
+    // ── 5. Draw boxes. ────────────────────────────────────────────
+    for (l, ts) in layers.iter().enumerate() {
+        let x0 = layer_x[l];
+        let w = layer_w[l];
+        for name in ts {
+            let y0 = node_y[*name];
+            let title_color = if referenced.contains(name) {
+                th.accent
+            } else {
+                th.muted
+            };
+            // Top
+            put(&mut buf, x0, y0, '╭', th.border, false);
+            put(&mut buf, x0 + w - 1, y0, '╮', th.border, false);
+            for k in 1..w - 1 {
+                put(&mut buf, x0 + k, y0, '─', th.border, false);
+            }
+            // Middle
+            put(&mut buf, x0, y0 + 1, '│', th.border, false);
+            put(&mut buf, x0 + w - 1, y0 + 1, '│', th.border, false);
+            for k in 1..w - 1 {
+                put(&mut buf, x0 + k, y0 + 1, ' ', th.fg, false);
+            }
+            let inner = w - 2;
+            let pad = inner.saturating_sub(name.chars().count()) / 2;
+            for (k, ch) in name.chars().enumerate() {
+                put(&mut buf, x0 + 1 + pad + k, y0 + 1, ch, title_color, true);
+            }
+            // Bottom
+            put(&mut buf, x0, y0 + 2, '╰', th.border, false);
+            put(&mut buf, x0 + w - 1, y0 + 2, '╯', th.border, false);
+            for k in 1..w - 1 {
+                put(&mut buf, x0 + k, y0 + 2, '─', th.border, false);
+            }
+        }
+    }
+
+    // ── 6. Pre-allocate one mid_x per edge inside its channel so
+    //       parallel edges don't overlap. Each channel gets evenly-
+    //       spaced track positions.
+    let mut by_channel: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (eid, edge) in edges.iter().enumerate() {
+        let Some(&fl) = node_layer.get(edge.from_table.as_str()) else {
+            continue;
+        };
+        let Some(&tl) = node_layer.get(edge.to_table.as_str()) else {
+            continue;
+        };
+        if fl <= tl || edge.from_table == edge.to_table {
+            continue;
+        }
+        // Use the channel immediately to the right of the target's layer.
+        by_channel.entry(tl).or_default().push(eid);
+    }
+    let mut edge_mid_x: HashMap<usize, usize> = HashMap::new();
+    for (tl, eids) in &by_channel {
+        let channel_start = layer_x[*tl] + layer_w[*tl]; // first cell after target box
+        let channel_end = if tl + 1 < layer_x.len() {
+            layer_x[tl + 1] // first cell of next layer's box
+        } else {
+            channel_start + CHANNEL_W
+        };
+        let span = channel_end.saturating_sub(channel_start).max(1);
+        let n = eids.len();
+        for (i, &eid) in eids.iter().enumerate() {
+            // Distribute mid_x evenly across the channel: positions
+            // 1..=n out of n+1 slots so neither edge sits on a box
+            // border.
+            let mx = channel_start + (i + 1) * span / (n + 1);
+            edge_mid_x.insert(eid, mx.max(channel_start).min(channel_end - 1));
+        }
+    }
+
+    // ── 7. Route edges: non-selected first, selected last so it
+    //       wins on crossings.
+    let order: Vec<usize> = (0..edges.len())
+        .filter(|i| *i != selected)
+        .chain(std::iter::once(selected).filter(|_| selected < edges.len()))
+        .collect();
+    for eid in order {
+        let edge = &edges[eid];
+        let Some(&fl) = node_layer.get(edge.from_table.as_str()) else {
+            continue;
+        };
+        let Some(&tl) = node_layer.get(edge.to_table.as_str()) else {
+            continue;
+        };
+        if fl <= tl || edge.from_table == edge.to_table {
+            continue; // skip same-layer + self-references for v1
+        }
+        let Some(&mid_x) = edge_mid_x.get(&eid) else {
+            continue;
+        };
+        let is_sel = eid == selected;
+        let color = if is_sel { th.warning } else { th.muted };
+        let bold = is_sel;
+
+        // Source: left edge of from-box (which is on the right since fl > tl).
+        let from_x_left = layer_x[fl];
+        let from_y_mid = node_y[edge.from_table.as_str()] + BOX_H / 2;
+        // Target: right edge of to-box.
+        let to_x_right = layer_x[tl] + layer_w[tl] - 1;
+        let to_y_mid = node_y[edge.to_table.as_str()] + BOX_H / 2;
+
+        // Stub one cell out of source to the left.
+        let stub_x = from_x_left.saturating_sub(1);
+        let target_stub = to_x_right + 1; // cell holding the arrowhead
+
+        // Segment 1: horizontal at from_y_mid from mid_x → stub_x
+        let (a, b) = (mid_x.min(stub_x), mid_x.max(stub_x));
+        for x in a..=b {
+            let cell = buf[from_y_mid][x];
+            if cell.ch == ' ' || cell.ch == '─' || is_sel {
+                put(&mut buf, x, from_y_mid, '─', color, bold);
+            }
+        }
+
+        // Segment 2: vertical at mid_x from from_y_mid → to_y_mid
+        if from_y_mid != to_y_mid {
+            let going_down = to_y_mid > from_y_mid;
+            // We came in from the right (going left), now turn up/down.
+            let bend_top = if going_down { '╭' } else { '╰' };
+            let bend_bot = if going_down { '╯' } else { '╮' };
+            put(&mut buf, mid_x, from_y_mid, bend_top, color, bold);
+            let (a, b) = (from_y_mid.min(to_y_mid), from_y_mid.max(to_y_mid));
+            for y in (a + 1)..b {
+                let cell = buf[y][mid_x];
+                if cell.ch == ' ' || cell.ch == '│' || is_sel {
+                    put(&mut buf, mid_x, y, '│', color, bold);
+                }
+            }
+            put(&mut buf, mid_x, to_y_mid, bend_bot, color, bold);
+        }
+
+        // Segment 3: horizontal at to_y_mid from target_stub → mid_x
+        let (a, b) = (mid_x.min(target_stub), mid_x.max(target_stub));
+        for x in a..=b {
+            if x == mid_x && from_y_mid != to_y_mid {
+                continue; // don't trample the bend
+            }
+            let cell = buf[to_y_mid][x];
+            if cell.ch == ' ' || cell.ch == '─' || is_sel {
+                put(&mut buf, x, to_y_mid, '─', color, bold);
+            }
+        }
+
+        // Arrowhead pointing into the target box's right edge.
+        let head_color = if is_sel { th.accent } else { color };
+        put(&mut buf, target_stub, to_y_mid, '◀', head_color, true);
+    }
+
+    // ── 8. Convert canvas to styled lines. ────────────────────────
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(canvas_h + 2);
+    for row in &buf {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut current = String::new();
+        let mut current_style = Style::default().fg(th.fg);
+        for cell in row {
+            let mut st = Style::default().fg(cell.fg);
+            if cell.bold {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            if st != current_style && !current.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut current), current_style));
+            }
+            current.push(cell.ch);
+            current_style = st;
+        }
+        if !current.is_empty() {
+            spans.push(Span::styled(current, current_style));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
 // ─── SQL editor pane ──────────────────────────────────────────────────────────
 
 fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -2095,83 +3066,115 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
-    let title = if app.history.is_empty() {
-        "  SQL Editor   Ctrl+R run  Esc browser  ".to_owned()
-    } else {
-        format!(
-            "  SQL Editor   Ctrl+R run  Ctrl+P/N history ({})  Esc browser  ",
-            app.history.len()
-        )
+    let title = {
+        let mut t = String::from("  SQL Editor  ");
+        if let Some(p) = &app.editor_path {
+            t.push_str(&p.display().to_string());
+            t.push_str("  ");
+        }
+        t.push_str("Ctrl+R run all  Ctrl+Enter run current  Ctrl+S save  ");
+        if !app.history.is_empty() {
+            t.push_str(&format!("Ctrl+P/N hist ({})  ", app.history.len()));
+        }
+        t.push_str("Esc browser  ");
+        t
     };
 
     let editor_area = layout[0];
-    f.render_widget(
-        Paragraph::new(app.editor.as_str())
-            .style(Style::default().fg(th.fg).bg(th.bg))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        title,
-                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(th.active_border))
-                    .style(Style::default().bg(th.bg)),
+    let editor_block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.active_border))
+        .style(Style::default().bg(th.bg));
+    let editor_inner = editor_block.inner(editor_area);
+    f.render_widget(editor_block, editor_area);
+
+    // Split the inner area into [gutter | text]. The gutter holds 1-indexed
+    // line numbers right-aligned to a 4-char column (max 9999 lines).
+    let line_count = app.editor.lines().count().max(1);
+    let gutter_width = (line_count.to_string().len() as u16 + 1).max(4);
+    let editor_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(gutter_width), Constraint::Min(0)])
+        .split(editor_inner);
+    let gutter_area = editor_layout[0];
+    let text_area = editor_layout[1];
+
+    // Current-statement byte range, used to highlight the active SQL.
+    let stmt_range = statement_range_at(&app.editor, app.editor_cursor);
+
+    let (cursor_line, cursor_col) = line_col(&app.editor, app.editor_cursor);
+
+    let mut byte_offset = 0usize;
+    let mut gutter_lines: Vec<Line> = Vec::new();
+    let mut text_lines: Vec<Line> = Vec::new();
+    for (idx, line) in app.editor.split('\n').enumerate() {
+        let line_start = byte_offset;
+        let line_end = line_start + line.len();
+        let in_stmt = stmt_range.start <= line_end && line_start <= stmt_range.end;
+        let line_bg = if in_stmt && !line.trim().is_empty() {
+            th.row_alt_bg
+        } else {
+            th.bg
+        };
+        let num_style = if idx == cursor_line {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.muted)
+        };
+        gutter_lines.push(Line::from(Span::styled(
+            format!(
+                "{:>width$} ",
+                idx + 1,
+                width = (gutter_width as usize).saturating_sub(1)
             ),
-        editor_area,
+            num_style.bg(line_bg),
+        )));
+
+        let mut spans = highlight_line(line, th);
+        for span in &mut spans {
+            // Apply the per-line background by patching each span's style.
+            let mut st = span.style;
+            st.bg = Some(line_bg);
+            span.style = st;
+        }
+        if spans.is_empty() {
+            spans.push(Span::styled(" ", Style::default().bg(line_bg)));
+        }
+        text_lines.push(Line::from(spans));
+        byte_offset = line_end + 1; // +1 for the '\n' we split on
+    }
+
+    f.render_widget(
+        Paragraph::new(gutter_lines).style(Style::default().bg(th.bg)),
+        gutter_area,
+    );
+    f.render_widget(
+        Paragraph::new(text_lines)
+            .style(Style::default().fg(th.fg).bg(th.bg))
+            .wrap(Wrap { trim: false }),
+        text_area,
     );
 
-    // Position the terminal's hardware cursor inside the editor pane so the
-    // user can see exactly where edits will land. Coordinates are computed
-    // from the (line, column) of `editor_cursor`. Note this ignores soft-wrap
-    // so very long lines may push the cursor off the visible width; that's a
-    // known limitation deferred to future work.
-    let inner = Rect {
-        x: editor_area.x + 1,
-        y: editor_area.y + 1,
-        width: editor_area.width.saturating_sub(2),
-        height: editor_area.height.saturating_sub(2),
-    };
-    let (line, col) = line_col(&app.editor, app.editor_cursor);
-    let cx = inner.x + (col as u16).min(inner.width.saturating_sub(1));
-    let cy = inner.y + (line as u16).min(inner.height.saturating_sub(1));
+    // Position the terminal's hardware cursor inside the text pane.
+    let cx = text_area.x + (cursor_col as u16).min(text_area.width.saturating_sub(1));
+    let cy = text_area.y + (cursor_line as u16).min(text_area.height.saturating_sub(1));
     f.set_cursor_position((cx, cy));
 
-    // Results from editor queries
-    let result_text: String = if let Some(rec) = &app.records {
-        if rec.columns.is_empty() {
-            format!("rows affected: {}", rec.rows_affected)
-        } else {
-            let mut s = rec.columns.join("  │  ");
-            s.push('\n');
-            s.push_str(&"─".repeat(60));
-            s.push('\n');
-            for row in rec.rows.iter().take(200) {
-                s.push_str(&row.join("  │  "));
-                s.push('\n');
-            }
-            s
-        }
-    } else {
-        String::new()
-    };
-
-    f.render_widget(
-        Paragraph::new(result_text.as_str())
-            .style(Style::default().fg(th.fg).bg(th.bg))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(Span::styled("  Results  ", Style::default().fg(th.muted)))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(th.border))
-                    .style(Style::default().bg(th.bg)),
-            ),
-        layout[1],
-    );
+    // ── Results pane: same grid as the Records tab ──
+    let results_block = Block::default()
+        .title(Span::styled("  Results  ", Style::default().fg(th.muted)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .style(Style::default().bg(th.bg));
+    let results_inner = results_block.inner(layout[1]);
+    f.render_widget(results_block, layout[1]);
+    draw_records(f, app, results_inner);
 }
 
 // ─── Status bar ───────────────────────────────────────────────────────────────
@@ -2223,8 +3226,9 @@ fn restore_terminal(
 #[cfg(test)]
 mod tests {
     use super::{
-        line_col, line_end, line_start, move_cursor_vertical, next_char_boundary,
-        prev_char_boundary, Theme, ALL_TABS,
+        close_current_table, line_col, line_end, line_start, move_cursor_vertical,
+        next_char_boundary, prev_char_boundary, short_hash, unique_connection_name, AppState,
+        ConnectionConfig, DetailTab, DriverKind, Theme, ALL_TABS,
     };
 
     #[test]
@@ -2244,6 +3248,16 @@ mod tests {
     fn all_tabs_have_labels() {
         for tab in ALL_TABS {
             assert!(!tab.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn hotkey_label_prefixes_index() {
+        // Tab order is fixed by ALL_TABS, so labels must start with
+        // their 1-based hotkey to match the `1`-`6` shortcuts.
+        for (idx, tab) in ALL_TABS.iter().enumerate() {
+            let expected = format!("{} {}", idx + 1, tab.label());
+            assert_eq!(tab.hotkey_label(), expected);
         }
     }
 
@@ -2300,5 +3314,51 @@ mod tests {
         let down = move_cursor_vertical(s, 3, 1);
         // back up should land on column 3 of line 0
         assert_eq!(move_cursor_vertical(s, down, -1), 3);
+    }
+
+    #[test]
+    fn close_current_table_clears_table_state() {
+        let mut app = AppState::new(DriverKind::Sqlite, "sqlite::memory:".to_owned());
+        app.current_schema = "public".to_owned();
+        app.current_table = "customers".to_owned();
+        app.detail_tab = DetailTab::Columns;
+        close_current_table(&mut app);
+        assert!(app.current_table.is_empty());
+        assert!(app.records.is_none());
+        assert!(app.table_info.is_none());
+        assert_eq!(app.detail_tab, DetailTab::Records);
+    }
+
+    #[test]
+    fn unique_name_appends_numeric_suffix_when_taken() {
+        let saved = vec![
+            (
+                "prod".to_owned(),
+                ConnectionConfig {
+                    driver: DriverKind::Postgres,
+                    url: "u1".to_owned(),
+                },
+            ),
+            (
+                "prod-2".to_owned(),
+                ConnectionConfig {
+                    driver: DriverKind::Postgres,
+                    url: "u2".to_owned(),
+                },
+            ),
+        ];
+        assert_eq!(unique_connection_name("prod", &saved), "prod-3");
+        assert_eq!(unique_connection_name("dev", &saved), "dev");
+    }
+
+    #[test]
+    fn short_hash_is_deterministic_and_alphanumeric() {
+        let a = short_hash("postgres://localhost/x");
+        let b = short_hash("postgres://localhost/x");
+        let c = short_hash("postgres://localhost/y");
+        assert_eq!(a, b, "same input produces same hash");
+        assert_ne!(a, c, "different input produces different hash");
+        assert!(a.starts_with("url_"));
+        assert!(a[4..].chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 }
