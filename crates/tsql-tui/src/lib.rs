@@ -1576,7 +1576,9 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 }
 
 /// Open the table currently highlighted on the ERD tab as the active
-/// browser table. Mirrors a sidebar `Enter`.
+/// browser table. Mirrors a sidebar `Enter`, but stays on the ERD tab
+/// so the user can keep navigating relationships without losing their
+/// place.
 async fn open_erd_selected_table(app: &mut AppState) {
     let tables = erd_table_list(app);
     let Some(target) = tables
@@ -1587,7 +1589,6 @@ async fn open_erd_selected_table(app: &mut AppState) {
     };
     let schema = app.current_schema.clone();
     select_sidebar_for(app, &target);
-    app.detail_tab = DetailTab::Records;
     load_table(app, &schema, &target).await;
 }
 
