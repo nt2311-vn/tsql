@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -48,6 +48,14 @@ enum DbMessage {
     Relationships {
         schema: String,
         result: Result<Vec<RelationshipEdge>, String>,
+    },
+    /// Pre-fetch of one schema-scoped `TableInfo` populated for the
+    /// ERD card view. Independent of the active table so it does not
+    /// race with `TableInfo` for the foreground view.
+    ErdTableInfo {
+        schema: String,
+        table: String,
+        result: Result<TableInfo, String>,
     },
 }
 
@@ -226,6 +234,10 @@ struct AppState {
     /// Row index into `relationships` selected on the ERD tab. Used by
     /// j/k navigation and the Enter / `o` jump-to-table shortcuts.
     erd_selected: usize,
+    /// Schema-scoped `TableInfo` cache feeding the ERD card-grid
+    /// renderer. Cleared on schema change. Tables that have not yet
+    /// been pre-fetched render as a name-only stub card.
+    erd_table_info: HashMap<String, TableInfo>,
     editor: String,
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
@@ -290,6 +302,7 @@ impl AppState {
             record_table_state: ts,
             relationships: Vec::new(),
             erd_selected: 0,
+            erd_table_info: HashMap::new(),
             editor: String::new(),
             editor_cursor: 0,
             editor_path: None,
@@ -484,6 +497,18 @@ fn apply_db_message(app: &mut AppState, msg: DbMessage) {
                 }
             }
         }
+        DbMessage::ErdTableInfo {
+            schema,
+            table,
+            result,
+        } => {
+            if schema != app.current_schema {
+                return;
+            }
+            if let Ok(info) = result {
+                app.erd_table_info.insert(table, info);
+            }
+        }
         DbMessage::Relationships { schema, result } => {
             if schema != app.current_schema {
                 return;
@@ -601,6 +626,7 @@ async fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
                 let schema = app.current_schema.clone();
                 spawn_relationships(app, schema);
             }
+            spawn_erd_prefetch(app);
         }
         // File IO
         "w" | "write" | "save" => {
@@ -1267,6 +1293,9 @@ async fn handle_browser_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 let schema = app.current_schema.clone();
                 spawn_relationships(app, schema);
             }
+            if app.detail_tab == DetailTab::Erd {
+                spawn_erd_prefetch(app);
+            }
         }
         _ => match app.pane {
             BrowserPane::Sidebar => {
@@ -1357,6 +1386,9 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 app.status = format!("Loading ERD for {schema}…");
                 spawn_relationships(app, schema);
             }
+            if app.detail_tab == DetailTab::Erd {
+                spawn_erd_prefetch(app);
+            }
         }
         KeyCode::Char('h') | KeyCode::Left => {
             app.detail_tab = app.detail_tab.prev();
@@ -1386,23 +1418,21 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 load_records_page(app, &s, &t);
             }
         }
-        // ERD navigation: move the highlight through the flat edge list.
-        KeyCode::Char('j') | KeyCode::Down
-            if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() =>
-        {
-            let max = app.relationships.len() - 1;
-            app.erd_selected = (app.erd_selected + 1).min(max);
+        // ERD navigation: move the highlight through the table list.
+        KeyCode::Char('j') | KeyCode::Down if app.detail_tab == DetailTab::Erd => {
+            let len = erd_table_list(app).len();
+            if len > 0 {
+                app.erd_selected = (app.erd_selected + 1).min(len - 1);
+            }
         }
-        KeyCode::Char('k') | KeyCode::Up
-            if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() =>
-        {
+        KeyCode::Char('k') | KeyCode::Up if app.detail_tab == DetailTab::Erd => {
             app.erd_selected = app.erd_selected.saturating_sub(1);
         }
-        KeyCode::Enter if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() => {
-            jump_to_erd_target(app, ErdJump::Target).await;
+        KeyCode::Enter if app.detail_tab == DetailTab::Erd => {
+            open_erd_selected_table(app).await;
         }
-        KeyCode::Char('o') if app.detail_tab == DetailTab::Erd && !app.relationships.is_empty() => {
-            jump_to_erd_target(app, ErdJump::Source).await;
+        KeyCode::Char('o') if app.detail_tab == DetailTab::Erd => {
+            open_erd_selected_table(app).await;
         }
         KeyCode::Char(']') if app.detail_tab == DetailTab::Records => {
             if let Some(rec) = &app.records {
@@ -1426,6 +1456,14 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                     app.status = format!("yanked columns: {}", col_names.join(", "));
                 }
             }
+            DetailTab::Erd => match save_mermaid_for_schema(app).await {
+                Ok(path) => {
+                    app.status = format!("wrote Mermaid ERD → {}", path.display());
+                }
+                Err(e) => {
+                    app.last_error = Some(format!("save mermaid: {e}"));
+                }
+            },
             _ => {}
         },
         KeyCode::Char('Y') if app.detail_tab == DetailTab::Records => {
@@ -1442,25 +1480,15 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     Ok(false)
 }
 
-/// Direction of an ERD jump: follow the FK arrow to its `to_table`, or
-/// hop back to the owning `from_table`.
-#[derive(Debug, Clone, Copy)]
-enum ErdJump {
-    Target,
-    Source,
-}
-
-/// Load the table at the other end of the highlighted ERD edge. Schema is
-/// inherited from the current schema (FK edges are schema-scoped). Updates
-/// the sidebar selection so the new table is the active context for
-/// further navigation.
-async fn jump_to_erd_target(app: &mut AppState, direction: ErdJump) {
-    let Some(edge) = app.relationships.get(app.erd_selected).cloned() else {
+/// Open the table currently highlighted on the ERD tab as the active
+/// browser table. Mirrors a sidebar `Enter`.
+async fn open_erd_selected_table(app: &mut AppState) {
+    let tables = erd_table_list(app);
+    let Some(target) = tables
+        .get(app.erd_selected.min(tables.len().saturating_sub(1)))
+        .cloned()
+    else {
         return;
-    };
-    let target = match direction {
-        ErdJump::Target => edge.to_table,
-        ErdJump::Source => edge.from_table,
     };
     let schema = app.current_schema.clone();
     select_sidebar_for(app, &target);
@@ -1491,11 +1519,14 @@ fn select_sidebar_for(app: &mut AppState, table: &str) {
 /// the sidebar updates immediately, then spawns two background tasks that
 /// will deliver `TableInfo` and `Records` messages to the event loop.
 async fn load_table(app: &mut AppState, schema: &str, table: &str) {
-    // Preserve cached relationships when jumping inside the same schema
-    // (ERD edges are schema-scoped, so they're still valid).
+    // Preserve cached relationships and ERD card-info when jumping
+    // inside the same schema (both are schema-scoped, so they stay
+    // valid). On a schema change we drop them so we never render
+    // edges or cards from a stale schema.
     if schema != app.current_schema {
         app.relationships.clear();
         app.erd_selected = 0;
+        app.erd_table_info.clear();
     }
     app.current_schema = schema.to_owned();
     app.current_table = table.to_owned();
@@ -1549,6 +1580,48 @@ fn spawn_records(app: &mut AppState, schema: String, table: String, offset: usiz
             result,
         });
     });
+}
+
+/// Pre-fetch a `TableInfo` for every table in the active schema so the
+/// ERD card-grid renderer can show full column lists with PK/FK
+/// badges. Skips tables already cached. Runs the queries concurrently.
+fn spawn_erd_prefetch(app: &mut AppState) {
+    let schema = app.current_schema.clone();
+    if schema.is_empty() {
+        return;
+    }
+    let tables: Vec<String> = match app.overview.as_ref() {
+        Some(ov) => ov
+            .schemas
+            .iter()
+            .find(|s| s.name == schema)
+            .map(|si| si.tables.clone())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let (Some(pool), Some(tx)) = (app.pool.clone(), app.tx.clone()) else {
+        return;
+    };
+    for t in tables {
+        if app.erd_table_info.contains_key(&t) {
+            continue;
+        }
+        app.pending += 1;
+        let pool = pool.clone();
+        let tx = tx.clone();
+        let s = schema.clone();
+        tokio::spawn(async move {
+            let result = pool
+                .fetch_table_info(&s, &t)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(DbMessage::ErdTableInfo {
+                schema: s,
+                table: t,
+                result,
+            });
+        });
+    }
 }
 
 fn spawn_relationships(app: &mut AppState, schema: String) {
@@ -2393,53 +2466,45 @@ fn draw_constraints(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 
 // ─── ERD tab ──────────────────────────────────────────────────────────────────
 //
-// Earlier iterations of this view tried to draw a 2-D graph with
-// orthogonal-routed edges. On real schemas the routes ran straight
-// through table boxes and the result was unreadable. We've since
-// pivoted to a **focused vertical view** that trades graph topology
-// for clarity:
+// We tried two visual diagrams (a layered graph, then a dbdiagram-style
+// card grid). Both fought the terminal: ASCII / box-drawing line
+// routing never looked smooth, parallel edges crossed badly, and
+// arrowheads renderered inconsistently across fonts. So we pivoted to
+// what TUIs are actually good at: a structured inspector.
 //
-//   1. **Tables** — a compact chip strip of every table in the active
-//      schema. Tables that participate in any FK render in `accent`;
-//      standalone tables in `muted` so the user sees the full set.
-//   2. **Selected edge focus** — two stacked rounded-corner boxes
-//      stacked vertically, source on top, target below, with a
-//      labelled vertical arrow between them and the column names
-//      printed inside each box. This is the "what does this edge
-//      mean" panel.
-//   3. **All edges** — a numbered list of every relationship with
-//      the selected one bolded and prefixed with `►`. `j/k` cycles
-//      the selection, `o` jumps to the target table.
+// Layout:
 //
-// No autorouting, no overlapping lines, no cognitive load to decode
-// crossings. Every relationship is one Enter / `o` away from being
-// inspected in detail.
+//   ┌── Tables ───┐   ┌── Inspector ─────────────────────────────┐
+//   │  customers  │   │ orders                                   │
+//   │  orders   ▶ │   │ Columns                                  │
+//   │  products   │   │   ★ id              int4                 │
+//   │             │   │   ⚷ customer_id     int4   → customers.id│
+//   │             │   │     issue_date      date                 │
+//   │             │   │ References →                             │
+//   │             │   │   1. customer_id → customers.id          │
+//   │             │   │ Referenced by ←                          │
+//   │             │   │   (none)                                 │
+//   │             │   │ Mermaid                                  │
+//   │             │   │   ```mermaid                             │
+//   │             │   │   erDiagram                              │
+//   │             │   │     orders { … }                         │
+//   │             │   │     customers { … }                      │
+//   │             │   │     orders }o--|| customers : customer_id│
+//   │             │   │   ```                                    │
+//   └─────────────┘   └──────────────────────────────────────────┘
+//
+// Keys:
+//   j/k        — move table selection
+//   Enter / o  — open the selected table (load as the active table)
+//   y          — write the Mermaid block for the whole schema to
+//                `./<schema>.mmd`. The output renders as a real ERD
+//                in any Mermaid-aware viewer (GitHub, Notion, IDE
+//                preview, https://mermaid.live).
 
 fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let th = app.theme;
     let schema = &app.current_schema;
-
-    // Collect the table set: every table that participates in an edge,
-    // plus all tables in the active schema (so standalone tables still
-    // show as boxes).
-    let mut table_set: BTreeSet<String> = BTreeSet::new();
-    for e in &app.relationships {
-        table_set.insert(e.from_table.clone());
-        table_set.insert(e.to_table.clone());
-    }
-    if let Some(ov) = &app.overview {
-        if let Some(si) = ov.schemas.iter().find(|s| s.name == *schema) {
-            for t in &si.tables {
-                table_set.insert(t.clone());
-            }
-        }
-    }
-    let tables: Vec<String> = table_set.into_iter().collect();
-    let referenced: HashSet<&str> = app
-        .relationships
-        .iter()
-        .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
-        .collect();
+    let tables = erd_table_list(app);
 
     if tables.is_empty() {
         let hint = if schema.is_empty() {
@@ -2451,11 +2516,13 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
-    // ── Build the lines top-down ───────────────────────────────────
-    let mut lines: Vec<Line> = Vec::new();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(area);
 
     // Banner.
-    lines.push(Line::from(vec![
+    let banner = vec![Line::from(vec![
         Span::styled(
             format!("  ERD  schema: {schema}  "),
             Style::default()
@@ -2465,596 +2532,405 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         ),
         Span::styled(
             format!(
-                "  {} table(s), {} relationship(s)  j/k select  o jump  ",
+                "  {} table(s), {} relationship(s)  j/k tables  Enter open  y mermaid  ",
                 tables.len(),
-                app.relationships.len()
+                app.relationships.len(),
             ),
             Style::default().fg(th.muted),
         ),
-    ]));
-    lines.push(Line::default());
+    ])];
+    f.render_widget(
+        Paragraph::new(banner).style(Style::default().bg(th.bg)),
+        layout[0],
+    );
 
-    // ── Section 1: chip list of tables ─────────────────────────────
-    lines.push(Line::from(Span::styled(
-        "  Tables",
-        Style::default()
-            .fg(th.accent2)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-    )));
-    let mut chips: Vec<Span> = vec![Span::raw("  ")];
-    for (i, name) in tables.iter().enumerate() {
-        let style = if referenced.contains(name.as_str()) {
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(th.muted)
-        };
-        chips.push(Span::styled(format!("◆ {}", name), style));
-        if i + 1 < tables.len() {
-            chips.push(Span::styled("   ", Style::default().fg(th.muted)));
-        }
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(28), Constraint::Min(0)])
+        .split(layout[1]);
+
+    let selected = app.erd_selected.min(tables.len() - 1);
+    draw_erd_table_list(f, app, &tables, selected, body[0]);
+    draw_erd_inspector(f, app, &tables, selected, body[1]);
+}
+
+/// Alphabetical list of tables in the active schema. Sourced from the
+/// pre-loaded overview so it stays stable across selections.
+fn erd_table_list(app: &AppState) -> Vec<String> {
+    match app.overview.as_ref() {
+        Some(ov) => ov
+            .schemas
+            .iter()
+            .find(|s| s.name == app.current_schema)
+            .map(|si| {
+                let mut v = si.tables.clone();
+                v.sort();
+                v
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
     }
-    lines.push(Line::from(chips));
-    lines.push(Line::default());
+}
 
-    // ── Section 2: visual layered diagram ──────────────────────────
-    // Render the whole-schema picture as a Sugiyama-lite layered graph:
-    // tables are grouped into columns by foreign-key depth (referenced
-    // tables on the LEFT, dependent tables on the RIGHT) and FK edges
-    // are routed through vertical channels between columns. The active
-    // edge is drawn last on `theme.warning` so it always wins on
-    // crossings.
-    if !app.relationships.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  Diagram",
+fn draw_erd_table_list(
+    f: &mut Frame<'_>,
+    app: &AppState,
+    tables: &[String],
+    selected: usize,
+    area: Rect,
+) {
+    let th = app.theme;
+    let referenced: HashSet<&str> = app
+        .relationships
+        .iter()
+        .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
+        .collect();
+
+    let block = Block::default()
+        .title(Span::styled(
+            "  Tables  ",
+            Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .style(Style::default().bg(th.bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(tables.len());
+    for (i, t) in tables.iter().enumerate() {
+        let is_sel = i == selected;
+        let bg = if is_sel { th.sel_bg } else { th.bg };
+        let prefix = if is_sel { " ▶ " } else { "   " };
+        let prefix_style = if is_sel {
             Style::default()
-                .fg(th.accent2)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )));
-        lines.extend(render_layered_erd(
-            &tables,
-            &app.relationships,
-            app.erd_selected,
-            th,
-        ));
-        lines.push(Line::default());
+                .fg(th.warning)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.muted).bg(bg)
+        };
+        let name_style = if is_sel {
+            Style::default()
+                .fg(th.accent)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD)
+        } else if referenced.contains(t.as_str()) {
+            Style::default().fg(th.fg).bg(bg)
+        } else {
+            Style::default().fg(th.muted).bg(bg)
+        };
+        let pad_w = inner.width as usize;
+        let used = prefix.chars().count() + t.chars().count();
+        let pad = pad_w.saturating_sub(used);
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_owned(), prefix_style),
+            Span::styled(t.clone(), name_style),
+            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        ]));
     }
+    f.render_widget(Paragraph::new(lines), inner);
+}
 
-    // ── Section 3: focused selected edge ───────────────────────────
-    let selected = app
-        .erd_selected
-        .min(app.relationships.len().saturating_sub(1));
-    if app.relationships.is_empty() {
+fn draw_erd_inspector(
+    f: &mut Frame<'_>,
+    app: &AppState,
+    tables: &[String],
+    selected: usize,
+    area: Rect,
+) {
+    let th = app.theme;
+    let table = &tables[selected];
+    let info = app.erd_table_info.get(table);
+
+    let block = Block::default()
+        .title(Span::styled(
+            format!("  {table}  "),
+            Style::default()
+                .fg(th.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .style(Style::default().bg(th.bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Columns section.
+    lines.push(section_header("Columns", th));
+    if let Some(info) = info {
+        let pk_set: HashSet<&str> = info
+            .primary_key
+            .as_ref()
+            .map(|pk| pk.column_names.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut fk_map: HashMap<&str, (String, String)> = HashMap::new();
+        for fk in &info.foreign_keys {
+            for (i, col) in fk.column_names.iter().enumerate() {
+                let target_col = fk.referenced_columns.get(i).cloned().unwrap_or_default();
+                fk_map.insert(col.as_str(), (fk.referenced_table.clone(), target_col));
+            }
+        }
+
+        let name_w = info
+            .columns
+            .iter()
+            .map(|c| c.name.chars().count())
+            .max()
+            .unwrap_or(8);
+        let type_w = info
+            .columns
+            .iter()
+            .map(|c| c.data_type.chars().count())
+            .max()
+            .unwrap_or(6);
+
+        for c in &info.columns {
+            let (marker, color) = if pk_set.contains(c.name.as_str()) {
+                ('★', th.warning)
+            } else if fk_map.contains_key(c.name.as_str()) {
+                ('⚷', th.accent2)
+            } else {
+                (' ', th.fg)
+            };
+            let mut spans = vec![
+                Span::raw("    "),
+                Span::styled(
+                    marker.to_string(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<w$}", c.name, w = name_w),
+                    Style::default().fg(color),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<w$}", c.data_type, w = type_w),
+                    Style::default().fg(th.muted),
+                ),
+            ];
+            if let Some((rt, rc)) = fk_map.get(c.name.as_str()) {
+                spans.push(Span::styled("   → ", Style::default().fg(th.accent2)));
+                spans.push(Span::styled(
+                    rt.clone(),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(".", Style::default().fg(th.muted)));
+                spans.push(Span::styled(rc.clone(), Style::default().fg(th.fg)));
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
         lines.push(Line::from(Span::styled(
-            "  No foreign-key relationships in this schema.",
+            "    (loading…)",
             Style::default().fg(th.muted),
         )));
-    } else if let Some(edge) = app.relationships.get(selected) {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  Relationship  {} / {}",
-                selected + 1,
-                app.relationships.len()
-            ),
-            Style::default()
-                .fg(th.accent2)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )));
-        lines.push(Line::default());
-        // Compute box width so both boxes share a consistent size and
-        // the column labels fit comfortably.
-        let from_label = format!("column: {}", edge.from_columns.join(", "));
-        let to_label = format!("column: {}", edge.to_columns.join(", "));
-        let inner_w = [
-            edge.from_table.chars().count(),
-            edge.to_table.chars().count(),
-            from_label.chars().count(),
-            to_label.chars().count(),
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(20)
-            + 6;
-        let inner_w = inner_w.max(28);
-        let indent = "         ";
-        // Source box (top).
-        lines.extend(render_erd_box(
-            indent,
-            &edge.from_table,
-            &from_label,
-            inner_w,
-            th,
-            true,
-        ));
-        // Vertical connector with the FK label centered.
-        let bar = format!("{}{:^w$}", indent, "│", w = inner_w);
-        let label_line = format!("{}{:^w$}", indent, " FOREIGN KEY ", w = inner_w);
-        let arrow = format!("{}{:^w$}", indent, "▼", w = inner_w);
-        lines.push(Line::from(Span::styled(
-            bar.clone(),
-            Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            label_line,
-            Style::default()
-                .fg(th.bg)
-                .bg(th.warning)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            bar,
-            Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            arrow,
-            Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
-        )));
-        // Target box (bottom).
-        lines.extend(render_erd_box(
-            indent,
-            &edge.to_table,
-            &to_label,
-            inner_w,
-            th,
-            true,
-        ));
-        lines.push(Line::default());
     }
+    lines.push(Line::default());
 
-    // ── Section 4: numbered list of all edges ──────────────────────
-    if !app.relationships.is_empty() {
+    // References → (outgoing FKs from this table).
+    lines.push(section_header("References →", th));
+    let outgoing: Vec<&RelationshipEdge> = app
+        .relationships
+        .iter()
+        .filter(|e| &e.from_table == table)
+        .collect();
+    if outgoing.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  All relationships",
-            Style::default()
-                .fg(th.accent2)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            "    (none)",
+            Style::default().fg(th.muted),
         )));
-        let max_n = app.relationships.len();
-        let n_width = max_n.to_string().len();
-        for (idx, edge) in app.relationships.iter().enumerate() {
-            let is_sel = idx == selected;
-            let row_bg = if is_sel { th.sel_bg } else { th.bg };
-            let prefix = if is_sel { "►" } else { " " };
-            let prefix_style = if is_sel {
-                Style::default()
-                    .fg(th.warning)
-                    .bg(row_bg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(th.muted).bg(row_bg)
-            };
-            let num_style = Style::default().fg(th.muted).bg(row_bg);
-            let table_style = Style::default()
-                .fg(th.accent)
-                .bg(row_bg)
-                .add_modifier(Modifier::BOLD);
-            let col_style = Style::default().fg(th.fg).bg(row_bg);
-            let dot_style = Style::default().fg(th.muted).bg(row_bg);
-            let arrow_style = if is_sel {
-                Style::default()
-                    .fg(th.warning)
-                    .bg(row_bg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(th.muted).bg(row_bg)
-            };
+    } else {
+        let n_w = outgoing.len().to_string().len();
+        for (i, e) in outgoing.iter().enumerate() {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {prefix} "), prefix_style),
-                Span::styled(format!("{:>w$}.", idx + 1, w = n_width), num_style),
-                Span::styled("  ", col_style),
-                Span::styled(edge.from_table.clone(), table_style),
-                Span::styled(".", dot_style),
-                Span::styled(edge.from_columns.join(", "), col_style),
-                Span::styled("  ─▶  ", arrow_style),
-                Span::styled(edge.to_table.clone(), table_style),
-                Span::styled(".", dot_style),
-                Span::styled(edge.to_columns.join(", "), col_style),
+                Span::styled(
+                    format!("    {:>w$}. ", i + 1, w = n_w),
+                    Style::default().fg(th.muted),
+                ),
+                Span::styled(e.from_columns.join(", "), Style::default().fg(th.fg)),
+                Span::styled("  →  ", Style::default().fg(th.accent2)),
+                Span::styled(
+                    e.to_table.clone(),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(".", Style::default().fg(th.muted)),
+                Span::styled(e.to_columns.join(", "), Style::default().fg(th.fg)),
             ]));
         }
     }
+    lines.push(Line::default());
+
+    // Referenced by ← (incoming FKs to this table).
+    lines.push(section_header("Referenced by ←", th));
+    let incoming: Vec<&RelationshipEdge> = app
+        .relationships
+        .iter()
+        .filter(|e| &e.to_table == table)
+        .collect();
+    if incoming.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    (none)",
+            Style::default().fg(th.muted),
+        )));
+    } else {
+        let n_w = incoming.len().to_string().len();
+        for (i, e) in incoming.iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    {:>w$}. ", i + 1, w = n_w),
+                    Style::default().fg(th.muted),
+                ),
+                Span::styled(
+                    e.from_table.clone(),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(".", Style::default().fg(th.muted)),
+                Span::styled(e.from_columns.join(", "), Style::default().fg(th.fg)),
+                Span::styled("  ←  ", Style::default().fg(th.accent2)),
+                Span::styled(e.to_columns.join(", "), Style::default().fg(th.fg)),
+            ]));
+        }
+    }
+    lines.push(Line::default());
+
+    // Mermaid block.
+    lines.push(section_header("Mermaid", th));
+    lines.push(Line::from(Span::styled(
+        "    ```mermaid",
+        Style::default().fg(th.muted),
+    )));
+    let mmd = mermaid_erdiagram(tables, &app.relationships, &app.erd_table_info);
+    for ml in mmd.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("    {ml}"),
+            Style::default().fg(th.fg),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "    ```",
+        Style::default().fg(th.muted),
+    )));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "    y → write block to ./<schema>.mmd",
+        Style::default().fg(th.muted).add_modifier(Modifier::ITALIC),
+    )));
 
     f.render_widget(
         Paragraph::new(lines)
             .style(Style::default().bg(th.bg))
             .wrap(Wrap { trim: false }),
-        area,
+        inner,
     );
 }
 
-/// Render one rounded-corner box centered at `indent` width `inner_w`,
-/// containing a bold title and a muted subtitle line. Returns three
-/// `Line`s: top border, title row, and a divider+subtitle+bottom row
-/// pair so the boxes always have the same height regardless of label.
-fn render_erd_box(
-    indent: &str,
-    title: &str,
-    subtitle: &str,
-    inner_w: usize,
-    th: Theme,
-    accented: bool,
-) -> Vec<Line<'static>> {
-    let border = Style::default().fg(th.border);
-    let title_style = if accented {
-        Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(th.fg).add_modifier(Modifier::BOLD)
-    };
-    let sub_style = Style::default().fg(th.muted);
-
-    let top = format!("╭{}╮", "─".repeat(inner_w));
-    let bottom = format!("╰{}╯", "─".repeat(inner_w));
-    let divider = format!("├{}┤", "─".repeat(inner_w));
-
-    let title_pad_l = inner_w.saturating_sub(title.chars().count()) / 2;
-    let title_pad_r = inner_w
-        .saturating_sub(title.chars().count())
-        .saturating_sub(title_pad_l);
-    let sub_pad_l = inner_w.saturating_sub(subtitle.chars().count()) / 2;
-    let sub_pad_r = inner_w
-        .saturating_sub(subtitle.chars().count())
-        .saturating_sub(sub_pad_l);
-
-    vec![
-        Line::from(vec![
-            Span::raw(indent.to_owned()),
-            Span::styled(top, border),
-        ]),
-        Line::from(vec![
-            Span::raw(indent.to_owned()),
-            Span::styled("│", border),
-            Span::raw(" ".repeat(title_pad_l)),
-            Span::styled(title.to_owned(), title_style),
-            Span::raw(" ".repeat(title_pad_r)),
-            Span::styled("│", border),
-        ]),
-        Line::from(vec![
-            Span::raw(indent.to_owned()),
-            Span::styled(divider, border),
-        ]),
-        Line::from(vec![
-            Span::raw(indent.to_owned()),
-            Span::styled("│", border),
-            Span::raw(" ".repeat(sub_pad_l)),
-            Span::styled(subtitle.to_owned(), sub_style),
-            Span::raw(" ".repeat(sub_pad_r)),
-            Span::styled("│", border),
-        ]),
-        Line::from(vec![
-            Span::raw(indent.to_owned()),
-            Span::styled(bottom, border),
-        ]),
-    ]
+fn section_header(label: &str, th: Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {label}"),
+        Style::default()
+            .fg(th.accent2)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    ))
 }
 
-/// One cell of the layered-ERD char canvas.
-#[derive(Clone, Copy)]
-struct ErdCell {
-    ch: char,
-    fg: Color,
-    bold: bool,
-}
-
-/// Render a Sugiyama-lite layered ERD into a list of styled lines.
-///
-/// Layout algorithm:
-///   1. **Layer assignment.** For each table, layer = longest path
-///      along outgoing FK edges to a sink (a table that references
-///      nothing). Sinks land at layer 0 (leftmost); the most
-///      dependent tables end up at the highest layer (rightmost).
-///      Cycles are broken by marking nodes on the recursion stack as
-///      layer 0.
-///   2. **Within-layer ordering.** Alphabetical for determinism.
-///   3. **Channel routing.** Edges going from layer F to layer T (F > T)
-///      route through the channel just to the right of layer T's
-///      boxes. Each edge in a given channel is given a unique mid-X
-///      so parallel edges don't overlap. The route is
-///      `source-left-edge → horizontal → bend → vertical → bend →
-///      horizontal → target-right-edge ◀`.
-///   4. **Selected edge wins.** All non-selected edges paint first;
-///      the active edge paints last in `theme.warning` + bold so it
-///      sits on top of any crossings.
-///
-/// Limitations: multi-layer hops (F > T+1) currently route through a
-/// single channel and may overlap intermediate-layer boxes. Acceptable
-/// for v1 — most schemas have ≤3 layers and the active-edge highlight
-/// keeps the focus readable regardless.
-fn render_layered_erd(
+/// Build a Mermaid `erDiagram` source for the active schema. Tables
+/// without cached `TableInfo` render as empty bodies — the layout
+/// still works, the columns just fill in once the prefetch completes.
+fn mermaid_erdiagram(
     tables: &[String],
     edges: &[RelationshipEdge],
-    selected: usize,
-    th: Theme,
-) -> Vec<Line<'static>> {
-    if tables.is_empty() {
-        return Vec::new();
-    }
-
-    // ── 1. Build outgoing-edge adjacency (table → referenced tables) ──
-    let mut out: HashMap<&str, Vec<&str>> = HashMap::new();
-    for e in edges {
-        out.entry(e.from_table.as_str())
-            .or_default()
-            .push(e.to_table.as_str());
-    }
-
-    // ── 2. Layer assignment via memoised longest-path-to-sink. ────
-    fn compute_layer<'a>(
-        node: &'a str,
-        out: &HashMap<&'a str, Vec<&'a str>>,
-        memo: &mut HashMap<&'a str, usize>,
-        on_stack: &mut HashSet<&'a str>,
-    ) -> usize {
-        if let Some(&l) = memo.get(node) {
-            return l;
+    cache: &HashMap<String, TableInfo>,
+) -> String {
+    fn ident(s: &str) -> String {
+        // Mermaid identifiers: keep alphanumerics + `_`; map anything
+        // else to `_`. Double underscores collapse to one for
+        // readability.
+        let mut out = String::with_capacity(s.len());
+        let mut prev_us = false;
+        for ch in s.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                out.push(ch);
+                prev_us = ch == '_';
+            } else if !prev_us {
+                out.push('_');
+                prev_us = true;
+            }
         }
-        if on_stack.contains(node) {
-            // Cycle: pin to 0 to break it.
-            return 0;
-        }
-        on_stack.insert(node);
-        let layer = match out.get(node) {
-            None => 0,
-            Some(targets) => targets
+        out.trim_matches('_').to_owned()
+    }
+    fn typ(s: &str) -> String {
+        // Mermaid wants single-token types. Replace whitespace and
+        // parens; collapse to one token.
+        ident(s)
+    }
+    let mut out = String::new();
+    out.push_str("erDiagram\n");
+    for t in tables {
+        let name = ident(t);
+        out.push_str("  ");
+        out.push_str(&name);
+        out.push_str(" {\n");
+        if let Some(info) = cache.get(t) {
+            let pk: HashSet<&str> = info
+                .primary_key
+                .as_ref()
+                .map(|p| p.column_names.iter().map(String::as_str).collect())
+                .unwrap_or_default();
+            let fk: HashSet<&str> = info
+                .foreign_keys
                 .iter()
-                .map(|t| compute_layer(t, out, memo, on_stack) + 1)
-                .max()
-                .unwrap_or(0),
-        };
-        on_stack.remove(node);
-        memo.insert(node, layer);
-        layer
-    }
-
-    let mut memo: HashMap<&str, usize> = HashMap::new();
-    let mut on_stack: HashSet<&str> = HashSet::new();
-    let mut node_layer: HashMap<&str, usize> = HashMap::new();
-    for t in tables {
-        let l = compute_layer(t.as_str(), &out, &mut memo, &mut on_stack);
-        node_layer.insert(t.as_str(), l);
-    }
-    let max_layer = node_layer.values().copied().max().unwrap_or(0);
-
-    // ── 3. Group tables by layer, sort alphabetically. ────────────
-    let mut layers: Vec<Vec<&str>> = vec![Vec::new(); max_layer + 1];
-    for t in tables {
-        let l = node_layer[t.as_str()];
-        layers[l].push(t.as_str());
-    }
-    for v in layers.iter_mut() {
-        v.sort();
-    }
-
-    // ── 4. Compute layer geometry. ────────────────────────────────
-    const BOX_H: usize = 3;
-    const V_GAP: usize = 1;
-    const CHANNEL_W: usize = 8; // horizontal gap between layers
-
-    let layer_w: Vec<usize> = layers
-        .iter()
-        .map(|ts| {
-            ts.iter()
-                .map(|t| t.chars().count())
-                .max()
-                .unwrap_or(8)
-                .max(10)
-                + 4
-        })
-        .collect();
-
-    let mut layer_x: Vec<usize> = Vec::with_capacity(layers.len());
-    let mut x_cursor = 0;
-    for (i, w) in layer_w.iter().enumerate() {
-        layer_x.push(x_cursor);
-        x_cursor += w;
-        if i + 1 < layer_w.len() {
-            x_cursor += CHANNEL_W;
-        }
-    }
-    let canvas_w = x_cursor;
-
-    let mut node_y: HashMap<&str, usize> = HashMap::new();
-    let mut max_h = 0;
-    for ts in &layers {
-        for (i, t) in ts.iter().enumerate() {
-            node_y.insert(*t, i * (BOX_H + V_GAP));
-        }
-        let h = ts.len() * (BOX_H + V_GAP);
-        if h > max_h {
-            max_h = h;
-        }
-    }
-    let canvas_h = max_h.max(BOX_H);
-
-    let blank = ErdCell {
-        ch: ' ',
-        fg: th.fg,
-        bold: false,
-    };
-    let mut buf: Vec<Vec<ErdCell>> = vec![vec![blank; canvas_w]; canvas_h];
-
-    let put = |buf: &mut Vec<Vec<ErdCell>>, x: usize, y: usize, ch: char, fg: Color, bold: bool| {
-        if y < buf.len() && x < buf[0].len() {
-            buf[y][x] = ErdCell { ch, fg, bold };
-        }
-    };
-
-    let referenced: HashSet<&str> = edges
-        .iter()
-        .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
-        .collect();
-
-    // ── 5. Draw boxes. ────────────────────────────────────────────
-    for (l, ts) in layers.iter().enumerate() {
-        let x0 = layer_x[l];
-        let w = layer_w[l];
-        for name in ts {
-            let y0 = node_y[*name];
-            let title_color = if referenced.contains(name) {
-                th.accent
-            } else {
-                th.muted
-            };
-            // Top
-            put(&mut buf, x0, y0, '╭', th.border, false);
-            put(&mut buf, x0 + w - 1, y0, '╮', th.border, false);
-            for k in 1..w - 1 {
-                put(&mut buf, x0 + k, y0, '─', th.border, false);
-            }
-            // Middle
-            put(&mut buf, x0, y0 + 1, '│', th.border, false);
-            put(&mut buf, x0 + w - 1, y0 + 1, '│', th.border, false);
-            for k in 1..w - 1 {
-                put(&mut buf, x0 + k, y0 + 1, ' ', th.fg, false);
-            }
-            let inner = w - 2;
-            let pad = inner.saturating_sub(name.chars().count()) / 2;
-            for (k, ch) in name.chars().enumerate() {
-                put(&mut buf, x0 + 1 + pad + k, y0 + 1, ch, title_color, true);
-            }
-            // Bottom
-            put(&mut buf, x0, y0 + 2, '╰', th.border, false);
-            put(&mut buf, x0 + w - 1, y0 + 2, '╯', th.border, false);
-            for k in 1..w - 1 {
-                put(&mut buf, x0 + k, y0 + 2, '─', th.border, false);
+                .flat_map(|fk| fk.column_names.iter().map(String::as_str))
+                .collect();
+            for c in &info.columns {
+                let role = if pk.contains(c.name.as_str()) {
+                    " PK"
+                } else if fk.contains(c.name.as_str()) {
+                    " FK"
+                } else {
+                    ""
+                };
+                out.push_str(&format!(
+                    "    {} {}{}\n",
+                    typ(&c.data_type),
+                    ident(&c.name),
+                    role
+                ));
             }
         }
+        out.push_str("  }\n");
     }
-
-    // ── 6. Pre-allocate one mid_x per edge inside its channel so
-    //       parallel edges don't overlap. Each channel gets evenly-
-    //       spaced track positions.
-    let mut by_channel: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (eid, edge) in edges.iter().enumerate() {
-        let Some(&fl) = node_layer.get(edge.from_table.as_str()) else {
-            continue;
-        };
-        let Some(&tl) = node_layer.get(edge.to_table.as_str()) else {
-            continue;
-        };
-        if fl <= tl || edge.from_table == edge.to_table {
-            continue;
-        }
-        // Use the channel immediately to the right of the target's layer.
-        by_channel.entry(tl).or_default().push(eid);
+    for e in edges {
+        // FK side has many; PK side has one. `}o--||` reads
+        // "many to one (optional on FK side)".
+        out.push_str(&format!(
+            "  {} }}o--|| {} : {}\n",
+            ident(&e.from_table),
+            ident(&e.to_table),
+            ident(&e.from_columns.join("_"))
+        ));
     }
-    let mut edge_mid_x: HashMap<usize, usize> = HashMap::new();
-    for (tl, eids) in &by_channel {
-        let channel_start = layer_x[*tl] + layer_w[*tl]; // first cell after target box
-        let channel_end = if tl + 1 < layer_x.len() {
-            layer_x[tl + 1] // first cell of next layer's box
-        } else {
-            channel_start + CHANNEL_W
-        };
-        let span = channel_end.saturating_sub(channel_start).max(1);
-        let n = eids.len();
-        for (i, &eid) in eids.iter().enumerate() {
-            // Distribute mid_x evenly across the channel: positions
-            // 1..=n out of n+1 slots so neither edge sits on a box
-            // border.
-            let mx = channel_start + (i + 1) * span / (n + 1);
-            edge_mid_x.insert(eid, mx.max(channel_start).min(channel_end - 1));
-        }
+    out
+}
+
+/// Write the Mermaid `erDiagram` for the active schema to
+/// `./<schema>.mmd`. Returns the path on success or an error string.
+async fn save_mermaid_for_schema(app: &AppState) -> Result<PathBuf, String> {
+    if app.current_schema.is_empty() {
+        return Err("no active schema".to_owned());
     }
-
-    // ── 7. Route edges: non-selected first, selected last so it
-    //       wins on crossings.
-    let order: Vec<usize> = (0..edges.len())
-        .filter(|i| *i != selected)
-        .chain(std::iter::once(selected).filter(|_| selected < edges.len()))
-        .collect();
-    for eid in order {
-        let edge = &edges[eid];
-        let Some(&fl) = node_layer.get(edge.from_table.as_str()) else {
-            continue;
-        };
-        let Some(&tl) = node_layer.get(edge.to_table.as_str()) else {
-            continue;
-        };
-        if fl <= tl || edge.from_table == edge.to_table {
-            continue; // skip same-layer + self-references for v1
-        }
-        let Some(&mid_x) = edge_mid_x.get(&eid) else {
-            continue;
-        };
-        let is_sel = eid == selected;
-        let color = if is_sel { th.warning } else { th.muted };
-        let bold = is_sel;
-
-        // Source: left edge of from-box (which is on the right since fl > tl).
-        let from_x_left = layer_x[fl];
-        let from_y_mid = node_y[edge.from_table.as_str()] + BOX_H / 2;
-        // Target: right edge of to-box.
-        let to_x_right = layer_x[tl] + layer_w[tl] - 1;
-        let to_y_mid = node_y[edge.to_table.as_str()] + BOX_H / 2;
-
-        // Stub one cell out of source to the left.
-        let stub_x = from_x_left.saturating_sub(1);
-        let target_stub = to_x_right + 1; // cell holding the arrowhead
-
-        // Segment 1: horizontal at from_y_mid from mid_x → stub_x
-        let (a, b) = (mid_x.min(stub_x), mid_x.max(stub_x));
-        for x in a..=b {
-            let cell = buf[from_y_mid][x];
-            if cell.ch == ' ' || cell.ch == '─' || is_sel {
-                put(&mut buf, x, from_y_mid, '─', color, bold);
-            }
-        }
-
-        // Segment 2: vertical at mid_x from from_y_mid → to_y_mid
-        if from_y_mid != to_y_mid {
-            let going_down = to_y_mid > from_y_mid;
-            // We came in from the right (going left), now turn up/down.
-            let bend_top = if going_down { '╭' } else { '╰' };
-            let bend_bot = if going_down { '╯' } else { '╮' };
-            put(&mut buf, mid_x, from_y_mid, bend_top, color, bold);
-            let (a, b) = (from_y_mid.min(to_y_mid), from_y_mid.max(to_y_mid));
-            for y in (a + 1)..b {
-                let cell = buf[y][mid_x];
-                if cell.ch == ' ' || cell.ch == '│' || is_sel {
-                    put(&mut buf, mid_x, y, '│', color, bold);
-                }
-            }
-            put(&mut buf, mid_x, to_y_mid, bend_bot, color, bold);
-        }
-
-        // Segment 3: horizontal at to_y_mid from target_stub → mid_x
-        let (a, b) = (mid_x.min(target_stub), mid_x.max(target_stub));
-        for x in a..=b {
-            if x == mid_x && from_y_mid != to_y_mid {
-                continue; // don't trample the bend
-            }
-            let cell = buf[to_y_mid][x];
-            if cell.ch == ' ' || cell.ch == '─' || is_sel {
-                put(&mut buf, x, to_y_mid, '─', color, bold);
-            }
-        }
-
-        // Arrowhead pointing into the target box's right edge.
-        let head_color = if is_sel { th.accent } else { color };
-        put(&mut buf, target_stub, to_y_mid, '◀', head_color, true);
-    }
-
-    // ── 8. Convert canvas to styled lines. ────────────────────────
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(canvas_h + 2);
-    for row in &buf {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut current = String::new();
-        let mut current_style = Style::default().fg(th.fg);
-        for cell in row {
-            let mut st = Style::default().fg(cell.fg);
-            if cell.bold {
-                st = st.add_modifier(Modifier::BOLD);
-            }
-            if st != current_style && !current.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut current), current_style));
-            }
-            current.push(cell.ch);
-            current_style = st;
-        }
-        if !current.is_empty() {
-            spans.push(Span::styled(current, current_style));
-        }
-        lines.push(Line::from(spans));
-    }
-    lines
+    let tables = erd_table_list(app);
+    let body = mermaid_erdiagram(&tables, &app.relationships, &app.erd_table_info);
+    let path = PathBuf::from(format!("{}.mmd", app.current_schema));
+    tokio::fs::write(&path, body.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 // ─── SQL editor pane ──────────────────────────────────────────────────────────
@@ -3349,6 +3225,84 @@ mod tests {
         ];
         assert_eq!(unique_connection_name("prod", &saved), "prod-3");
         assert_eq!(unique_connection_name("dev", &saved), "dev");
+    }
+
+    #[test]
+    fn mermaid_erdiagram_emits_columns_and_relationships() {
+        use std::collections::HashMap;
+        use tsql_db::{ColumnInfo, PrimaryKeyInfo, RelationshipEdge, TableInfo};
+
+        let users = TableInfo {
+            name: "users".to_owned(),
+            schema: "public".to_owned(),
+            columns: vec![ColumnInfo {
+                name: "id".to_owned(),
+                data_type: "int4".to_owned(),
+                is_nullable: false,
+                default_value: None,
+            }],
+            indexes: vec![],
+            primary_key: Some(PrimaryKeyInfo {
+                name: "users_pk".to_owned(),
+                column_names: vec!["id".to_owned()],
+            }),
+            foreign_keys: vec![],
+            constraints: vec![],
+        };
+        let orders = TableInfo {
+            name: "orders".to_owned(),
+            schema: "public".to_owned(),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    data_type: "int4".to_owned(),
+                    is_nullable: false,
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "user_id".to_owned(),
+                    data_type: "int4".to_owned(),
+                    is_nullable: false,
+                    default_value: None,
+                },
+            ],
+            indexes: vec![],
+            primary_key: Some(PrimaryKeyInfo {
+                name: "orders_pk".to_owned(),
+                column_names: vec!["id".to_owned()],
+            }),
+            foreign_keys: vec![tsql_db::ForeignKeyInfo {
+                name: "orders_user_fk".to_owned(),
+                column_names: vec!["user_id".to_owned()],
+                referenced_table: "users".to_owned(),
+                referenced_columns: vec!["id".to_owned()],
+            }],
+            constraints: vec![],
+        };
+
+        let mut cache: HashMap<String, TableInfo> = HashMap::new();
+        cache.insert("users".to_owned(), users);
+        cache.insert("orders".to_owned(), orders);
+
+        let tables = vec!["orders".to_owned(), "users".to_owned()];
+        let edges = vec![RelationshipEdge {
+            from_table: "orders".to_owned(),
+            from_columns: vec!["user_id".to_owned()],
+            to_table: "users".to_owned(),
+            to_columns: vec!["id".to_owned()],
+        }];
+
+        let mmd = super::mermaid_erdiagram(&tables, &edges, &cache);
+        assert!(mmd.starts_with("erDiagram\n"), "header present");
+        assert!(mmd.contains("orders {"), "orders block opens");
+        assert!(mmd.contains("users {"), "users block opens");
+        assert!(mmd.contains("int4 id PK"), "PK role tagged");
+        assert!(mmd.contains("int4 user_id FK"), "FK role tagged");
+        assert!(
+            mmd.contains("orders }o--|| users : user_id"),
+            "FK relationship line present"
+        );
+        let _ = Theme::catppuccin_mocha();
     }
 
     #[test]
