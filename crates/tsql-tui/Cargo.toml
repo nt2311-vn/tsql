@@ -16,7 +16,8 @@ anyhow.workspace = true
 crossterm.workspace = true
 dirs.workspace = true
 ratatui.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "sync", "rt"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "process", "sync", "rt"] }
 tsql-core = { path = "../tsql-core", version = "0.1.0" }
 tsql-db = { path = "../tsql-db", version = "0.1.0" }
 tsql-sql = { path = "../tsql-sql", version = "0.1.0" }

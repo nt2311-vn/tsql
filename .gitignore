@@ -9,3 +9,6 @@
 *.aaak
 Vault/
 graph.md
+
+# generated locally by ERD  save
+*.mmd
