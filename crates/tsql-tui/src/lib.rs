@@ -3296,15 +3296,20 @@ async fn render_mermaid_with_chafa(
     }
 
     // chafa: rasterize PNG to a colored symbol grid sized for the
-    // chart pane. Use the full symbol palette (sextants + quadrants
-    // + half-blocks) so we get up to 6× sub-cell resolution — that's
-    // what makes Mermaid box labels legible. Pin the cell aspect
-    // ratio (1:2 width:height matches most terminal fonts). 10s is
-    // generous; chafa returns in milliseconds.
+    // chart pane. Symbol palette is deliberately conservative —
+    // `--symbols=all` pulls in sextants / octants from the
+    // Symbols-for-Legacy-Computing Unicode block, which most
+    // monospace fonts (Nerd Fonts included) substitute with CJK
+    // fallback glyphs and turn the chart into garbage. Stick to
+    // blocks + half-blocks + quadrants + box-drawing borders, all
+    // of which render correctly in any modern terminal font and
+    // still give us 4× sub-cell resolution via quadrants. Pin the
+    // cell aspect ratio (1:2 width:height matches most terminal
+    // fonts). 10s is generous; chafa returns in milliseconds.
     let mut chafa_cmd = Command::new("chafa");
     chafa_cmd
         .arg("--format=symbols")
-        .arg("--symbols=all")
+        .arg("--symbols=block+space+border+vhalf+hhalf+quad+inverted")
         .arg("--colors=full")
         .arg("--color-space=rgb")
         .arg("--font-ratio=1/2")
