@@ -26,6 +26,35 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
   metadata now includes the PK index (previously filtered out) so the
   default btree backing each table is always visible. SQLite reports
   every regular index as btree (FTS/R*Tree live as virtual tables).
+- **ERD: render the Mermaid chart inline via `mmdc` + `chafa`.**
+  The Mermaid source by itself wasn't useful — users had to paste
+  it into another tool to actually see anything. Now the chart
+  pane at the top of the ERD tab calls out to the Mermaid CLI
+  (`mmdc`) to rasterize the schema to a PNG and pipes that
+  through `chafa` to convert it into colored Unicode half-blocks
+  rendered directly inside the TUI.
+
+  - **Pipeline.** `mermaid_erdiagram` → temp `.mmd` → `mmdc -t
+    dark -b transparent -w 1600 -H 1200` → temp `.png` →
+    `chafa --format=symbols --symbols=block+border --size=WxH`
+    → bespoke SGR parser → `Vec<Line<'static>>`.
+  - **Async + cached.** Render runs on a tokio task; result
+    arrives as a new `DbMessage::ErdChart` variant. FNV-1a hash
+    of the Mermaid source keys the cache so a redraw doesn't
+    re-shell on every frame; pane size changes ≥2 cells re-trigger
+    a render.
+  - **Status states.** Idle / Rendering / Ready / Failed /
+    MissingTool. When `mmdc` or `chafa` aren't on `PATH`, the
+    pane shows an actionable install hint plus a `y` prompt for
+    saving the source manually.
+  - **Layout.** Vertical split on the ERD tab: banner row at top,
+    chart pane (~60% height, full width), then the table list +
+    per-table inspector below (~40%). Chart gets max horizontal
+    real estate, which it actually needs.
+
+  New deps: `tempfile` (runtime) and `tokio` `process` feature.
+  External tools (`mmdc`, `chafa`) are optional — graceful fallback
+  to the install hint when missing.
 - **ERD: structured inspector + Mermaid export.** Two visual
   attempts at an in-terminal diagram (layered graph, then a
   dbdiagram-style card grid) hit hard limits — ASCII / box-drawing

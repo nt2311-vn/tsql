@@ -530,13 +530,25 @@ async fn fetch_postgres_table_info(
         )
         .collect();
 
-    // Constraints (CHECK + UNIQUE)
+    // Constraints (CHECK + UNIQUE + EXCLUSION). We go through
+    // pg_constraint instead of information_schema for two reasons:
+    //   1. `pg_get_constraintdef` gives us the actual SQL clause
+    //      (e.g. `CHECK ((amount > 0))`, `UNIQUE (email)`) rather
+    //      than just the constraint *type*.
+    //   2. We can filter out the synthetic NOT NULL constraints
+    //      Postgres now records (e.g. `2200_16385_1_not_null`) —
+    //      those are already surfaced in the Columns tab via the
+    //      `is_nullable` flag and would otherwise spam this view.
     let constraint_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT tc.constraint_name, tc.constraint_type
-         FROM information_schema.table_constraints tc
-         WHERE tc.table_schema = $1 AND tc.table_name = $2
-           AND tc.constraint_type IN ('CHECK', 'UNIQUE')
-         ORDER BY tc.constraint_name",
+        "SELECT con.conname, pg_get_constraintdef(con.oid)
+         FROM pg_constraint con
+         JOIN pg_class rel ON rel.oid = con.conrelid
+         JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+         WHERE nsp.nspname = $1
+           AND rel.relname = $2
+           AND con.contype IN ('c', 'u', 'x')
+           AND con.conname !~ '_not_null$'
+         ORDER BY con.conname",
     )
     .bind(schema)
     .bind(table)

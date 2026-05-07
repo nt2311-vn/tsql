@@ -57,6 +57,61 @@ enum DbMessage {
         table: String,
         result: Result<TableInfo, String>,
     },
+    /// Result of rendering the Mermaid chart with `mmdc` + `chafa`.
+    /// `hash` keys the render against the source the task was launched
+    /// for so a stale render that arrives after the schema changed is
+    /// dropped silently.
+    ErdChart {
+        schema: String,
+        hash: u64,
+        size: (u16, u16),
+        result: Result<Vec<Line<'static>>, ErdChartError>,
+    },
+}
+
+/// Why an ERD chart render failed. Drives the on-screen hint so the
+/// user knows whether to install a tool or fix the source.
+#[derive(Debug, Clone)]
+enum ErdChartError {
+    /// A required external binary (`mmdc` or `chafa`) was not found
+    /// on `PATH`. The string is the install hint shown to the user.
+    MissingTool(String),
+    /// `mmdc` or `chafa` ran but exited non-zero. The string is the
+    /// stderr tail.
+    Failed(String),
+}
+
+/// Cached chart-render pipeline state. Lives on `AppState` so the draw
+/// path can show the latest output without re-running `mmdc`/`chafa`
+/// on every frame.
+#[derive(Debug, Default)]
+struct ErdChart {
+    /// FNV-1a hash of the Mermaid source last submitted for rendering.
+    /// Re-render only triggers when this changes (or the pane size
+    /// changes meaningfully).
+    hash: Option<u64>,
+    /// Pane size used when the chart was last submitted.
+    size: (u16, u16),
+    /// Most recent observed inspector chart-pane size, set by the draw
+    /// path so the event-loop trigger can spot resizes.
+    desired_size: std::cell::Cell<(u16, u16)>,
+    status: ErdChartStatus,
+}
+
+#[derive(Debug, Default, Clone)]
+enum ErdChartStatus {
+    /// No render attempted yet for the current inputs.
+    #[default]
+    Idle,
+    /// A background task is currently running.
+    Rendering,
+    /// Render completed successfully; lines hold the parsed chafa
+    /// output ready to splice into the inspector pane.
+    Ready(Vec<Line<'static>>),
+    /// Render failed with the given message.
+    Failed(String),
+    /// External tool missing — show install hint.
+    MissingTool(String),
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -234,10 +289,13 @@ struct AppState {
     /// Row index into `relationships` selected on the ERD tab. Used by
     /// j/k navigation and the Enter / `o` jump-to-table shortcuts.
     erd_selected: usize,
-    /// Schema-scoped `TableInfo` cache feeding the ERD card-grid
-    /// renderer. Cleared on schema change. Tables that have not yet
-    /// been pre-fetched render as a name-only stub card.
+    /// Schema-scoped `TableInfo` cache feeding the ERD inspector +
+    /// Mermaid generator. Cleared on schema change. Tables that have
+    /// not yet been pre-fetched render as `(loading…)` stubs.
     erd_table_info: HashMap<String, TableInfo>,
+    /// State of the rendered Mermaid chart pipeline (mmdc + chafa).
+    /// Cached so a redraw doesn't re-shell on every frame.
+    erd_chart: ErdChart,
     editor: String,
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
@@ -303,6 +361,7 @@ impl AppState {
             relationships: Vec::new(),
             erd_selected: 0,
             erd_table_info: HashMap::new(),
+            erd_chart: ErdChart::default(),
             editor: String::new(),
             editor_cursor: 0,
             editor_path: None,
@@ -428,6 +487,12 @@ async fn run_loop(
             apply_db_message(app, msg);
         }
 
+        // After draining, decide whether the ERD chart needs a
+        // refresh. The draw path stamps the inspector pane size into
+        // `app.erd_chart.desired_size`, so by now we know how large to
+        // render.
+        maybe_spawn_chart_render(app);
+
         // Short poll keeps the UI responsive (~30 fps) while still letting
         // the runtime schedule background tasks.
         if !event::poll(Duration::from_millis(33))? {
@@ -508,6 +573,36 @@ fn apply_db_message(app: &mut AppState, msg: DbMessage) {
             if let Ok(info) = result {
                 app.erd_table_info.insert(table, info);
             }
+        }
+        DbMessage::ErdChart {
+            schema,
+            hash,
+            size,
+            result,
+        } => {
+            // Drop the result if the user has navigated away or the
+            // mermaid source has been re-hashed since this task began.
+            if schema != app.current_schema {
+                return;
+            }
+            if app.erd_chart.hash != Some(hash) {
+                return;
+            }
+            app.erd_chart.size = size;
+            app.erd_chart.status = match result {
+                Ok(lines) => {
+                    app.status = format!("ERD chart rendered ({}x{})", size.0, size.1);
+                    ErdChartStatus::Ready(lines)
+                }
+                Err(ErdChartError::MissingTool(hint)) => {
+                    app.status = format!("ERD chart: {hint}");
+                    ErdChartStatus::MissingTool(hint)
+                }
+                Err(ErdChartError::Failed(msg)) => {
+                    app.last_error = Some(format!("ERD chart: {msg}"));
+                    ErdChartStatus::Failed(msg)
+                }
+            };
         }
         DbMessage::Relationships { schema, result } => {
             if schema != app.current_schema {
@@ -1481,7 +1576,9 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 }
 
 /// Open the table currently highlighted on the ERD tab as the active
-/// browser table. Mirrors a sidebar `Enter`.
+/// browser table. Mirrors a sidebar `Enter`, but stays on the ERD tab
+/// so the user can keep navigating relationships without losing their
+/// place.
 async fn open_erd_selected_table(app: &mut AppState) {
     let tables = erd_table_list(app);
     let Some(target) = tables
@@ -1492,7 +1589,6 @@ async fn open_erd_selected_table(app: &mut AppState) {
     };
     let schema = app.current_schema.clone();
     select_sidebar_for(app, &target);
-    app.detail_tab = DetailTab::Records;
     load_table(app, &schema, &target).await;
 }
 
@@ -1527,6 +1623,7 @@ async fn load_table(app: &mut AppState, schema: &str, table: &str) {
         app.relationships.clear();
         app.erd_selected = 0;
         app.erd_table_info.clear();
+        app.erd_chart = ErdChart::default();
     }
     app.current_schema = schema.to_owned();
     app.current_table = table.to_owned();
@@ -2516,9 +2613,17 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
+    // Vertical split:
+    //   row 0: banner (1 line)
+    //   row 1: chart pane (~60%, full width)
+    //   row 2: tables list + per-table inspector (~40%, two columns)
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Percentage(60),
+            Constraint::Min(8),
+        ])
         .split(area);
 
     // Banner.
@@ -2532,7 +2637,7 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         ),
         Span::styled(
             format!(
-                "  {} table(s), {} relationship(s)  j/k tables  Enter open  y mermaid  ",
+                "  {} table(s), {} relationship(s)  j/k tables  Enter open  y save mermaid  ",
                 tables.len(),
                 app.relationships.len(),
             ),
@@ -2544,14 +2649,120 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         layout[0],
     );
 
+    draw_erd_chart_pane(f, app, layout[1]);
+
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(28), Constraint::Min(0)])
-        .split(layout[1]);
+        .split(layout[2]);
 
     let selected = app.erd_selected.min(tables.len() - 1);
     draw_erd_table_list(f, app, &tables, selected, body[0]);
     draw_erd_inspector(f, app, &tables, selected, body[1]);
+}
+
+/// Render the rendered Mermaid chart (or its current placeholder /
+/// error state) into `area`. Stamps the inner content size into
+/// `app.erd_chart.desired_size` so the event loop can trigger a fresh
+/// render at this exact size.
+fn draw_erd_chart_pane(f: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let th = app.theme;
+    let title = match &app.erd_chart.status {
+        ErdChartStatus::Ready(_) => "  ERD chart  ",
+        ErdChartStatus::Rendering => "  ERD chart  (rendering…)  ",
+        ErdChartStatus::Idle => "  ERD chart  (preparing…)  ",
+        ErdChartStatus::Failed(_) => "  ERD chart  (error)  ",
+        ErdChartStatus::MissingTool(_) => "  ERD chart  (tools missing)  ",
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .style(Style::default().bg(th.bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Tell the event loop how big a render we'd like.
+    app.erd_chart.desired_size.set((inner.width, inner.height));
+
+    let placeholder = |msg: &str, color: Color| -> Paragraph<'static> {
+        Paragraph::new(vec![
+            Line::default(),
+            Line::from(Span::styled(format!("  {msg}"), Style::default().fg(color))),
+        ])
+        .style(Style::default().bg(th.bg))
+    };
+
+    match &app.erd_chart.status {
+        ErdChartStatus::Ready(lines) => {
+            f.render_widget(
+                Paragraph::new(lines.clone()).style(Style::default().bg(th.bg)),
+                inner,
+            );
+        }
+        ErdChartStatus::Rendering => {
+            f.render_widget(
+                placeholder("rendering Mermaid → PNG → terminal…", th.muted),
+                inner,
+            );
+        }
+        ErdChartStatus::Idle => {
+            f.render_widget(placeholder("waiting for schema metadata…", th.muted), inner);
+        }
+        ErdChartStatus::Failed(msg) => {
+            let body = vec![
+                Line::default(),
+                Line::from(Span::styled(
+                    "  Could not render chart:",
+                    Style::default().fg(th.error).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("    {msg}"),
+                    Style::default().fg(th.error),
+                )),
+                Line::default(),
+                Line::from(Span::styled(
+                    "  Press y to save the Mermaid source for manual rendering.",
+                    Style::default().fg(th.muted).add_modifier(Modifier::ITALIC),
+                )),
+            ];
+            f.render_widget(
+                Paragraph::new(body).style(Style::default().bg(th.bg)),
+                inner,
+            );
+        }
+        ErdChartStatus::MissingTool(hint) => {
+            let body = vec![
+                Line::default(),
+                Line::from(Span::styled(
+                    "  Inline ERD chart needs two external tools:",
+                    Style::default().fg(th.fg).add_modifier(Modifier::BOLD),
+                )),
+                Line::default(),
+                Line::from(Span::styled(
+                    format!("    • {hint}"),
+                    Style::default().fg(th.warning),
+                )),
+                Line::default(),
+                Line::from(Span::styled(
+                    "  Once installed, the chart will render here automatically.",
+                    Style::default().fg(th.muted),
+                )),
+                Line::from(Span::styled(
+                    "  Press y to write the Mermaid source to ./<schema>.mmd in the meantime.",
+                    Style::default().fg(th.muted).add_modifier(Modifier::ITALIC),
+                )),
+            ];
+            f.render_widget(
+                Paragraph::new(body).style(Style::default().bg(th.bg)),
+                inner,
+            );
+        }
+    }
 }
 
 /// Alphabetical list of tables in the active schema. Sourced from the
@@ -2799,26 +3010,12 @@ fn draw_erd_inspector(
     }
     lines.push(Line::default());
 
-    // Mermaid block.
-    lines.push(section_header("Mermaid", th));
+    // Mermaid source no longer dumps here — the chart pane above
+    // shows the rendered diagram, and `y` still writes the source
+    // out for sharing.
+    let _ = tables;
     lines.push(Line::from(Span::styled(
-        "    ```mermaid",
-        Style::default().fg(th.muted),
-    )));
-    let mmd = mermaid_erdiagram(tables, &app.relationships, &app.erd_table_info);
-    for ml in mmd.lines() {
-        lines.push(Line::from(Span::styled(
-            format!("    {ml}"),
-            Style::default().fg(th.fg),
-        )));
-    }
-    lines.push(Line::from(Span::styled(
-        "    ```",
-        Style::default().fg(th.muted),
-    )));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "    y → write block to ./<schema>.mmd",
+        "    y → save Mermaid source to ./<schema>.mmd",
         Style::default().fg(th.muted).add_modifier(Modifier::ITALIC),
     )));
 
@@ -2931,6 +3128,267 @@ async fn save_mermaid_for_schema(app: &AppState) -> Result<PathBuf, String> {
         .await
         .map_err(|e| e.to_string())?;
     Ok(path)
+}
+
+/// Stable FNV-1a 64-bit hash of a string. Used to key chart renders so
+/// we can detect when the Mermaid source has changed without comparing
+/// full strings on every redraw.
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// Decide whether a fresh chart render needs to start, and spawn one if
+/// so. Driven from the event loop after each frame so we react to any
+/// of: (1) Mermaid source changes, (2) inspector resizes, (3) an
+/// initial entry into the ERD tab.
+fn maybe_spawn_chart_render(app: &mut AppState) {
+    if app.detail_tab != DetailTab::Erd {
+        return;
+    }
+    if matches!(app.erd_chart.status, ErdChartStatus::Rendering) {
+        return;
+    }
+    let (w, h) = app.erd_chart.desired_size.get();
+    if w < 16 || h < 6 {
+        // Pane too small to bother rendering. Stay idle.
+        return;
+    }
+    let tables = erd_table_list(app);
+    if tables.is_empty() {
+        return;
+    }
+    let src = mermaid_erdiagram(&tables, &app.relationships, &app.erd_table_info);
+    let hash = fnv1a64(&src);
+    // Re-render only if hash or size changed meaningfully (>=2 cells in
+    // either dim — stops thrashing on 1-cell jitter from layout splits).
+    let size_changed = (w as i32 - app.erd_chart.size.0 as i32).abs() >= 2
+        || (h as i32 - app.erd_chart.size.1 as i32).abs() >= 2;
+    let hash_changed = app.erd_chart.hash != Some(hash);
+    if !hash_changed && !size_changed && matches!(app.erd_chart.status, ErdChartStatus::Ready(_)) {
+        return;
+    }
+    let Some(tx) = app.tx.clone() else {
+        return;
+    };
+    let schema = app.current_schema.clone();
+    app.erd_chart.status = ErdChartStatus::Rendering;
+    app.erd_chart.hash = Some(hash);
+    app.erd_chart.size = (w, h);
+    tokio::spawn(async move {
+        let result = render_mermaid_with_chafa(&src, w, h).await;
+        let _ = tx.send(DbMessage::ErdChart {
+            schema,
+            hash,
+            size: (w, h),
+            result,
+        });
+    });
+}
+
+/// Run the `mmdc` + `chafa` pipeline on `mermaid_src`, returning a
+/// list of styled `Line`s ready to render. Missing binaries surface
+/// as `ErdChartError::MissingTool` (caught from the OS' `NotFound`
+/// when the spawn fails). Each step is wrapped in a timeout so a hung
+/// child can never leave the chart pane stuck on `(rendering…)`.
+async fn render_mermaid_with_chafa(
+    mermaid_src: &str,
+    width: u16,
+    height: u16,
+) -> Result<Vec<Line<'static>>, ErdChartError> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+
+    fn install_hint(tool: &str) -> String {
+        match tool {
+            "mmdc" => "install Mermaid CLI: `npm i -g @mermaid-js/mermaid-cli`".to_owned(),
+            "chafa" => "install chafa: `sudo apt install chafa` / `brew install chafa`".to_owned(),
+            other => format!("missing tool: {other}"),
+        }
+    }
+
+    /// Map a `tokio::process` spawn outcome onto our error enum,
+    /// distinguishing a missing binary (NotFound) from a runtime
+    /// failure (timeout / non-zero exit / I/O error).
+    async fn run(
+        cmd: &mut Command,
+        tool: &'static str,
+        timeout_secs: u64,
+    ) -> Result<std::process::Output, ErdChartError> {
+        cmd.stdin(Stdio::null());
+        match timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
+            Err(_) => Err(ErdChartError::Failed(format!(
+                "{tool}: timed out after {timeout_secs}s"
+            ))),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(ErdChartError::MissingTool(install_hint(tool)))
+            }
+            Ok(Err(e)) => Err(ErdChartError::Failed(format!("spawn {tool}: {e}"))),
+            Ok(Ok(out)) => Ok(out),
+        }
+    }
+
+    // Stage source + PNG in a tempdir so the pipeline never touches
+    // the user's working directory.
+    let tmp = tempfile::Builder::new()
+        .prefix("tsql-erd-")
+        .tempdir()
+        .map_err(|e| ErdChartError::Failed(format!("tempdir: {e}")))?;
+    let mmd_path = tmp.path().join("erd.mmd");
+    let png_path = tmp.path().join("erd.png");
+    tokio::fs::write(&mmd_path, mermaid_src.as_bytes())
+        .await
+        .map_err(|e| ErdChartError::Failed(format!("write mmd: {e}")))?;
+
+    // mmdc: render Mermaid to PNG. 60s budget covers the first-run
+    // Chromium download path; subsequent runs are sub-second.
+    let mut mmdc_cmd = Command::new("mmdc");
+    mmdc_cmd
+        .arg("-i")
+        .arg(&mmd_path)
+        .arg("-o")
+        .arg(&png_path)
+        .arg("-b")
+        .arg("transparent")
+        .arg("-t")
+        .arg("dark")
+        .arg("-w")
+        .arg("1600")
+        .arg("-H")
+        .arg("1200");
+    let mmdc_out = run(&mut mmdc_cmd, "mmdc", 60).await?;
+    if !mmdc_out.status.success() {
+        let stderr = String::from_utf8_lossy(&mmdc_out.stderr);
+        let tail: String = stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
+        return Err(ErdChartError::Failed(format!("mmdc: {tail}")));
+    }
+
+    // chafa: rasterize PNG to colored Unicode half-blocks sized for
+    // the chart pane. 10s is generous; chafa returns in milliseconds.
+    let mut chafa_cmd = Command::new("chafa");
+    chafa_cmd
+        .arg("--format=symbols")
+        .arg("--symbols=block+border")
+        .arg(format!("--size={}x{}", width, height))
+        .arg(&png_path);
+    let chafa_out = run(&mut chafa_cmd, "chafa", 10).await?;
+    if !chafa_out.status.success() {
+        let stderr = String::from_utf8_lossy(&chafa_out.stderr);
+        let tail: String = stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
+        return Err(ErdChartError::Failed(format!("chafa: {tail}")));
+    }
+
+    Ok(parse_ansi_to_lines(&chafa_out.stdout))
+}
+
+/// Translate a byte stream of ANSI SGR-coloured text into ratatui
+/// `Line`s. Handles the subset chafa actually emits: SGR `0` (reset),
+/// `1` (bold), `38;2;r;g;b` / `48;2;r;g;b` (24-bit fg/bg),
+/// `38;5;n` / `48;5;n` (256-colour palette). Anything else is
+/// swallowed silently — we'd rather drop a colour than panic on a
+/// rendering glitch.
+fn parse_ansi_to_lines(input: &[u8]) -> Vec<Line<'static>> {
+    let s = String::from_utf8_lossy(input).into_owned();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_line: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut style = Style::default();
+
+    let flush = |buf: &mut String, current_line: &mut Vec<Span<'static>>, style: Style| {
+        if !buf.is_empty() {
+            current_line.push(Span::styled(std::mem::take(buf), style));
+        }
+    };
+
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            // CSI: collect parameters until terminator.
+            flush(&mut buf, &mut current_line, style);
+            i += 2;
+            let mut params = String::new();
+            while i < chars.len() {
+                let c = chars[i];
+                if c.is_ascii_alphabetic() {
+                    if c == 'm' {
+                        apply_sgr(&mut style, &params);
+                    }
+                    i += 1;
+                    break;
+                }
+                params.push(c);
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '\n' {
+            flush(&mut buf, &mut current_line, style);
+            lines.push(Line::from(std::mem::take(&mut current_line)));
+            i += 1;
+            continue;
+        }
+        if ch == '\r' {
+            i += 1;
+            continue;
+        }
+        buf.push(ch);
+        i += 1;
+    }
+    flush(&mut buf, &mut current_line, style);
+    if !current_line.is_empty() {
+        lines.push(Line::from(current_line));
+    }
+    lines
+}
+
+/// Apply a single CSI `m` parameter list to a `Style`. Only the SGR
+/// codes chafa emits are handled — others are ignored.
+fn apply_sgr(style: &mut Style, params: &str) {
+    let parts: Vec<&str> = params.split(';').collect();
+    let mut i = 0;
+    while i < parts.len() {
+        let n: u32 = parts[i].parse().unwrap_or(0);
+        match n {
+            0 => *style = Style::default(),
+            1 => *style = style.add_modifier(Modifier::BOLD),
+            22 => *style = style.remove_modifier(Modifier::BOLD),
+            38 if i + 4 < parts.len() && parts[i + 1] == "2" => {
+                let r = parts[i + 2].parse().unwrap_or(0);
+                let g = parts[i + 3].parse().unwrap_or(0);
+                let b = parts[i + 4].parse().unwrap_or(0);
+                *style = style.fg(Color::Rgb(r, g, b));
+                i += 4;
+            }
+            48 if i + 4 < parts.len() && parts[i + 1] == "2" => {
+                let r = parts[i + 2].parse().unwrap_or(0);
+                let g = parts[i + 3].parse().unwrap_or(0);
+                let b = parts[i + 4].parse().unwrap_or(0);
+                *style = style.bg(Color::Rgb(r, g, b));
+                i += 4;
+            }
+            38 if i + 2 < parts.len() && parts[i + 1] == "5" => {
+                let idx = parts[i + 2].parse().unwrap_or(0);
+                *style = style.fg(Color::Indexed(idx));
+                i += 2;
+            }
+            48 if i + 2 < parts.len() && parts[i + 1] == "5" => {
+                let idx = parts[i + 2].parse().unwrap_or(0);
+                *style = style.bg(Color::Indexed(idx));
+                i += 2;
+            }
+            39 => *style = style.fg(Color::Reset),
+            49 => *style = style.bg(Color::Reset),
+            _ => {}
+        }
+        i += 1;
+    }
 }
 
 // ─── SQL editor pane ──────────────────────────────────────────────────────────
@@ -3225,6 +3683,22 @@ mod tests {
         ];
         assert_eq!(unique_connection_name("prod", &saved), "prod-3");
         assert_eq!(unique_connection_name("dev", &saved), "dev");
+    }
+
+    #[test]
+    fn parse_ansi_to_lines_decodes_24bit_color_and_newlines() {
+        // Two cells: red 'A' on a blue bg, then a reset and a plain 'B'
+        // followed by a newline and an unstyled 'C'.
+        let bytes = b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255mA\x1b[0mB\nC";
+        let lines = super::parse_ansi_to_lines(bytes);
+        assert_eq!(lines.len(), 2, "newline produces two lines");
+        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(first, "AB");
+        // The first span should hold the styled 'A' with the rgb fg/bg.
+        let a = &lines[0].spans[0];
+        assert_eq!(a.content.as_ref(), "A");
+        assert_eq!(a.style.fg, Some(super::Color::Rgb(255, 0, 0)));
+        assert_eq!(a.style.bg, Some(super::Color::Rgb(0, 0, 255)));
     }
 
     #[test]
