@@ -49,6 +49,14 @@ enum DbMessage {
         schema: String,
         result: Result<Vec<RelationshipEdge>, String>,
     },
+    /// Pre-fetch of one schema-scoped `TableInfo` populated for the
+    /// ERD card view. Independent of the active table so it does not
+    /// race with `TableInfo` for the foreground view.
+    ErdTableInfo {
+        schema: String,
+        table: String,
+        result: Result<TableInfo, String>,
+    },
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -226,6 +234,10 @@ struct AppState {
     /// Row index into `relationships` selected on the ERD tab. Used by
     /// j/k navigation and the Enter / `o` jump-to-table shortcuts.
     erd_selected: usize,
+    /// Schema-scoped `TableInfo` cache feeding the ERD card-grid
+    /// renderer. Cleared on schema change. Tables that have not yet
+    /// been pre-fetched render as a name-only stub card.
+    erd_table_info: HashMap<String, TableInfo>,
     editor: String,
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
@@ -290,6 +302,7 @@ impl AppState {
             record_table_state: ts,
             relationships: Vec::new(),
             erd_selected: 0,
+            erd_table_info: HashMap::new(),
             editor: String::new(),
             editor_cursor: 0,
             editor_path: None,
@@ -484,6 +497,18 @@ fn apply_db_message(app: &mut AppState, msg: DbMessage) {
                 }
             }
         }
+        DbMessage::ErdTableInfo {
+            schema,
+            table,
+            result,
+        } => {
+            if schema != app.current_schema {
+                return;
+            }
+            if let Ok(info) = result {
+                app.erd_table_info.insert(table, info);
+            }
+        }
         DbMessage::Relationships { schema, result } => {
             if schema != app.current_schema {
                 return;
@@ -601,6 +626,7 @@ async fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
                 let schema = app.current_schema.clone();
                 spawn_relationships(app, schema);
             }
+            spawn_erd_prefetch(app);
         }
         // File IO
         "w" | "write" | "save" => {
@@ -1267,6 +1293,9 @@ async fn handle_browser_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 let schema = app.current_schema.clone();
                 spawn_relationships(app, schema);
             }
+            if app.detail_tab == DetailTab::Erd {
+                spawn_erd_prefetch(app);
+            }
         }
         _ => match app.pane {
             BrowserPane::Sidebar => {
@@ -1356,6 +1385,9 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 let schema = app.current_schema.clone();
                 app.status = format!("Loading ERD for {schema}…");
                 spawn_relationships(app, schema);
+            }
+            if app.detail_tab == DetailTab::Erd {
+                spawn_erd_prefetch(app);
             }
         }
         KeyCode::Char('h') | KeyCode::Left => {
@@ -1491,11 +1523,14 @@ fn select_sidebar_for(app: &mut AppState, table: &str) {
 /// the sidebar updates immediately, then spawns two background tasks that
 /// will deliver `TableInfo` and `Records` messages to the event loop.
 async fn load_table(app: &mut AppState, schema: &str, table: &str) {
-    // Preserve cached relationships when jumping inside the same schema
-    // (ERD edges are schema-scoped, so they're still valid).
+    // Preserve cached relationships and ERD card-info when jumping
+    // inside the same schema (both are schema-scoped, so they stay
+    // valid). On a schema change we drop them so we never render
+    // edges or cards from a stale schema.
     if schema != app.current_schema {
         app.relationships.clear();
         app.erd_selected = 0;
+        app.erd_table_info.clear();
     }
     app.current_schema = schema.to_owned();
     app.current_table = table.to_owned();
@@ -1549,6 +1584,48 @@ fn spawn_records(app: &mut AppState, schema: String, table: String, offset: usiz
             result,
         });
     });
+}
+
+/// Pre-fetch a `TableInfo` for every table in the active schema so the
+/// ERD card-grid renderer can show full column lists with PK/FK
+/// badges. Skips tables already cached. Runs the queries concurrently.
+fn spawn_erd_prefetch(app: &mut AppState) {
+    let schema = app.current_schema.clone();
+    if schema.is_empty() {
+        return;
+    }
+    let tables: Vec<String> = match app.overview.as_ref() {
+        Some(ov) => ov
+            .schemas
+            .iter()
+            .find(|s| s.name == schema)
+            .map(|si| si.tables.clone())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let (Some(pool), Some(tx)) = (app.pool.clone(), app.tx.clone()) else {
+        return;
+    };
+    for t in tables {
+        if app.erd_table_info.contains_key(&t) {
+            continue;
+        }
+        app.pending += 1;
+        let pool = pool.clone();
+        let tx = tx.clone();
+        let s = schema.clone();
+        tokio::spawn(async move {
+            let result = pool
+                .fetch_table_info(&s, &t)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(DbMessage::ErdTableInfo {
+                schema: s,
+                table: t,
+                result,
+            });
+        });
+    }
 }
 
 fn spawn_relationships(app: &mut AppState, schema: String) {
@@ -2474,52 +2551,27 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     ]));
     lines.push(Line::default());
 
-    // ── Section 1: chip list of tables ─────────────────────────────
+    // ── Section 1: card-grid diagram ───────────────────────────────
+    // Each table becomes a vertical card with PK/FK badges next to
+    // every column; FK edges route from the FK column-row of the
+    // source card to the PK column-row of the target card.
     lines.push(Line::from(Span::styled(
-        "  Tables",
+        "  Diagram",
         Style::default()
             .fg(th.accent2)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
     )));
-    let mut chips: Vec<Span> = vec![Span::raw("  ")];
-    for (i, name) in tables.iter().enumerate() {
-        let style = if referenced.contains(name.as_str()) {
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(th.muted)
-        };
-        chips.push(Span::styled(format!("◆ {}", name), style));
-        if i + 1 < tables.len() {
-            chips.push(Span::styled("   ", Style::default().fg(th.muted)));
-        }
-    }
-    lines.push(Line::from(chips));
+    lines.extend(render_card_erd(
+        &tables,
+        &app.relationships,
+        app.erd_selected,
+        &app.erd_table_info,
+        th,
+    ));
     lines.push(Line::default());
+    let _ = referenced; // referenced was only used by the old chip strip
 
-    // ── Section 2: visual layered diagram ──────────────────────────
-    // Render the whole-schema picture as a Sugiyama-lite layered graph:
-    // tables are grouped into columns by foreign-key depth (referenced
-    // tables on the LEFT, dependent tables on the RIGHT) and FK edges
-    // are routed through vertical channels between columns. The active
-    // edge is drawn last on `theme.warning` so it always wins on
-    // crossings.
-    if !app.relationships.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  Diagram",
-            Style::default()
-                .fg(th.accent2)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )));
-        lines.extend(render_layered_erd(
-            &tables,
-            &app.relationships,
-            app.erd_selected,
-            th,
-        ));
-        lines.push(Line::default());
-    }
-
-    // ── Section 3: focused selected edge ───────────────────────────
+    // ── Section 2: focused selected edge ───────────────────────────
     let selected = app
         .erd_selected
         .min(app.relationships.len().saturating_sub(1));
@@ -2600,7 +2652,7 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         lines.push(Line::default());
     }
 
-    // ── Section 4: numbered list of all edges ──────────────────────
+    // ── Section 3: numbered list of all edges ──────────────────────
     if !app.relationships.is_empty() {
         lines.push(Line::from(Span::styled(
             "  All relationships",
@@ -2733,34 +2785,66 @@ struct ErdCell {
     bold: bool,
 }
 
-/// Render a Sugiyama-lite layered ERD into a list of styled lines.
+/// Pre-computed geometry + content for one ERD card. The renderer
+/// walks `rows` to draw the body; `col_y` lets the edge router
+/// attach to a specific column row by name.
+struct ErdCard<'a> {
+    name: &'a str,
+    /// One entry per data row (columns). Each is `(marker, color,
+    /// name, type)` where `marker` is one of `★`, `⚷`, or ` `.
+    rows: Vec<(char, Color, &'a str, &'a str)>,
+    /// Total inner width (between the two border `│`s).
+    inner_w: usize,
+    /// Map column-name → row index inside `rows` (0-based).
+    col_y: HashMap<&'a str, usize>,
+}
+
+impl ErdCard<'_> {
+    /// Outer width including both border columns.
+    fn width(&self) -> usize {
+        self.inner_w + 2
+    }
+    /// Total height: top border + N column rows + bottom border. When
+    /// no metadata is cached we fall back to a 3-row name-only stub.
+    fn height(&self) -> usize {
+        2 + self.rows.len().max(1)
+    }
+}
+
+/// Render a dbdiagram.io-style card-grid ERD into a list of styled lines.
+///
+/// Each table becomes a vertical card listing every column with a PK
+/// (`★`) / FK (`⚷`) / regular (` `) badge and the column type
+/// right-aligned. Cards sit in columns by FK depth (referenced tables
+/// LEFT, dependent tables RIGHT) and edges route from the FK column-
+/// row of the source card to the PK column-row of the target card.
 ///
 /// Layout algorithm:
-///   1. **Layer assignment.** For each table, layer = longest path
-///      along outgoing FK edges to a sink (a table that references
-///      nothing). Sinks land at layer 0 (leftmost); the most
-///      dependent tables end up at the highest layer (rightmost).
-///      Cycles are broken by marking nodes on the recursion stack as
-///      layer 0.
-///   2. **Within-layer ordering.** Alphabetical for determinism.
-///   3. **Channel routing.** Edges going from layer F to layer T (F > T)
-///      route through the channel just to the right of layer T's
-///      boxes. Each edge in a given channel is given a unique mid-X
-///      so parallel edges don't overlap. The route is
-///      `source-left-edge → horizontal → bend → vertical → bend →
-///      horizontal → target-right-edge ◀`.
-///   4. **Selected edge wins.** All non-selected edges paint first;
+///   1. **Layer assignment** — longest-path-to-sink along outgoing
+///      FK edges. Sinks land at layer 0 (leftmost). Cycles are broken
+///      by marking on-stack nodes as layer 0.
+///   2. **Within-layer ordering** — alphabetical for determinism.
+///   3. **Per-card geometry** — inner width = max of column-row width
+///      and title width. Layer width is the max of all its cards so
+///      every card in a column has aligned borders.
+///   4. **Channel routing** — edges going from layer F → layer T
+///      (F > T) route through the channel just to the right of the
+///      target layer. Each edge in a given channel is given a unique
+///      mid-X so parallel edges never sit on top of each other. The
+///      route is `source-left-edge → horizontal → bend → vertical →
+///      bend → horizontal → target-right-edge ◀`.
+///   5. **Selected edge wins** — all non-selected edges paint first;
 ///      the active edge paints last in `theme.warning` + bold so it
 ///      sits on top of any crossings.
 ///
-/// Limitations: multi-layer hops (F > T+1) currently route through a
-/// single channel and may overlap intermediate-layer boxes. Acceptable
-/// for v1 — most schemas have ≤3 layers and the active-edge highlight
-/// keeps the focus readable regardless.
-fn render_layered_erd(
+/// Tables without cached `TableInfo` fall back to a name-only stub
+/// card; edges to/from those attach to the box mid-Y instead of a
+/// specific column row.
+fn render_card_erd(
     tables: &[String],
     edges: &[RelationshipEdge],
     selected: usize,
+    cache: &HashMap<String, TableInfo>,
     th: Theme,
 ) -> Vec<Line<'static>> {
     if tables.is_empty() {
@@ -2822,25 +2906,82 @@ fn render_layered_erd(
         v.sort();
     }
 
-    // ── 4. Compute layer geometry. ────────────────────────────────
-    const BOX_H: usize = 3;
+    // ── 4. Build cards for every table. ───────────────────────────
+    let referenced: HashSet<&str> = edges
+        .iter()
+        .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
+        .collect();
+
+    let mut cards: HashMap<&str, ErdCard> = HashMap::new();
+    for t in tables {
+        let info = cache.get(t.as_str());
+        let pk_set: HashSet<&str> = info
+            .and_then(|i| i.primary_key.as_ref())
+            .map(|pk| pk.column_names.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let fk_set: HashSet<&str> = info
+            .map(|i| {
+                i.foreign_keys
+                    .iter()
+                    .flat_map(|fk| fk.column_names.iter().map(String::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut rows: Vec<(char, Color, &str, &str)> = Vec::new();
+        let mut col_y: HashMap<&str, usize> = HashMap::new();
+        if let Some(info) = info {
+            for (i, c) in info.columns.iter().enumerate() {
+                let (marker, color) = if pk_set.contains(c.name.as_str()) {
+                    ('★', th.warning)
+                } else if fk_set.contains(c.name.as_str()) {
+                    ('⚷', th.accent2)
+                } else {
+                    (' ', th.fg)
+                };
+                rows.push((marker, color, c.name.as_str(), c.data_type.as_str()));
+                col_y.insert(c.name.as_str(), i);
+            }
+        }
+        // Inner width: room for `M name  type ` plus 2 cells of side
+        // padding. Title `─ name ─` inside the top border also has to
+        // fit, so floor the width at name + 6.
+        let row_w = rows
+            .iter()
+            .map(|(_, _, n, t)| 2 + n.chars().count() + 2 + t.chars().count())
+            .max()
+            .unwrap_or(0);
+        let title_w = t.chars().count() + 4; // "─ name ─"
+        let inner_w = row_w.max(title_w).max(12) + 2;
+        cards.insert(
+            t.as_str(),
+            ErdCard {
+                name: t.as_str(),
+                rows,
+                inner_w,
+                col_y,
+            },
+        );
+    }
+
+    // ── 5. Layer geometry: align card widths within each layer and
+    //       stack cards vertically with a gap.
     const V_GAP: usize = 1;
-    const CHANNEL_W: usize = 8; // horizontal gap between layers
+    const CHANNEL_W: usize = 10;
 
     let layer_w: Vec<usize> = layers
         .iter()
-        .map(|ts| {
-            ts.iter()
-                .map(|t| t.chars().count())
-                .max()
-                .unwrap_or(8)
-                .max(10)
-                + 4
-        })
+        .map(|ts| ts.iter().map(|n| cards[n].width()).max().unwrap_or(14))
         .collect();
+    // Pin all cards in a layer to the layer width so their borders align.
+    for (l, ts) in layers.iter().enumerate() {
+        let target = layer_w[l] - 2;
+        for n in ts {
+            cards.get_mut(n).unwrap().inner_w = target;
+        }
+    }
 
     let mut layer_x: Vec<usize> = Vec::with_capacity(layers.len());
-    let mut x_cursor = 0;
+    let mut x_cursor = 1; // 1-cell left margin
     for (i, w) in layer_w.iter().enumerate() {
         layer_x.push(x_cursor);
         x_cursor += w;
@@ -2848,20 +2989,22 @@ fn render_layered_erd(
             x_cursor += CHANNEL_W;
         }
     }
-    let canvas_w = x_cursor;
+    let canvas_w = x_cursor + 1;
 
-    let mut node_y: HashMap<&str, usize> = HashMap::new();
+    // node_y0 = top border row of the card.
+    let mut node_y0: HashMap<&str, usize> = HashMap::new();
     let mut max_h = 0;
     for ts in &layers {
-        for (i, t) in ts.iter().enumerate() {
-            node_y.insert(*t, i * (BOX_H + V_GAP));
+        let mut y = 0;
+        for n in ts {
+            node_y0.insert(*n, y);
+            y += cards[n].height() + V_GAP;
         }
-        let h = ts.len() * (BOX_H + V_GAP);
-        if h > max_h {
-            max_h = h;
+        if y > max_h {
+            max_h = y;
         }
     }
-    let canvas_h = max_h.max(BOX_H);
+    let canvas_h = max_h.max(3);
 
     let blank = ErdCell {
         ch: ' ',
@@ -2876,51 +3019,89 @@ fn render_layered_erd(
         }
     };
 
-    let referenced: HashSet<&str> = edges
-        .iter()
-        .flat_map(|e| [e.from_table.as_str(), e.to_table.as_str()])
-        .collect();
-
-    // ── 5. Draw boxes. ────────────────────────────────────────────
-    for (l, ts) in layers.iter().enumerate() {
-        let x0 = layer_x[l];
-        let w = layer_w[l];
-        for name in ts {
-            let y0 = node_y[*name];
-            let title_color = if referenced.contains(name) {
+    // ── 6. Draw cards. ────────────────────────────────────────────
+    for ts in &layers {
+        for n in ts {
+            let card = &cards[n];
+            let x0 = layer_x[node_layer[n]];
+            let y0 = node_y0[n];
+            let w = card.width();
+            let inner = card.inner_w;
+            let title_color = if referenced.contains(n) {
                 th.accent
             } else {
                 th.muted
             };
-            // Top
+
+            // Top border: `╭─ name ────╮`. Render `─` first, then the
+            // name overlays positions 2..=2+name_len.
             put(&mut buf, x0, y0, '╭', th.border, false);
-            put(&mut buf, x0 + w - 1, y0, '╮', th.border, false);
             for k in 1..w - 1 {
                 put(&mut buf, x0 + k, y0, '─', th.border, false);
             }
-            // Middle
-            put(&mut buf, x0, y0 + 1, '│', th.border, false);
-            put(&mut buf, x0 + w - 1, y0 + 1, '│', th.border, false);
+            put(&mut buf, x0 + w - 1, y0, '╮', th.border, false);
+            // Title label (inset 2 cells, surrounded by spaces for breathing room).
+            put(&mut buf, x0 + 1, y0, ' ', th.border, false);
+            for (i, ch) in card.name.chars().enumerate() {
+                put(&mut buf, x0 + 2 + i, y0, ch, title_color, true);
+            }
+            put(
+                &mut buf,
+                x0 + 2 + card.name.chars().count(),
+                y0,
+                ' ',
+                th.border,
+                false,
+            );
+
+            // Body rows.
+            if card.rows.is_empty() {
+                // Stub: single muted "(loading…)" row.
+                let label = "(loading…)";
+                put(&mut buf, x0, y0 + 1, '│', th.border, false);
+                for k in 1..w - 1 {
+                    put(&mut buf, x0 + k, y0 + 1, ' ', th.fg, false);
+                }
+                let pad = inner.saturating_sub(label.chars().count()) / 2;
+                for (i, ch) in label.chars().enumerate() {
+                    put(&mut buf, x0 + 1 + pad + i, y0 + 1, ch, th.muted, false);
+                }
+                put(&mut buf, x0 + w - 1, y0 + 1, '│', th.border, false);
+            } else {
+                for (i, (marker, color, name, ty)) in card.rows.iter().enumerate() {
+                    let y = y0 + 1 + i;
+                    put(&mut buf, x0, y, '│', th.border, false);
+                    for k in 1..w - 1 {
+                        put(&mut buf, x0 + k, y, ' ', th.fg, false);
+                    }
+                    put(&mut buf, x0 + w - 1, y, '│', th.border, false);
+                    // Marker at col 1 (inner col 0).
+                    put(&mut buf, x0 + 1, y, *marker, *color, true);
+                    // Column name at col 3.
+                    for (j, ch) in name.chars().enumerate() {
+                        put(&mut buf, x0 + 3 + j, y, ch, *color, false);
+                    }
+                    // Type right-aligned with one cell of inner padding.
+                    let ty_w = ty.chars().count();
+                    let ty_x = x0 + w - 1 - 1 - ty_w; // right border − 1 padding − ty_w
+                    for (j, ch) in ty.chars().enumerate() {
+                        put(&mut buf, ty_x + j, y, ch, th.muted, false);
+                    }
+                }
+            }
+
+            // Bottom border.
+            let yb = y0 + card.height() - 1;
+            put(&mut buf, x0, yb, '╰', th.border, false);
             for k in 1..w - 1 {
-                put(&mut buf, x0 + k, y0 + 1, ' ', th.fg, false);
+                put(&mut buf, x0 + k, yb, '─', th.border, false);
             }
-            let inner = w - 2;
-            let pad = inner.saturating_sub(name.chars().count()) / 2;
-            for (k, ch) in name.chars().enumerate() {
-                put(&mut buf, x0 + 1 + pad + k, y0 + 1, ch, title_color, true);
-            }
-            // Bottom
-            put(&mut buf, x0, y0 + 2, '╰', th.border, false);
-            put(&mut buf, x0 + w - 1, y0 + 2, '╯', th.border, false);
-            for k in 1..w - 1 {
-                put(&mut buf, x0 + k, y0 + 2, '─', th.border, false);
-            }
+            put(&mut buf, x0 + w - 1, yb, '╯', th.border, false);
         }
     }
 
-    // ── 6. Pre-allocate one mid_x per edge inside its channel so
-    //       parallel edges don't overlap. Each channel gets evenly-
-    //       spaced track positions.
+    // ── 7. Pre-allocate one mid_x per edge inside its channel so
+    //       parallel edges don't overlap.
     let mut by_channel: HashMap<usize, Vec<usize>> = HashMap::new();
     for (eid, edge) in edges.iter().enumerate() {
         let Some(&fl) = node_layer.get(edge.from_table.as_str()) else {
@@ -2932,30 +3113,38 @@ fn render_layered_erd(
         if fl <= tl || edge.from_table == edge.to_table {
             continue;
         }
-        // Use the channel immediately to the right of the target's layer.
         by_channel.entry(tl).or_default().push(eid);
     }
     let mut edge_mid_x: HashMap<usize, usize> = HashMap::new();
     for (tl, eids) in &by_channel {
-        let channel_start = layer_x[*tl] + layer_w[*tl]; // first cell after target box
+        let channel_start = layer_x[*tl] + layer_w[*tl];
         let channel_end = if tl + 1 < layer_x.len() {
-            layer_x[tl + 1] // first cell of next layer's box
+            layer_x[tl + 1]
         } else {
             channel_start + CHANNEL_W
         };
         let span = channel_end.saturating_sub(channel_start).max(1);
         let n = eids.len();
         for (i, &eid) in eids.iter().enumerate() {
-            // Distribute mid_x evenly across the channel: positions
-            // 1..=n out of n+1 slots so neither edge sits on a box
-            // border.
             let mx = channel_start + (i + 1) * span / (n + 1);
             edge_mid_x.insert(eid, mx.max(channel_start).min(channel_end - 1));
         }
     }
 
-    // ── 7. Route edges: non-selected first, selected last so it
-    //       wins on crossings.
+    // Helper: anchor Y inside a card for a given column. Falls back to
+    // box-mid when the column isn't in the cache (table info still
+    // loading).
+    let anchor_y = |table: &str, col: &str| -> usize {
+        let card = &cards[table];
+        let y0 = node_y0[table];
+        if let Some(&i) = card.col_y.get(col) {
+            y0 + 1 + i
+        } else {
+            y0 + card.height() / 2
+        }
+    };
+
+    // ── 8. Route edges: non-selected first, selected last.
     let order: Vec<usize> = (0..edges.len())
         .filter(|i| *i != selected)
         .chain(std::iter::once(selected).filter(|_| selected < edges.len()))
@@ -2969,7 +3158,7 @@ fn render_layered_erd(
             continue;
         };
         if fl <= tl || edge.from_table == edge.to_table {
-            continue; // skip same-layer + self-references for v1
+            continue;
         }
         let Some(&mid_x) = edge_mid_x.get(&eid) else {
             continue;
@@ -2978,61 +3167,59 @@ fn render_layered_erd(
         let color = if is_sel { th.warning } else { th.muted };
         let bold = is_sel;
 
-        // Source: left edge of from-box (which is on the right since fl > tl).
+        let from_col = edge.from_columns.first().map(String::as_str).unwrap_or("");
+        let to_col = edge.to_columns.first().map(String::as_str).unwrap_or("");
+        let from_y = anchor_y(edge.from_table.as_str(), from_col);
+        let to_y = anchor_y(edge.to_table.as_str(), to_col);
+
         let from_x_left = layer_x[fl];
-        let from_y_mid = node_y[edge.from_table.as_str()] + BOX_H / 2;
-        // Target: right edge of to-box.
         let to_x_right = layer_x[tl] + layer_w[tl] - 1;
-        let to_y_mid = node_y[edge.to_table.as_str()] + BOX_H / 2;
-
-        // Stub one cell out of source to the left.
         let stub_x = from_x_left.saturating_sub(1);
-        let target_stub = to_x_right + 1; // cell holding the arrowhead
+        let target_stub = to_x_right + 1;
 
-        // Segment 1: horizontal at from_y_mid from mid_x → stub_x
+        // Segment 1: horizontal at from_y from mid_x → stub_x.
         let (a, b) = (mid_x.min(stub_x), mid_x.max(stub_x));
         for x in a..=b {
-            let cell = buf[from_y_mid][x];
+            let cell = buf[from_y][x];
             if cell.ch == ' ' || cell.ch == '─' || is_sel {
-                put(&mut buf, x, from_y_mid, '─', color, bold);
+                put(&mut buf, x, from_y, '─', color, bold);
             }
         }
 
-        // Segment 2: vertical at mid_x from from_y_mid → to_y_mid
-        if from_y_mid != to_y_mid {
-            let going_down = to_y_mid > from_y_mid;
-            // We came in from the right (going left), now turn up/down.
+        // Segment 2: vertical at mid_x from from_y → to_y.
+        if from_y != to_y {
+            let going_down = to_y > from_y;
             let bend_top = if going_down { '╭' } else { '╰' };
             let bend_bot = if going_down { '╯' } else { '╮' };
-            put(&mut buf, mid_x, from_y_mid, bend_top, color, bold);
-            let (a, b) = (from_y_mid.min(to_y_mid), from_y_mid.max(to_y_mid));
+            put(&mut buf, mid_x, from_y, bend_top, color, bold);
+            let (a, b) = (from_y.min(to_y), from_y.max(to_y));
             for y in (a + 1)..b {
                 let cell = buf[y][mid_x];
                 if cell.ch == ' ' || cell.ch == '│' || is_sel {
                     put(&mut buf, mid_x, y, '│', color, bold);
                 }
             }
-            put(&mut buf, mid_x, to_y_mid, bend_bot, color, bold);
+            put(&mut buf, mid_x, to_y, bend_bot, color, bold);
         }
 
-        // Segment 3: horizontal at to_y_mid from target_stub → mid_x
+        // Segment 3: horizontal at to_y from target_stub → mid_x.
         let (a, b) = (mid_x.min(target_stub), mid_x.max(target_stub));
         for x in a..=b {
-            if x == mid_x && from_y_mid != to_y_mid {
-                continue; // don't trample the bend
+            if x == mid_x && from_y != to_y {
+                continue;
             }
-            let cell = buf[to_y_mid][x];
+            let cell = buf[to_y][x];
             if cell.ch == ' ' || cell.ch == '─' || is_sel {
-                put(&mut buf, x, to_y_mid, '─', color, bold);
+                put(&mut buf, x, to_y, '─', color, bold);
             }
         }
 
-        // Arrowhead pointing into the target box's right edge.
+        // Arrowhead pointing into the target card's right border.
         let head_color = if is_sel { th.accent } else { color };
-        put(&mut buf, target_stub, to_y_mid, '◀', head_color, true);
+        put(&mut buf, target_stub, to_y, '◀', head_color, true);
     }
 
-    // ── 8. Convert canvas to styled lines. ────────────────────────
+    // ── 9. Convert canvas to styled lines. ────────────────────────
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(canvas_h + 2);
     for row in &buf {
         let mut spans: Vec<Span<'static>> = Vec::new();
@@ -3349,6 +3536,89 @@ mod tests {
         ];
         assert_eq!(unique_connection_name("prod", &saved), "prod-3");
         assert_eq!(unique_connection_name("dev", &saved), "dev");
+    }
+
+    #[test]
+    fn render_card_erd_emits_box_borders_and_pk_marker() {
+        use std::collections::HashMap;
+        use tsql_db::{ColumnInfo, PrimaryKeyInfo, RelationshipEdge, TableInfo};
+
+        let users = TableInfo {
+            name: "users".to_owned(),
+            schema: "public".to_owned(),
+            columns: vec![ColumnInfo {
+                name: "id".to_owned(),
+                data_type: "int4".to_owned(),
+                is_nullable: false,
+                default_value: None,
+            }],
+            indexes: vec![],
+            primary_key: Some(PrimaryKeyInfo {
+                name: "users_pk".to_owned(),
+                column_names: vec!["id".to_owned()],
+            }),
+            foreign_keys: vec![],
+            constraints: vec![],
+        };
+        let orders = TableInfo {
+            name: "orders".to_owned(),
+            schema: "public".to_owned(),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    data_type: "int4".to_owned(),
+                    is_nullable: false,
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "user_id".to_owned(),
+                    data_type: "int4".to_owned(),
+                    is_nullable: false,
+                    default_value: None,
+                },
+            ],
+            indexes: vec![],
+            primary_key: Some(PrimaryKeyInfo {
+                name: "orders_pk".to_owned(),
+                column_names: vec!["id".to_owned()],
+            }),
+            foreign_keys: vec![tsql_db::ForeignKeyInfo {
+                name: "orders_user_fk".to_owned(),
+                column_names: vec!["user_id".to_owned()],
+                referenced_table: "users".to_owned(),
+                referenced_columns: vec!["id".to_owned()],
+            }],
+            constraints: vec![],
+        };
+
+        let mut cache: HashMap<String, TableInfo> = HashMap::new();
+        cache.insert("users".to_owned(), users);
+        cache.insert("orders".to_owned(), orders);
+
+        let tables = vec!["orders".to_owned(), "users".to_owned()];
+        let edges = vec![RelationshipEdge {
+            from_table: "orders".to_owned(),
+            from_columns: vec!["user_id".to_owned()],
+            to_table: "users".to_owned(),
+            to_columns: vec!["id".to_owned()],
+        }];
+
+        let lines = super::render_card_erd(&tables, &edges, 0, &cache, Theme::catppuccin_mocha());
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+
+        assert!(rendered.contains("orders"), "card title for orders");
+        assert!(rendered.contains("users"), "card title for users");
+        assert!(rendered.contains("user_id"), "FK column name visible");
+        assert!(
+            rendered.chars().any(|c| c == '╭') && rendered.chars().any(|c| c == '╯'),
+            "rounded card borders rendered"
+        );
+        assert!(rendered.contains('★'), "PK marker rendered");
+        assert!(rendered.contains('⚷'), "FK marker rendered");
+        assert!(rendered.contains('◀'), "edge arrowhead rendered");
     }
 
     #[test]

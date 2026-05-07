@@ -26,25 +26,34 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
   metadata now includes the PK index (previously filtered out) so the
   default btree backing each table is always visible. SQLite reports
   every regular index as btree (FTS/R*Tree live as virtual tables).
-- **ERD: layered visual diagram + focused detail.** The ERD tab now
-  has four stacked sections so the user gets the whole-schema
-  picture and the active edge in detail at the same time:
-  1. **Chip strip** of every table (referenced → `accent`,
-     standalone → `muted`).
-  2. **Layered Sugiyama-lite diagram.** Tables are grouped into
-     columns by FK depth (referenced tables on the LEFT, dependent
-     tables on the RIGHT — longest-path-to-sink layering with cycle
-     break) and edges route through vertical channels between
-     columns. Each channel pre-allocates a unique mid-X per edge so
-     parallel arrows don't overlap. The active edge draws last in
-     `theme.warning` + bold so it always wins on crossings, with a
-     `◀` arrowhead pointing at the referenced box.
-  3. **Focused detail.** The currently-selected relationship is
-     rendered as two stacked rounded-corner boxes with a labelled
-     vertical `FOREIGN KEY ▼` arrow between them and the column
-     names printed inside.
-  4. **Numbered list** of every relationship; `►` marks the active
-     row; `j`/`k` cycle, `Enter`/`o` jump to source/target table.
+- **ERD: dbdiagram.io-style card-grid diagram.** The diagram pane is
+  redesigned around proper table cards instead of name-only boxes:
+  1. **Cards** — each table renders as a vertical card listing
+     every column with a `★` PK badge in `theme.warning`, a `⚷`
+     FK badge in `theme.accent2`, and the column type
+     right-aligned in `theme.muted`. Card title sits inside the
+     top border (`╭─ orders ─…─╮`). Cards within a layer share a
+     common width so borders align.
+  2. **Layered placement** — same Sugiyama-lite longest-path-to-
+     sink layering as before (referenced tables LEFT, dependent
+     tables RIGHT, cycle-broken at layer 0).
+  3. **Per-row edge attachment** — FK edges route from the
+     specific FK column-row of the source card to the specific
+     PK column-row of the target card, not just box-mid to
+     box-mid. Falls back to box-mid when a table's `TableInfo`
+     hasn't been pre-fetched yet.
+  4. **Channel routing** — one unique mid-X per edge in each
+     channel so parallel arrows never overlap. Active edge paints
+     last in `theme.warning` + bold with a `theme.accent` `◀`
+     arrowhead so it always wins on crossings.
+  5. **Focused detail + numbered edge list** — kept below the
+     diagram for `j`/`k` selection and `Enter`/`o` jumps.
+
+  New `erd_table_info` cache holds one `TableInfo` per table in
+  the active schema; populated lazily by `spawn_erd_prefetch`
+  whenever the ERD tab becomes active and cleared on schema
+  change. Cards for tables not yet in the cache render as a
+  `(loading…)` stub and edges anchor to their box-mid.
 - **Decode timestamp / numeric / uuid / json cells properly.**
   Records previously rendered every `NUMERIC`, `TIMESTAMP`,
   `TIMESTAMPTZ`, `DATE`, `TIME`, `UUID`, `JSON`, and `JSONB` value as
