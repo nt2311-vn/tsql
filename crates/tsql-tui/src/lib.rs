@@ -296,6 +296,10 @@ struct AppState {
     /// State of the rendered Mermaid chart pipeline (mmdc + chafa).
     /// Cached so a redraw doesn't re-shell on every frame.
     erd_chart: ErdChart,
+    /// When true the ERD chart pane fills the whole detail body —
+    /// banner stays, but the table list + per-table inspector hide.
+    /// Toggled with `f` while on the ERD tab.
+    erd_chart_fullscreen: bool,
     editor: String,
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
@@ -362,6 +366,7 @@ impl AppState {
             erd_selected: 0,
             erd_table_info: HashMap::new(),
             erd_chart: ErdChart::default(),
+            erd_chart_fullscreen: false,
             editor: String::new(),
             editor_cursor: 0,
             editor_path: None,
@@ -1529,6 +1534,14 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         KeyCode::Char('o') if app.detail_tab == DetailTab::Erd => {
             open_erd_selected_table(app).await;
         }
+        KeyCode::Char('f') if app.detail_tab == DetailTab::Erd => {
+            app.erd_chart_fullscreen = !app.erd_chart_fullscreen;
+            app.status = if app.erd_chart_fullscreen {
+                "ERD chart: fullscreen (press f to exit)".to_owned()
+            } else {
+                "ERD chart: split view".to_owned()
+            };
+        }
         KeyCode::Char(']') if app.detail_tab == DetailTab::Records => {
             if let Some(rec) = &app.records {
                 let max = rec.columns.len().saturating_sub(1);
@@ -2613,18 +2626,24 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
-    // Vertical split:
-    //   row 0: banner (1 line)
-    //   row 1: chart pane (~60%, full width)
-    //   row 2: tables list + per-table inspector (~40%, two columns)
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Percentage(60),
-            Constraint::Min(8),
-        ])
-        .split(area);
+    // Vertical split. Fullscreen mode (`f`) gives the chart the
+    // entire body so the user can actually read box labels; default
+    // mode keeps the table list + per-table inspector below.
+    let layout = if app.erd_chart_fullscreen {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(0)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Percentage(70),
+                Constraint::Min(8),
+            ])
+            .split(area)
+    };
 
     // Banner.
     let banner = vec![Line::from(vec![
@@ -2637,7 +2656,7 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         ),
         Span::styled(
             format!(
-                "  {} table(s), {} relationship(s)  j/k tables  Enter open  y save mermaid  ",
+                "  {} table(s), {} relationship(s)  j/k tables  Enter open  f fullscreen  y save mermaid  ",
                 tables.len(),
                 app.relationships.len(),
             ),
@@ -2650,6 +2669,10 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     );
 
     draw_erd_chart_pane(f, app, layout[1]);
+
+    if app.erd_chart_fullscreen {
+        return;
+    }
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -3245,8 +3268,10 @@ async fn render_mermaid_with_chafa(
         .await
         .map_err(|e| ErdChartError::Failed(format!("write mmd: {e}")))?;
 
-    // mmdc: render Mermaid to PNG. 60s budget covers the first-run
-    // Chromium download path; subsequent runs are sub-second.
+    // mmdc: render Mermaid to a high-resolution PNG. We deliberately
+    // over-render (3200×2400) so chafa has plenty of source pixels
+    // when downsampling to the ~200×40 terminal cell grid — without
+    // the headroom, in-box text becomes unreadable noise.
     let mut mmdc_cmd = Command::new("mmdc");
     mmdc_cmd
         .arg("-i")
@@ -3258,9 +3283,11 @@ async fn render_mermaid_with_chafa(
         .arg("-t")
         .arg("dark")
         .arg("-w")
-        .arg("1600")
+        .arg("3200")
         .arg("-H")
-        .arg("1200");
+        .arg("2400")
+        .arg("-s")
+        .arg("2");
     let mmdc_out = run(&mut mmdc_cmd, "mmdc", 60).await?;
     if !mmdc_out.status.success() {
         let stderr = String::from_utf8_lossy(&mmdc_out.stderr);
@@ -3268,12 +3295,20 @@ async fn render_mermaid_with_chafa(
         return Err(ErdChartError::Failed(format!("mmdc: {tail}")));
     }
 
-    // chafa: rasterize PNG to colored Unicode half-blocks sized for
-    // the chart pane. 10s is generous; chafa returns in milliseconds.
+    // chafa: rasterize PNG to a colored symbol grid sized for the
+    // chart pane. Use the full symbol palette (sextants + quadrants
+    // + half-blocks) so we get up to 6× sub-cell resolution — that's
+    // what makes Mermaid box labels legible. Pin the cell aspect
+    // ratio (1:2 width:height matches most terminal fonts). 10s is
+    // generous; chafa returns in milliseconds.
     let mut chafa_cmd = Command::new("chafa");
     chafa_cmd
         .arg("--format=symbols")
-        .arg("--symbols=block+border")
+        .arg("--symbols=all")
+        .arg("--colors=full")
+        .arg("--color-space=rgb")
+        .arg("--font-ratio=1/2")
+        .arg("--polite=on")
         .arg(format!("--size={}x{}", width, height))
         .arg(&png_path);
     let chafa_out = run(&mut chafa_cmd, "chafa", 10).await?;
