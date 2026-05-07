@@ -590,9 +590,18 @@ fn apply_db_message(app: &mut AppState, msg: DbMessage) {
             }
             app.erd_chart.size = size;
             app.erd_chart.status = match result {
-                Ok(lines) => ErdChartStatus::Ready(lines),
-                Err(ErdChartError::MissingTool(hint)) => ErdChartStatus::MissingTool(hint),
-                Err(ErdChartError::Failed(msg)) => ErdChartStatus::Failed(msg),
+                Ok(lines) => {
+                    app.status = format!("ERD chart rendered ({}x{})", size.0, size.1);
+                    ErdChartStatus::Ready(lines)
+                }
+                Err(ErdChartError::MissingTool(hint)) => {
+                    app.status = format!("ERD chart: {hint}");
+                    ErdChartStatus::MissingTool(hint)
+                }
+                Err(ErdChartError::Failed(msg)) => {
+                    app.last_error = Some(format!("ERD chart: {msg}"));
+                    ErdChartStatus::Failed(msg)
+                }
             };
         }
         DbMessage::Relationships { schema, result } => {
@@ -3181,43 +3190,50 @@ fn maybe_spawn_chart_render(app: &mut AppState) {
 }
 
 /// Run the `mmdc` + `chafa` pipeline on `mermaid_src`, returning a
-/// list of styled `Line`s ready to render. Each external binary is
-/// looked up on `PATH`; missing tools surface as
-/// `ErdChartError::MissingTool` so the UI can show an install hint
-/// instead of a cryptic exec error.
+/// list of styled `Line`s ready to render. Missing binaries surface
+/// as `ErdChartError::MissingTool` (caught from the OS' `NotFound`
+/// when the spawn fails). Each step is wrapped in a timeout so a hung
+/// child can never leave the chart pane stuck on `(rendering…)`.
 async fn render_mermaid_with_chafa(
     mermaid_src: &str,
     width: u16,
     height: u16,
 ) -> Result<Vec<Line<'static>>, ErdChartError> {
+    use std::process::Stdio;
     use tokio::process::Command;
-    fn missing(tool: &str) -> ErdChartError {
-        ErdChartError::MissingTool(match tool {
+    use tokio::time::{timeout, Duration};
+
+    fn install_hint(tool: &str) -> String {
+        match tool {
             "mmdc" => "install Mermaid CLI: `npm i -g @mermaid-js/mermaid-cli`".to_owned(),
-            "chafa" => "install chafa: `apt install chafa` / `brew install chafa`".to_owned(),
+            "chafa" => "install chafa: `sudo apt install chafa` / `brew install chafa`".to_owned(),
             other => format!("missing tool: {other}"),
-        })
-    }
-    fn which(bin: &str) -> bool {
-        std::env::var_os("PATH")
-            .map(|p| {
-                std::env::split_paths(&p).any(|dir| {
-                    let mut full = dir;
-                    full.push(bin);
-                    full.is_file()
-                })
-            })
-            .unwrap_or(false)
-    }
-    if !which("mmdc") {
-        return Err(missing("mmdc"));
-    }
-    if !which("chafa") {
-        return Err(missing("chafa"));
+        }
     }
 
-    // Stage the mermaid source + PNG output in a tempdir so the
-    // pipeline never touches the user's working directory.
+    /// Map a `tokio::process` spawn outcome onto our error enum,
+    /// distinguishing a missing binary (NotFound) from a runtime
+    /// failure (timeout / non-zero exit / I/O error).
+    async fn run(
+        cmd: &mut Command,
+        tool: &'static str,
+        timeout_secs: u64,
+    ) -> Result<std::process::Output, ErdChartError> {
+        cmd.stdin(Stdio::null());
+        match timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
+            Err(_) => Err(ErdChartError::Failed(format!(
+                "{tool}: timed out after {timeout_secs}s"
+            ))),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(ErdChartError::MissingTool(install_hint(tool)))
+            }
+            Ok(Err(e)) => Err(ErdChartError::Failed(format!("spawn {tool}: {e}"))),
+            Ok(Ok(out)) => Ok(out),
+        }
+    }
+
+    // Stage source + PNG in a tempdir so the pipeline never touches
+    // the user's working directory.
     let tmp = tempfile::Builder::new()
         .prefix("tsql-erd-")
         .tempdir()
@@ -3228,10 +3244,10 @@ async fn render_mermaid_with_chafa(
         .await
         .map_err(|e| ErdChartError::Failed(format!("write mmd: {e}")))?;
 
-    // mmdc: render Mermaid to PNG. We pick a fixed pixel size so the
-    // chart fits comfortably in the chafa output without further
-    // upscaling.
-    let mmdc_out = Command::new("mmdc")
+    // mmdc: render Mermaid to PNG. 60s budget covers the first-run
+    // Chromium download path; subsequent runs are sub-second.
+    let mut mmdc_cmd = Command::new("mmdc");
+    mmdc_cmd
         .arg("-i")
         .arg(&mmd_path)
         .arg("-o")
@@ -3243,26 +3259,23 @@ async fn render_mermaid_with_chafa(
         .arg("-w")
         .arg("1600")
         .arg("-H")
-        .arg("1200")
-        .output()
-        .await
-        .map_err(|e| ErdChartError::Failed(format!("spawn mmdc: {e}")))?;
+        .arg("1200");
+    let mmdc_out = run(&mut mmdc_cmd, "mmdc", 60).await?;
     if !mmdc_out.status.success() {
         let stderr = String::from_utf8_lossy(&mmdc_out.stderr);
         let tail: String = stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
         return Err(ErdChartError::Failed(format!("mmdc: {tail}")));
     }
 
-    // chafa: rasterize the PNG to colored Unicode half-blocks sized
-    // for the inspector pane.
-    let chafa_out = Command::new("chafa")
+    // chafa: rasterize PNG to colored Unicode half-blocks sized for
+    // the chart pane. 10s is generous; chafa returns in milliseconds.
+    let mut chafa_cmd = Command::new("chafa");
+    chafa_cmd
         .arg("--format=symbols")
         .arg("--symbols=block+border")
         .arg(format!("--size={}x{}", width, height))
-        .arg(&png_path)
-        .output()
-        .await
-        .map_err(|e| ErdChartError::Failed(format!("spawn chafa: {e}")))?;
+        .arg(&png_path);
+    let chafa_out = run(&mut chafa_cmd, "chafa", 10).await?;
     if !chafa_out.status.success() {
         let stderr = String::from_utf8_lossy(&chafa_out.stderr);
         let tail: String = stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
