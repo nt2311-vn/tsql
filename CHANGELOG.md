@@ -26,34 +26,38 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
   metadata now includes the PK index (previously filtered out) so the
   default btree backing each table is always visible. SQLite reports
   every regular index as btree (FTS/R*Tree live as virtual tables).
-- **ERD: dbdiagram.io-style card-grid diagram.** The diagram pane is
-  redesigned around proper table cards instead of name-only boxes:
-  1. **Cards** — each table renders as a vertical card listing
-     every column with a `★` PK badge in `theme.warning`, a `⚷`
-     FK badge in `theme.accent2`, and the column type
-     right-aligned in `theme.muted`. Card title sits inside the
-     top border (`╭─ orders ─…─╮`). Cards within a layer share a
-     common width so borders align.
-  2. **Layered placement** — same Sugiyama-lite longest-path-to-
-     sink layering as before (referenced tables LEFT, dependent
-     tables RIGHT, cycle-broken at layer 0).
-  3. **Per-row edge attachment** — FK edges route from the
-     specific FK column-row of the source card to the specific
-     PK column-row of the target card, not just box-mid to
-     box-mid. Falls back to box-mid when a table's `TableInfo`
-     hasn't been pre-fetched yet.
-  4. **Channel routing** — one unique mid-X per edge in each
-     channel so parallel arrows never overlap. Active edge paints
-     last in `theme.warning` + bold with a `theme.accent` `◀`
-     arrowhead so it always wins on crossings.
-  5. **Focused detail + numbered edge list** — kept below the
-     diagram for `j`/`k` selection and `Enter`/`o` jumps.
+- **ERD: structured inspector + Mermaid export.** Two visual
+  attempts at an in-terminal diagram (layered graph, then a
+  dbdiagram-style card grid) hit hard limits — ASCII / box-drawing
+  line routing never looked smooth, parallel edges crossed badly,
+  and arrowheads rendered inconsistently across fonts. So the tab
+  pivots to what TUIs actually do well: a structured two-pane
+  inspector plus a copy-pastable Mermaid block.
 
-  New `erd_table_info` cache holds one `TableInfo` per table in
-  the active schema; populated lazily by `spawn_erd_prefetch`
-  whenever the ERD tab becomes active and cleared on schema
-  change. Cards for tables not yet in the cache render as a
-  `(loading…)` stub and edges anchor to their box-mid.
+  - **Tables pane (left).** Bordered list of every table in the
+    active schema. `j`/`k` cycles, `Enter`/`o` opens the
+    selected table as the active browser table.
+  - **Inspector pane (right).** Four sections for the selected
+    table:
+    1. **Columns** — each row shows a `★` PK / `⚷` FK / blank
+       badge, the column name, the type, and (for FK columns)
+       an inline `→ other_table.col` reference.
+    2. **References →** — outgoing FKs as styled rows
+       (`local_col → other_table.col`).
+    3. **Referenced by ←** — incoming FKs.
+    4. **Mermaid** — a complete, ready-to-paste
+       `\`\`\`mermaid … erDiagram … \`\`\`` block for the whole
+       schema. PK / FK column roles tagged. Cardinality drawn as
+       `}o--||` (many-to-one).
+  - **`y` saves the Mermaid block to `./<schema>.mmd`** so it's a
+    one-key step from the TUI to a real ERD in any Mermaid-aware
+    viewer (GitHub, Notion, IDE preview, mermaid.live).
+
+  Removes the old layered renderer, the dbdiagram card-grid
+  renderer, and `ErdJump`/`jump_to_erd_target`. Keeps the
+  `erd_table_info` cache (now feeding the inspector + Mermaid
+  generator) and `spawn_erd_prefetch` (still kicked off on every
+  ERD-tab entry path).
 - **Decode timestamp / numeric / uuid / json cells properly.**
   Records previously rendered every `NUMERIC`, `TIMESTAMP`,
   `TIMESTAMPTZ`, `DATE`, `TIME`, `UUID`, `JSON`, and `JSONB` value as
