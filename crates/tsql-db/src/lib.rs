@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
@@ -18,6 +19,7 @@ pub enum DbError {
 pub enum DatabaseDriver {
     Postgres,
     Sqlite,
+    MySql,
 }
 
 impl From<DriverKind> for DatabaseDriver {
@@ -25,6 +27,7 @@ impl From<DriverKind> for DatabaseDriver {
         match value {
             DriverKind::Postgres => Self::Postgres,
             DriverKind::Sqlite => Self::Sqlite,
+            DriverKind::Mysql => Self::MySql,
         }
     }
 }
@@ -126,6 +129,7 @@ pub struct RelationshipEdge {
 pub enum Pool {
     Postgres(PgPool),
     Sqlite(SqlitePool),
+    MySql(MySqlPool),
 }
 
 impl Pool {
@@ -137,6 +141,14 @@ impl Pool {
                 Ok(Self::Postgres(pool))
             }
             DriverKind::Sqlite => Ok(Self::Sqlite(sqlite_pool(url).await?)),
+            DriverKind::Mysql => {
+                let url = driver.normalise_url(url);
+                let pool = MySqlPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&url)
+                    .await?;
+                Ok(Self::MySql(pool))
+            }
         }
     }
 
@@ -144,6 +156,7 @@ impl Pool {
         match self {
             Pool::Postgres(_) => DriverKind::Postgres,
             Pool::Sqlite(_) => DriverKind::Sqlite,
+            Pool::MySql(_) => DriverKind::Mysql,
         }
     }
 
@@ -152,6 +165,7 @@ impl Pool {
         match self {
             Pool::Postgres(pool) => execute_postgres(pool, &stmts).await,
             Pool::Sqlite(pool) => execute_sqlite(pool, &stmts).await,
+            Pool::MySql(pool) => execute_mysql(pool, &stmts).await,
         }
     }
 
@@ -159,6 +173,7 @@ impl Pool {
         match self {
             Pool::Postgres(pool) => fetch_postgres_overview(pool).await,
             Pool::Sqlite(pool) => fetch_sqlite_overview(pool).await,
+            Pool::MySql(pool) => fetch_mysql_overview(pool).await,
         }
     }
 
@@ -166,6 +181,7 @@ impl Pool {
         match self {
             Pool::Postgres(pool) => fetch_postgres_table_info(pool, schema, table).await,
             Pool::Sqlite(pool) => fetch_sqlite_table_info(pool, schema, table).await,
+            Pool::MySql(pool) => fetch_mysql_table_info(pool, schema, table).await,
         }
     }
 
@@ -182,6 +198,12 @@ impl Pool {
             }
             DriverKind::Sqlite => {
                 format!("SELECT * FROM \"{table}\" LIMIT {limit} OFFSET {offset}")
+            }
+            DriverKind::Mysql => {
+                // MySQL identifiers use backticks; the schema is the
+                // active database, qualified explicitly so reading
+                // tables in another database (USE) works.
+                format!("SELECT * FROM `{schema}`.`{table}` LIMIT {limit} OFFSET {offset}")
             }
         };
         let document = SqlDocument::new(sql);
@@ -200,6 +222,7 @@ impl Pool {
         match self {
             Pool::Postgres(pool) => fetch_postgres_relationships(pool, schema).await,
             Pool::Sqlite(pool) => fetch_sqlite_relationships(pool, schema).await,
+            Pool::MySql(pool) => fetch_mysql_relationships(pool, schema).await,
         }
     }
 }
@@ -849,6 +872,325 @@ async fn fetch_postgres_relationships(
         })
         .collect())
 }
+// ─── MySQL / MariaDB ──────────────────────────────────────────────────────────
+//
+// MySQL doesn't expose Postgres-style schemas — every connection has
+// one current database, and `information_schema` is the canonical
+// metadata source. We surface each non-system database (mysql,
+// information_schema, performance_schema, sys are filtered out) as a
+// "schema" so the existing schemas → tables sidebar layout fits with
+// no UI changes.
+
+async fn fetch_mysql_overview(pool: &MySqlPool) -> Result<DatabaseOverview, DbError> {
+    // MySQL 8 reports `information_schema` text columns as VARBINARY
+    // even though they're UTF-8 — sqlx's `String` decoder rejects
+    // VARBINARY, so every read here goes through `CAST(... AS CHAR)`
+    // to land back on VARCHAR.
+    let schemas: Vec<(String,)> = sqlx::query_as(
+        "SELECT CAST(schema_name AS CHAR) FROM information_schema.schemata
+         WHERE schema_name NOT IN ('information_schema','mysql','performance_schema','sys')
+         ORDER BY schema_name",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut schema_infos = Vec::with_capacity(schemas.len());
+    for (schema_name,) in schemas {
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT CAST(table_name AS CHAR) FROM information_schema.tables
+             WHERE table_schema = ? AND table_type = 'BASE TABLE'
+             ORDER BY table_name",
+        )
+        .bind(&schema_name)
+        .fetch_all(pool)
+        .await?;
+        schema_infos.push(SchemaInfo {
+            name: schema_name,
+            tables: tables.into_iter().map(|(t,)| t).collect(),
+        });
+    }
+    Ok(DatabaseOverview {
+        schemas: schema_infos,
+    })
+}
+
+async fn fetch_mysql_table_info(
+    pool: &MySqlPool,
+    schema: &str,
+    table: &str,
+) -> Result<TableInfo, DbError> {
+    let columns: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT CAST(column_name AS CHAR), CAST(column_type AS CHAR),
+                CAST(is_nullable AS CHAR), CAST(column_default AS CHAR)
+         FROM information_schema.columns
+         WHERE table_schema = ? AND table_name = ?
+         ORDER BY ordinal_position",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    let column_infos: Vec<ColumnInfo> = columns
+        .into_iter()
+        .map(|(name, data_type, is_nullable, default_value)| ColumnInfo {
+            name,
+            data_type,
+            is_nullable: is_nullable == "YES",
+            default_value,
+        })
+        .collect();
+
+    // Primary key columns (key_column_usage with constraint_name='PRIMARY').
+    let pk_columns: Vec<(String,)> = sqlx::query_as(
+        "SELECT CAST(column_name AS CHAR) FROM information_schema.key_column_usage
+         WHERE table_schema = ? AND table_name = ? AND constraint_name = 'PRIMARY'
+         ORDER BY ordinal_position",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let primary_key = if pk_columns.is_empty() {
+        None
+    } else {
+        Some(PrimaryKeyInfo {
+            name: "PRIMARY".to_owned(),
+            column_names: pk_columns.into_iter().map(|(c,)| c).collect(),
+        })
+    };
+
+    // Foreign keys via referential_constraints + key_column_usage.
+    // Group by constraint_name so composite FKs collapse into one entry.
+    let fk_rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT CAST(kcu.constraint_name AS CHAR), CAST(kcu.column_name AS CHAR),
+                CAST(kcu.referenced_table_name AS CHAR),
+                CAST(kcu.referenced_column_name AS CHAR)
+         FROM information_schema.key_column_usage kcu
+         WHERE kcu.table_schema = ? AND kcu.table_name = ?
+           AND kcu.referenced_table_name IS NOT NULL
+         ORDER BY kcu.constraint_name, kcu.ordinal_position",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    // (col_names, ref_table, ref_cols) keyed by constraint name.
+    let mut fk_map: BTreeMap<String, (Vec<String>, String, Vec<String>)> = BTreeMap::new();
+    for (name, col, ref_t, ref_c) in fk_rows {
+        let entry = fk_map
+            .entry(name)
+            .or_insert_with(|| (Vec::new(), ref_t.clone(), Vec::new()));
+        entry.0.push(col);
+        entry.2.push(ref_c);
+    }
+    let foreign_keys: Vec<ForeignKeyInfo> = fk_map
+        .into_iter()
+        .map(
+            |(name, (column_names, referenced_table, referenced_columns))| ForeignKeyInfo {
+                name,
+                column_names,
+                referenced_table,
+                referenced_columns,
+            },
+        )
+        .collect();
+
+    // Indexes from information_schema.statistics. seq_in_index orders
+    // multi-column indexes; non_unique=0 means UNIQUE.
+    let idx_rows: Vec<(String, String, i64, i64, String)> = sqlx::query_as(
+        "SELECT CAST(index_name AS CHAR), CAST(column_name AS CHAR),
+                CAST(non_unique AS SIGNED), CAST(seq_in_index AS SIGNED),
+                CAST(index_type AS CHAR)
+         FROM information_schema.statistics
+         WHERE table_schema = ? AND table_name = ?
+         ORDER BY index_name, seq_in_index",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    let mut idx_map: BTreeMap<String, (Vec<String>, bool, bool, String)> = BTreeMap::new();
+    for (name, col, non_unique, _seq, method) in idx_rows {
+        let is_primary = name == "PRIMARY";
+        let entry = idx_map.entry(name).or_insert_with(|| {
+            (
+                Vec::new(),
+                non_unique == 0,
+                is_primary,
+                method.to_lowercase(),
+            )
+        });
+        entry.0.push(col);
+    }
+    let indexes: Vec<IndexInfo> = idx_map
+        .into_iter()
+        .map(
+            |(name, (column_names, is_unique, is_primary, method))| IndexInfo {
+                name,
+                column_names,
+                is_unique,
+                is_primary,
+                method,
+            },
+        )
+        .collect();
+
+    // CHECK constraints (MySQL 8.0+ / MariaDB 10.2+). Best-effort —
+    // both engines use the standard `information_schema.check_constraints`,
+    // but old MariaDB versions may not populate it. We swallow query
+    // errors for missing tables silently rather than fail the whole load.
+    let constraint_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT CAST(constraint_name AS CHAR), CAST(check_clause AS CHAR)
+         FROM information_schema.check_constraints
+         WHERE constraint_schema = ?
+           AND table_name = ?",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let constraints = constraint_rows
+        .into_iter()
+        .map(|(name, definition)| ConstraintInfo {
+            name,
+            definition: format!("CHECK ({definition})"),
+        })
+        .collect();
+
+    Ok(TableInfo {
+        name: table.to_owned(),
+        schema: schema.to_owned(),
+        columns: column_infos,
+        indexes,
+        primary_key,
+        foreign_keys,
+        constraints,
+    })
+}
+
+async fn fetch_mysql_relationships(
+    pool: &MySqlPool,
+    schema: &str,
+) -> Result<Vec<RelationshipEdge>, DbError> {
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT CAST(kcu.constraint_name AS CHAR), CAST(kcu.table_name AS CHAR),
+                CAST(kcu.column_name AS CHAR),
+                CAST(kcu.referenced_table_name AS CHAR),
+                CAST(kcu.referenced_column_name AS CHAR)
+         FROM information_schema.key_column_usage kcu
+         WHERE kcu.table_schema = ?
+           AND kcu.referenced_table_name IS NOT NULL
+         ORDER BY kcu.table_name, kcu.constraint_name, kcu.ordinal_position",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await?;
+
+    // Group composite FKs into one edge.
+    let mut edges: BTreeMap<(String, String), RelationshipEdge> = BTreeMap::new();
+    for (cname, table, col, ref_table, ref_col) in rows {
+        let key = (table.clone(), cname);
+        let edge = edges.entry(key).or_insert(RelationshipEdge {
+            from_table: table,
+            from_columns: Vec::new(),
+            to_table: ref_table,
+            to_columns: Vec::new(),
+        });
+        edge.from_columns.push(col);
+        edge.to_columns.push(ref_col);
+    }
+    Ok(edges.into_values().collect())
+}
+
+async fn execute_mysql(pool: &MySqlPool, statements: &[String]) -> Result<QueryOutput, DbError> {
+    let mut output = Vec::with_capacity(statements.len());
+    for statement in statements {
+        if returns_rows(statement) {
+            let rows = sqlx::query(statement).fetch_all(pool).await?;
+            output.push(mysql_rows(statement, &rows));
+        } else {
+            let result = sqlx::query(statement).execute(pool).await?;
+            output.push(StatementOutput {
+                statement: statement.clone(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: result.rows_affected(),
+            });
+        }
+    }
+    Ok(QueryOutput { statements: output })
+}
+
+fn mysql_rows(statement: &str, rows: &[MySqlRow]) -> StatementOutput {
+    let columns = rows
+        .first()
+        .map_or_else(Vec::new, |row| column_names(row.columns()));
+    let rows = rows
+        .iter()
+        .map(|row| {
+            (0..row.columns().len())
+                .map(|index| mysql_cell(row, index))
+                .collect()
+        })
+        .collect();
+    StatementOutput {
+        statement: statement.to_owned(),
+        columns,
+        rows,
+        rows_affected: 0,
+    }
+}
+
+fn mysql_cell(row: &MySqlRow, index: usize) -> String {
+    use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+    use sqlx::types::{BigDecimal, JsonValue};
+
+    if row
+        .try_get_raw(index)
+        .is_ok_and(|value| ValueRef::is_null(&value))
+    {
+        return "NULL".to_owned();
+    }
+
+    // MySQL types are looser than Postgres — try the broadest decoders
+    // first. `i64` covers TINYINT..BIGINT (signed); `u64` catches
+    // BIGINT UNSIGNED. Booleans show up as TINYINT(1) — already covered
+    // by i64. DATE / DATETIME / TIMESTAMP go through chrono; JSON is a
+    // dedicated type since 5.7.
+    row.try_get::<String, _>(index)
+        .or_else(|_| row.try_get::<i64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<u64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<f64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<bool, _>(index).map(|v| v.to_string()))
+        .or_else(|_| row.try_get::<BigDecimal, _>(index).map(|v| v.to_string()))
+        .or_else(|_| {
+            row.try_get::<DateTime<Utc>, _>(index)
+                .map(|v| v.to_rfc3339())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveDateTime, _>(index)
+                .map(|v| v.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveDate, _>(index)
+                .map(|v| v.format("%Y-%m-%d").to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<NaiveTime, _>(index)
+                .map(|v| v.format("%H:%M:%S%.f").to_string())
+        })
+        .or_else(|_| row.try_get::<JsonValue, _>(index).map(|v| v.to_string()))
+        .or_else(|_| {
+            row.try_get::<Vec<u8>, _>(index)
+                .map(|v| format!("0x{}", hex_encode(&v)))
+        })
+        .unwrap_or_else(|_| format!("<{}>", row.columns()[index].type_info().name()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{returns_rows, DatabaseDriver};
@@ -856,6 +1198,12 @@ mod tests {
     #[test]
     fn postgres_driver_is_distinct_from_sqlite() {
         assert_ne!(DatabaseDriver::Postgres, DatabaseDriver::Sqlite);
+    }
+
+    #[test]
+    fn mysql_driver_is_distinct() {
+        assert_ne!(DatabaseDriver::MySql, DatabaseDriver::Postgres);
+        assert_ne!(DatabaseDriver::MySql, DatabaseDriver::Sqlite);
     }
 
     #[test]

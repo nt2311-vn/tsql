@@ -49,10 +49,16 @@ impl Default for ProjectInfo {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "lowercase")]
 pub enum DriverKind {
     Postgres,
     Sqlite,
+    /// MySQL and MariaDB share the wire protocol; sqlx's `mysql`
+    /// feature speaks both. URLs starting with either `mysql://` or
+    /// `mariadb://` resolve here. `driver = "mariadb"` is also
+    /// accepted in the TOML config as a friendly alias.
+    #[serde(alias = "mariadb")]
+    Mysql,
 }
 
 impl DriverKind {
@@ -61,11 +67,24 @@ impl DriverKind {
             Ok(Self::Postgres)
         } else if url.starts_with("sqlite:") {
             Ok(Self::Sqlite)
+        } else if url.starts_with("mysql://") || url.starts_with("mariadb://") {
+            Ok(Self::Mysql)
         } else {
             Err(ConfigError::UnsupportedDriver(
                 url.split(':').next().unwrap_or(url).to_owned(),
             ))
         }
+    }
+
+    /// MySQL deserves both spellings of its scheme. sqlx's `MySqlPool`
+    /// only accepts `mysql://`, so we normalise on connect.
+    pub fn normalise_url(self, url: &str) -> String {
+        if matches!(self, Self::Mysql) {
+            if let Some(rest) = url.strip_prefix("mariadb://") {
+                return format!("mysql://{rest}");
+            }
+        }
+        url.to_owned()
     }
 }
 
@@ -143,6 +162,7 @@ pub async fn append_connection(
     let driver = match connection.driver {
         DriverKind::Postgres => "postgres",
         DriverKind::Sqlite => "sqlite",
+        DriverKind::Mysql => "mysql",
     };
     let escaped_url = connection.url.replace('\\', "\\\\").replace('"', "\\\"");
     let mut block = String::new();

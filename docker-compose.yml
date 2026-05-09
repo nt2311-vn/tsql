@@ -14,3 +14,43 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # MySQL sandbox. We pin to 8.4 LTS so CHECK constraints (8.0+) and
+  # the standard `information_schema.check_constraints` view are both
+  # available — that's what tsql's metadata fetchers rely on.
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: tsql
+      MYSQL_DATABASE: tsql
+      MYSQL_USER: tsql
+      MYSQL_PASSWORD: tsql
+    ports:
+      - "33069:3306"
+    volumes:
+      - ./seed/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u tsql -ptsql --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # MariaDB sandbox alongside MySQL. Same wire protocol so the same
+  # tsql driver speaks both — handy for sniffing out engine-specific
+  # bugs without restarting MySQL.
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      MARIADB_ROOT_PASSWORD: tsql
+      MARIADB_DATABASE: tsql
+      MARIADB_USER: tsql
+      MARIADB_PASSWORD: tsql
+    ports:
+      - "33079:3306"
+    volumes:
+      - ./seed/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -u tsql -ptsql --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
