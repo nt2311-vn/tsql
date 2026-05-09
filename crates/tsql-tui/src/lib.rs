@@ -2143,7 +2143,10 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     // columns as fit, with the focused column always visible. `[`/`]`
     // moves focus, the window slides to follow.
     let col_total = rec.columns.len();
-    let min_cell: u16 = 12;
+    // 14 cells per column = enough to show a `YYYY-MM-DD` date or a
+    // short numeric value with one space of padding. Anything narrower
+    // and even the date prefix in an RFC3339 timestamp gets clipped.
+    let min_cell: u16 = 14;
     let inner_w = area.width.max(1);
     let max_cols = ((inner_w + 1) / (min_cell + 1)).max(1) as usize;
     let visible = col_total.min(max_cols);
@@ -2217,7 +2220,10 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                         } else {
                             Style::default().fg(th.fg).bg(row_bg)
                         };
-                        ccell(val.as_str(), st)
+                        // Left-align body values so a too-wide cell
+                        // truncates from the right (date prefix wins
+                        // over timezone suffix). Headers stay centred.
+                        lcell(format!(" {val}"), st)
                     }),
                 th,
                 row_bg,
@@ -2262,6 +2268,14 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 /// tab so headers and body values share the same alignment treatment.
 fn ccell<'a>(content: impl Into<std::borrow::Cow<'a, str>>, style: Style) -> Cell<'a> {
     Cell::from(Line::from(Span::raw(content)).alignment(Alignment::Center)).style(style)
+}
+
+/// Build a left-aligned `Cell`. Used for record body values where the
+/// content can be longer than the column width — left-alignment keeps
+/// the meaningful prefix visible (e.g. `2026-01-05T…` instead of
+/// `-01-05T09:15:00+0` produced by centre-truncation).
+fn lcell<'a>(content: impl Into<std::borrow::Cow<'a, str>>, style: Style) -> Cell<'a> {
+    Cell::from(Line::from(Span::raw(content)).alignment(Alignment::Left)).style(style)
 }
 
 /// Produce `[data, sep, data, sep, …, data]` width constraints for an
