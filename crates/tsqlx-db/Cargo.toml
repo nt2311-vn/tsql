@@ -15,8 +15,8 @@ categories = ["command-line-utilities", "database"]
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tsqlx-core = { path = "../tsqlx-core", version = "0.2.0" }
-tsqlx-sql = { path = "../tsqlx-sql", version = "0.2.0" }
+tsqlx-core = { path = "../tsqlx-core", version = "0.3.0" }
+tsqlx-sql = { path = "../tsqlx-sql", version = "0.3.0" }
 
 [lints]
 workspace = true
