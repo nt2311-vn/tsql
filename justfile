@@ -160,10 +160,26 @@ alias seed-sqlite := sqlite-up
 #
 # RUSTSEC-2023-0071 (RSA timing sidechannel) has no upstream fix and
 # only reaches us transitively through `sqlx-mysql`, which we don't
-# enable. Ignore it explicitly so CI stays green; revisit when sqlx
-# 0.9 publishes a patched MySQL driver.
+# enable. Revisit when sqlx 0.9 publishes a patched MySQL driver.
+#
+# RUSTSEC-2026-0098/0099/0104 sit in `rustls-webpki 0.101.x`, which
+# `tiberius 0.12` (our MSSQL driver) pins via `rustls 0.21`. None
+# are exploitable unless tsqlx connects to a hostile SQL Server; the
+# upstream patches require rustls 0.23+, which tiberius hasn't
+# adopted. Track https://github.com/prisma/tiberius/issues for the
+# bump.
+#
+# RUSTSEC-2024-0436 (paste unmaintained) and RUSTSEC-2025-0134
+# (rustls-pemfile unmaintained) are maintenance advisories with no
+# CVE; ignored until upstream updates land.
 audit:
-    cargo audit --ignore RUSTSEC-2023-0071
+    cargo audit \
+        --ignore RUSTSEC-2023-0071 \
+        --ignore RUSTSEC-2026-0098 \
+        --ignore RUSTSEC-2026-0099 \
+        --ignore RUSTSEC-2026-0104 \
+        --ignore RUSTSEC-2024-0436 \
+        --ignore RUSTSEC-2025-0134
 
 # Run cargo audit and remind that TruffleHog/Gitleaks/Semgrep/Trivy live in CI.
 security: audit

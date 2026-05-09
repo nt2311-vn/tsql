@@ -6,6 +6,90 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ## [Unreleased]
 
+## [0.3.0] - in flight
+
+### Added
+
+- **Microsoft SQL Server driver.** Full TDS support via `tiberius`
+  + `bb8-tiberius`, no native dependencies (pure Rust, rustls TLS).
+  - URL formats: `mssql://`, `sqlserver://`, `tds://` (the last two
+    are normalised to `mssql://` on connect). TOML `driver = "sqlserver"`
+    and `driver = "tds"` are accepted as aliases.
+  - Query-string options: `encrypt=on|off|required` (default `on`),
+    `trust_cert=true|false` (default `false`), `instance=NAMED` for
+    SQL Browser named-instance discovery.
+  - Metadata introspection driven by `sys.schemas` / `sys.tables` /
+    `sys.columns` / `sys.types` / `sys.indexes` / `sys.foreign_keys`.
+    Distinguishes `is_primary_key` indexes; reports the index access
+    method (`type_desc`) lower-cased.
+  - Pagination via `OFFSET … ROWS FETCH NEXT … ROWS ONLY` with a
+    `ORDER BY (SELECT NULL)` no-op so callers don't need a key.
+  - **T-SQL `GO` batch separator.** New
+    `tsqlx_sql::split_tsql_batches` peels SSMS-style batches off a
+    script (case-insensitive, optional repeat count `GO 5`,
+    string/comment-aware). `Pool::execute_script` for MSSQL hands
+    each batch to `tiberius::Client::simple_query` so DDL chains
+    that depend on prior batches work as in sqlcmd.
+  - Docker sandbox: `mcr.microsoft.com/mssql/server:2022-latest` on
+    `localhost:14330` (sa / Tsqlx_Pass1, Developer edition). Recipes
+    `just mssql-up` / `just mssql-down` / `just test-mssql`.
+  - 5 integration tests gated on `TSQLX_TEST_MSSQL_URL` (executes,
+    overview, table_info, relationships, paginated records).
+  - CI: new `mssql-integration` job mirroring the Postgres pattern.
+- **Oracle Database driver (opt-in via `--features oracle`).** Built
+  on the `oracle` crate (OCI bindings). All blocking calls run
+  inside `tokio::task::spawn_blocking` so the rest of the async
+  surface is unchanged.
+  - URL format: `oracle://user:pass@host:port/service_name`. Without
+    the feature, `DriverKind::Oracle` still parses but
+    `Pool::connect` returns `DbError::Unsupported` so the binary
+    builds on machines without Instant Client.
+  - Metadata introspection driven by `ALL_TABLES` / `ALL_TAB_COLUMNS`
+    / `ALL_CONSTRAINTS` / `ALL_CONS_COLUMNS`. PKs are reconstructed
+    from `constraint_type='P'`, FKs from `'R'` with one extra round
+    trip per FK to resolve the referenced table/columns.
+  - Pagination via Oracle 12c+ `OFFSET … ROWS FETCH NEXT … ROWS ONLY`.
+  - **PL/SQL `/` batch terminator.** New
+    `tsqlx_sql::split_plsql_batches` recognises SQL*Plus `/`-on-its-
+    own-line as a batch boundary, leaving `/` inside expressions
+    (`SELECT a/b FROM t`) and block comments alone. `Pool::execute_
+    script` strips the trailing `;` from non-PL/SQL batches (Oracle
+    rejects it) but keeps it on `BEGIN…END;` blocks.
+  - Docker sandbox: `gvenzl/oracle-free:23-slim-faststart` on
+    `localhost:15210` (FREEPDB1 PDB, login `tsqlx`/`tsqlx_pass`).
+    Deliberately excluded from `just drivers-up` because of its
+    ~90-second cold-start cost. Recipes `just oracle-up` /
+    `just oracle-down` / `just test-oracle`.
+  - 5 integration tests gated on `TSQLX_TEST_ORACLE_URL` and
+    `#![cfg(feature = "oracle")]` so `cargo test --workspace`
+    without features still discovers and skips them.
+- **Driver matrix table** in the README extended to MSSQL + Oracle
+  with their introspection sources.
+
+### Changed
+
+- **Project rename `tsql` → `tsqlx`.** `tsql` was already taken on
+  crates.io. All five workspace crates (`tsqlx-app`, `tsqlx-core`,
+  `tsqlx-db`, `tsqlx-sql`, `tsqlx-tui`), the binary, the
+  `tsqlx_*` Rust import paths, the `~/.config/tsqlx/` config dir,
+  the `~/.local/share/tsqlx/history/` history dir, the
+  `TSQLX_TEST_POSTGRES_URL` test env var, the docker-compose dev
+  credentials, and the canonical `https://github.com/nt2311-vn/tsqlx`
+  repo URL all moved together.
+- **Driver-matrix mermaid in README.** GitHub's renderer silently
+  fails when edge labels contain `<br/>` inside quoted strings (e.g.
+  `-- "postgres://"<br/>"postgresql://" -->`). Rewrote the chart
+  with single-line edge labels (`-->|postgres:// or postgresql://|`)
+  and added MSSQL + Oracle pool nodes.
+
+### Fixed
+
+- **Docker healthcheck password.** The `mysqladmin -ptsql` /
+  `mariadb-admin -ptsql` healthchecks weren't picked up by the
+  `\btsql\b` rename regex because there's no word boundary between
+  `-p` and the password fragment. Renamed to `-ptsqlx` so the
+  healthcheck actually authenticates.
+
 ## [0.2.0] - 2026-05-09
 
 ### Added
