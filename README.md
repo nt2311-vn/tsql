@@ -1,4 +1,4 @@
-# TSQL
+# TSQLX
 
 A fast, keyboard-first terminal database client for **PostgreSQL**, **SQLite**, and **MySQL / MariaDB**, built in Rust.
 
