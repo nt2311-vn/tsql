@@ -18,6 +18,170 @@ impl SqlDocument {
     pub fn statements(&self) -> Vec<String> {
         split_statements(&self.text)
     }
+
+    /// T-SQL batches. SQL Server uses `GO` on its own line as a
+    /// client-side batch separator (sqlcmd/SSMS convention; the wire
+    /// protocol never sees it). Each returned string is one batch and
+    /// may itself contain multiple `;`-separated statements.
+    #[must_use]
+    pub fn tsql_batches(&self) -> Vec<String> {
+        split_tsql_batches(&self.text)
+    }
+}
+
+/// Split a T-SQL script on `GO` batch separators.
+///
+/// `GO` is a sqlcmd / SSMS client convention — never sent over TDS — so
+/// MSSQL drivers have to peel batches off before they reach the server.
+/// A separator is a line whose only non-whitespace content is `GO`,
+/// optionally followed by an integer repeat count (`GO 5`). The
+/// directive is case-insensitive.
+///
+/// We deliberately *don't* honor `GO` inside string literals, line
+/// comments, or block comments — same boundary rules as
+/// [`split_statements`].
+#[must_use]
+pub fn split_tsql_batches(input: &str) -> Vec<String> {
+    let mut batches = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut state = SplitState::Normal;
+    let mut at_line_start = true;
+
+    while let Some(ch) = chars.next() {
+        match state {
+            SplitState::Normal => match ch {
+                '\'' => {
+                    current.push(ch);
+                    at_line_start = false;
+                    state = SplitState::SingleQuoted;
+                }
+                '"' => {
+                    current.push(ch);
+                    at_line_start = false;
+                    state = SplitState::DoubleQuoted;
+                }
+                '-' if chars.peek() == Some(&'-') => {
+                    current.push(ch);
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                    state = SplitState::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    current.push(ch);
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                    state = SplitState::BlockComment;
+                }
+                '\n' => {
+                    current.push(ch);
+                    at_line_start = true;
+                }
+                ' ' | '\t' | '\r' => {
+                    current.push(ch);
+                }
+                _ => {
+                    if at_line_start && is_go_separator(ch, &mut chars) {
+                        push_statement(&mut batches, &mut current);
+                        // Consume the rest of the GO line (including any
+                        // trailing repeat count and the line terminator).
+                        consume_to_eol(&mut chars);
+                        at_line_start = true;
+                    } else {
+                        current.push(ch);
+                        at_line_start = false;
+                    }
+                }
+            },
+            SplitState::SingleQuoted => {
+                current.push(ch);
+                if ch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        if let Some(next) = chars.next() {
+                            current.push(next);
+                        }
+                    } else {
+                        state = SplitState::Normal;
+                    }
+                }
+            }
+            SplitState::DoubleQuoted => {
+                current.push(ch);
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        if let Some(next) = chars.next() {
+                            current.push(next);
+                        }
+                    } else {
+                        state = SplitState::Normal;
+                    }
+                }
+            }
+            SplitState::LineComment => {
+                current.push(ch);
+                if ch == '\n' {
+                    state = SplitState::Normal;
+                    at_line_start = true;
+                }
+            }
+            SplitState::BlockComment => {
+                current.push(ch);
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                    state = SplitState::Normal;
+                }
+            }
+            SplitState::DollarQuoted(_) => {
+                // T-SQL doesn't use dollar-quoted bodies; if we're here
+                // we copy the char and move on. (Reachable only if the
+                // caller mixes dialects in the same buffer.)
+                current.push(ch);
+            }
+        }
+    }
+
+    push_statement(&mut batches, &mut current);
+    batches
+}
+
+/// Returns true iff the next two characters spell `GO` (case-insensitive)
+/// and the character after `GO` is whitespace, end-of-input, or a digit
+/// (for the optional repeat count). `ch` is the *first* char already
+/// consumed; on a true return the matching `O` is also consumed.
+fn is_go_separator(ch: char, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    if !matches!(ch, 'g' | 'G') {
+        return false;
+    }
+    let Some(&next) = chars.peek() else {
+        return true;
+    };
+    if !matches!(next, 'o' | 'O') {
+        return false;
+    }
+    // Look one further: must be EOL, EOF, whitespace, or a digit (count).
+    let mut probe = chars.clone();
+    probe.next();
+    let after = probe.peek().copied();
+    let ok = matches!(
+        after,
+        None | Some('\n') | Some('\r') | Some(' ') | Some('\t') | Some('0'..='9')
+    );
+    if ok {
+        chars.next();
+    }
+    ok
+}
+
+fn consume_to_eol(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    for ch in chars.by_ref() {
+        if ch == '\n' {
+            break;
+        }
+    }
 }
 
 #[must_use]
@@ -157,7 +321,7 @@ fn push_statement(statements: &mut Vec<String>, current: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_statements, SqlDocument};
+    use super::{split_statements, split_tsql_batches, SqlDocument};
 
     #[test]
     fn document_preserves_multiline_sql() {
@@ -204,5 +368,42 @@ mod tests {
         assert_eq!(statements.len(), 2);
         assert!(statements[0].contains("perform 1;"));
         assert_eq!(statements[1], "select 1");
+    }
+
+    #[test]
+    fn tsql_batches_split_on_go() {
+        let batches = split_tsql_batches("create table t (id int);\nGO\nselect * from t;\nGO");
+        assert_eq!(batches.len(), 2);
+        assert!(batches[0].contains("create table t"));
+        assert_eq!(batches[1], "select * from t;");
+    }
+
+    #[test]
+    fn tsql_batches_case_insensitive_and_repeat_count() {
+        let batches = split_tsql_batches("select 1;\ngo 5\nselect 2;\nGo\nselect 3;");
+        assert_eq!(batches, ["select 1;", "select 2;", "select 3;"]);
+    }
+
+    #[test]
+    fn tsql_batches_ignore_go_inside_string_or_comment() {
+        let batches = split_tsql_batches("select 'GO';\n-- GO\n/* GO */\nselect 2;");
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].contains("select 'GO';"));
+        assert!(batches[0].contains("select 2;"));
+    }
+
+    #[test]
+    fn tsql_batches_keep_go_when_not_at_line_start() {
+        // `GO` mid-statement (e.g. inside an identifier or after other
+        // tokens on the same line) is just an identifier — never a
+        // separator.
+        let batches = split_tsql_batches("select 1; GO\nselect 2;");
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[test]
+    fn document_tsql_batches_round_trip() {
+        let doc = SqlDocument::new("a;\nGO\nb;");
+        assert_eq!(doc.tsql_batches(), ["a;", "b;"]);
     }
 }

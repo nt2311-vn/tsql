@@ -200,12 +200,14 @@ impl Pool {
     }
 
     pub async fn execute_script(&self, document: &SqlDocument) -> Result<QueryOutput, DbError> {
-        let stmts = document.statements();
         match self {
-            Pool::Postgres(pool) => execute_postgres(pool, &stmts).await,
-            Pool::Sqlite(pool) => execute_sqlite(pool, &stmts).await,
-            Pool::MySql(pool) => execute_mysql(pool, &stmts).await,
-            Pool::Mssql(pool) => mssql::execute_script(pool, &stmts).await,
+            Pool::Postgres(pool) => execute_postgres(pool, &document.statements()).await,
+            Pool::Sqlite(pool) => execute_sqlite(pool, &document.statements()).await,
+            Pool::MySql(pool) => execute_mysql(pool, &document.statements()).await,
+            // T-SQL `GO` is a client-side batch separator; tiberius's
+            // `simple_query` accepts an arbitrary batch (multiple `;`-
+            // separated statements), so we hand it whole batches.
+            Pool::Mssql(pool) => mssql::execute_script(pool, &document.tsql_batches()).await,
         }
     }
 
