@@ -57,61 +57,6 @@ enum DbMessage {
         table: String,
         result: Result<TableInfo, String>,
     },
-    /// Result of rendering the Mermaid chart with `mmdc` + `chafa`.
-    /// `hash` keys the render against the source the task was launched
-    /// for so a stale render that arrives after the schema changed is
-    /// dropped silently.
-    ErdChart {
-        schema: String,
-        hash: u64,
-        size: (u16, u16),
-        result: Result<Vec<Line<'static>>, ErdChartError>,
-    },
-}
-
-/// Why an ERD chart render failed. Drives the on-screen hint so the
-/// user knows whether to install a tool or fix the source.
-#[derive(Debug, Clone)]
-enum ErdChartError {
-    /// A required external binary (`mmdc` or `chafa`) was not found
-    /// on `PATH`. The string is the install hint shown to the user.
-    MissingTool(String),
-    /// `mmdc` or `chafa` ran but exited non-zero. The string is the
-    /// stderr tail.
-    Failed(String),
-}
-
-/// Cached chart-render pipeline state. Lives on `AppState` so the draw
-/// path can show the latest output without re-running `mmdc`/`chafa`
-/// on every frame.
-#[derive(Debug, Default)]
-struct ErdChart {
-    /// FNV-1a hash of the Mermaid source last submitted for rendering.
-    /// Re-render only triggers when this changes (or the pane size
-    /// changes meaningfully).
-    hash: Option<u64>,
-    /// Pane size used when the chart was last submitted.
-    size: (u16, u16),
-    /// Most recent observed inspector chart-pane size, set by the draw
-    /// path so the event-loop trigger can spot resizes.
-    desired_size: std::cell::Cell<(u16, u16)>,
-    status: ErdChartStatus,
-}
-
-#[derive(Debug, Default, Clone)]
-enum ErdChartStatus {
-    /// No render attempted yet for the current inputs.
-    #[default]
-    Idle,
-    /// A background task is currently running.
-    Rendering,
-    /// Render completed successfully; lines hold the parsed chafa
-    /// output ready to splice into the inspector pane.
-    Ready(Vec<Line<'static>>),
-    /// Render failed with the given message.
-    Failed(String),
-    /// External tool missing — show install hint.
-    MissingTool(String),
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -293,9 +238,10 @@ struct AppState {
     /// Mermaid generator. Cleared on schema change. Tables that have
     /// not yet been pre-fetched render as `(loading…)` stubs.
     erd_table_info: HashMap<String, TableInfo>,
-    /// State of the rendered Mermaid chart pipeline (mmdc + chafa).
-    /// Cached so a redraw doesn't re-shell on every frame.
-    erd_chart: ErdChart,
+    /// When true the ERD chart pane fills the whole detail body —
+    /// banner stays, but the table list + per-table inspector hide.
+    /// Toggled with `f` while on the ERD tab.
+    erd_chart_fullscreen: bool,
     editor: String,
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
@@ -361,7 +307,7 @@ impl AppState {
             relationships: Vec::new(),
             erd_selected: 0,
             erd_table_info: HashMap::new(),
-            erd_chart: ErdChart::default(),
+            erd_chart_fullscreen: false,
             editor: String::new(),
             editor_cursor: 0,
             editor_path: None,
@@ -487,12 +433,6 @@ async fn run_loop(
             apply_db_message(app, msg);
         }
 
-        // After draining, decide whether the ERD chart needs a
-        // refresh. The draw path stamps the inspector pane size into
-        // `app.erd_chart.desired_size`, so by now we know how large to
-        // render.
-        maybe_spawn_chart_render(app);
-
         // Short poll keeps the UI responsive (~30 fps) while still letting
         // the runtime schedule background tasks.
         if !event::poll(Duration::from_millis(33))? {
@@ -573,36 +513,6 @@ fn apply_db_message(app: &mut AppState, msg: DbMessage) {
             if let Ok(info) = result {
                 app.erd_table_info.insert(table, info);
             }
-        }
-        DbMessage::ErdChart {
-            schema,
-            hash,
-            size,
-            result,
-        } => {
-            // Drop the result if the user has navigated away or the
-            // mermaid source has been re-hashed since this task began.
-            if schema != app.current_schema {
-                return;
-            }
-            if app.erd_chart.hash != Some(hash) {
-                return;
-            }
-            app.erd_chart.size = size;
-            app.erd_chart.status = match result {
-                Ok(lines) => {
-                    app.status = format!("ERD chart rendered ({}x{})", size.0, size.1);
-                    ErdChartStatus::Ready(lines)
-                }
-                Err(ErdChartError::MissingTool(hint)) => {
-                    app.status = format!("ERD chart: {hint}");
-                    ErdChartStatus::MissingTool(hint)
-                }
-                Err(ErdChartError::Failed(msg)) => {
-                    app.last_error = Some(format!("ERD chart: {msg}"));
-                    ErdChartStatus::Failed(msg)
-                }
-            };
         }
         DbMessage::Relationships { schema, result } => {
             if schema != app.current_schema {
@@ -1529,6 +1439,14 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         KeyCode::Char('o') if app.detail_tab == DetailTab::Erd => {
             open_erd_selected_table(app).await;
         }
+        KeyCode::Char('f') if app.detail_tab == DetailTab::Erd => {
+            app.erd_chart_fullscreen = !app.erd_chart_fullscreen;
+            app.status = if app.erd_chart_fullscreen {
+                "ERD chart: fullscreen (press f to exit)".to_owned()
+            } else {
+                "ERD chart: split view".to_owned()
+            };
+        }
         KeyCode::Char(']') if app.detail_tab == DetailTab::Records => {
             if let Some(rec) = &app.records {
                 let max = rec.columns.len().saturating_sub(1);
@@ -1623,7 +1541,6 @@ async fn load_table(app: &mut AppState, schema: &str, table: &str) {
         app.relationships.clear();
         app.erd_selected = 0;
         app.erd_table_info.clear();
-        app.erd_chart = ErdChart::default();
     }
     app.current_schema = schema.to_owned();
     app.current_table = table.to_owned();
@@ -2613,18 +2530,24 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
-    // Vertical split:
-    //   row 0: banner (1 line)
-    //   row 1: chart pane (~60%, full width)
-    //   row 2: tables list + per-table inspector (~40%, two columns)
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Percentage(60),
-            Constraint::Min(8),
-        ])
-        .split(area);
+    // Vertical split. Fullscreen mode (`f`) gives the chart the
+    // entire body so the user can actually read box labels; default
+    // mode keeps the table list + per-table inspector below.
+    let layout = if app.erd_chart_fullscreen {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(0)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Percentage(70),
+                Constraint::Min(8),
+            ])
+            .split(area)
+    };
 
     // Banner.
     let banner = vec![Line::from(vec![
@@ -2637,7 +2560,7 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         ),
         Span::styled(
             format!(
-                "  {} table(s), {} relationship(s)  j/k tables  Enter open  y save mermaid  ",
+                "  {} table(s), {} edge(s)  j/k focus  Enter open  f fullscreen  y export .mmd  ",
                 tables.len(),
                 app.relationships.len(),
             ),
@@ -2651,6 +2574,10 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 
     draw_erd_chart_pane(f, app, layout[1]);
 
+    if app.erd_chart_fullscreen {
+        return;
+    }
+
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(28), Constraint::Min(0)])
@@ -2661,22 +2588,24 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     draw_erd_inspector(f, app, &tables, selected, body[1]);
 }
 
-/// Render the rendered Mermaid chart (or its current placeholder /
-/// error state) into `area`. Stamps the inner content size into
-/// `app.erd_chart.desired_size` so the event loop can trigger a fresh
-/// render at this exact size.
+/// Render a focused, pure-Rust schema graph centred on the selected
+/// table. No external tools, no async pipeline — just a hand-rolled
+/// box-drawing canvas:
+///
+///   ┌─ neighbours that reference SELECTED ──┐  ╭── SELECTED ──╮  ┌─ tables SELECTED references ─┐
+///   │  shipments  ─── ship_id ──────────────│──▶│ ★ id         │──── customer_id ──▶│  customers  │
+///   │  invoices   ─── inv_id  ──────────────│──▶│ ⚷ customer_id│                    └─────────────┘
+///   └───────────────────────────────────────┘  │   amount      │
+///                                              ╰──────────────╯
+///
+/// FK column labels ride on top of the connecting line. PK columns get
+/// `★`, FK columns `⚷`. When the pane is too narrow / short, neighbour
+/// cards are dropped first; the centre card is always preserved.
 fn draw_erd_chart_pane(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let th = app.theme;
-    let title = match &app.erd_chart.status {
-        ErdChartStatus::Ready(_) => "  ERD chart  ",
-        ErdChartStatus::Rendering => "  ERD chart  (rendering…)  ",
-        ErdChartStatus::Idle => "  ERD chart  (preparing…)  ",
-        ErdChartStatus::Failed(_) => "  ERD chart  (error)  ",
-        ErdChartStatus::MissingTool(_) => "  ERD chart  (tools missing)  ",
-    };
     let block = Block::default()
         .title(Span::styled(
-            title,
+            "  Schema map  (focused on selected table)  ",
             Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -2686,83 +2615,485 @@ fn draw_erd_chart_pane(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Tell the event loop how big a render we'd like.
-    app.erd_chart.desired_size.set((inner.width, inner.height));
-
-    let placeholder = |msg: &str, color: Color| -> Paragraph<'static> {
-        Paragraph::new(vec![
+    if inner.width < 24 || inner.height < 6 {
+        let msg = vec![
             Line::default(),
-            Line::from(Span::styled(format!("  {msg}"), Style::default().fg(color))),
-        ])
-        .style(Style::default().bg(th.bg))
+            Line::from(Span::styled(
+                "  pane too small — press f to fullscreen",
+                Style::default().fg(th.muted),
+            )),
+        ];
+        f.render_widget(Paragraph::new(msg).style(Style::default().bg(th.bg)), inner);
+        return;
+    }
+
+    let tables = erd_table_list(app);
+    let selected = app.erd_selected.min(tables.len().saturating_sub(1));
+    let Some(centre_name) = tables.get(selected).cloned() else {
+        return;
+    };
+    let centre_info = app.erd_table_info.get(&centre_name).cloned();
+
+    // Outgoing FKs: this table → others.
+    let outgoing: Vec<&RelationshipEdge> = app
+        .relationships
+        .iter()
+        .filter(|e| e.from_table == centre_name)
+        .collect();
+    // Incoming FKs: others → this table.
+    let incoming: Vec<&RelationshipEdge> = app
+        .relationships
+        .iter()
+        .filter(|e| e.to_table == centre_name)
+        .collect();
+
+    let canvas = render_focus_canvas(
+        inner.width,
+        inner.height,
+        &centre_name,
+        centre_info.as_ref(),
+        &incoming,
+        &outgoing,
+        th,
+    );
+    f.render_widget(
+        Paragraph::new(canvas).style(Style::default().bg(th.bg)),
+        inner,
+    );
+}
+
+/// Single canvas cell. `bold` is the only modifier we need so far —
+/// we keep the type tiny so the grid stays cache-friendly.
+#[derive(Clone, Copy)]
+struct Cell2 {
+    ch: char,
+    fg: Color,
+    bold: bool,
+}
+
+impl Cell2 {
+    fn space(th: Theme) -> Self {
+        Self {
+            ch: ' ',
+            fg: th.fg,
+            bold: false,
+        }
+    }
+}
+
+/// Build the focused-graph canvas. Returns one styled `Line` per row.
+#[allow(clippy::too_many_arguments)]
+fn render_focus_canvas(
+    width: u16,
+    height: u16,
+    centre_name: &str,
+    centre_info: Option<&TableInfo>,
+    incoming: &[&RelationshipEdge],
+    outgoing: &[&RelationshipEdge],
+    th: Theme,
+) -> Vec<Line<'static>> {
+    let w = width as usize;
+    let h = height as usize;
+    let mut grid: Vec<Vec<Cell2>> = vec![vec![Cell2::space(th); w]; h];
+
+    // ── centre card ────────────────────────────────────────────────
+    // Build rows: header (table name) + horizontal rule + columns.
+    let mut centre_rows: Vec<(String, Color, bool)> = Vec::new();
+    centre_rows.push((centre_name.to_owned(), th.accent, true));
+    if let Some(info) = centre_info {
+        let pk_set: HashSet<&str> = info
+            .primary_key
+            .as_ref()
+            .map(|pk| pk.column_names.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let fk_set: HashSet<&str> = info
+            .foreign_keys
+            .iter()
+            .flat_map(|fk| fk.column_names.iter().map(String::as_str))
+            .collect();
+        let name_w = info.columns.iter().map(|c| c.name.len()).max().unwrap_or(4);
+        for c in info.columns.iter().take(8) {
+            let (marker, color) = if pk_set.contains(c.name.as_str()) {
+                ('★', th.warning)
+            } else if fk_set.contains(c.name.as_str()) {
+                ('⚷', th.accent2)
+            } else {
+                (' ', th.fg)
+            };
+            let label = format!("{marker} {:<w$}  {}", c.name, c.data_type, w = name_w);
+            centre_rows.push((label, color, false));
+        }
+        if info.columns.len() > 8 {
+            centre_rows.push((
+                format!("… (+{} more)", info.columns.len() - 8),
+                th.muted,
+                false,
+            ));
+        }
+    } else {
+        centre_rows.push(("(loading…)".to_owned(), th.muted, false));
+    }
+
+    // Box width = max content + 2 padding. Cap so neighbours fit.
+    let max_centre_w = centre_rows
+        .iter()
+        .map(|(s, _, _)| s.chars().count())
+        .max()
+        .unwrap_or(8);
+    let centre_box_w = (max_centre_w + 4).min(w.saturating_sub(8));
+    let centre_box_w = centre_box_w.max(centre_name.chars().count() + 4);
+    let centre_box_h = (centre_rows.len() + 2).min(h);
+
+    // Side card width: tight.
+    let side_box_w: usize = 18;
+    let side_box_h: usize = 3;
+
+    // Decide how many neighbours we can show vertically with 1-row gap.
+    let stack_capacity = (h.saturating_sub(1) / (side_box_h + 1)).max(1);
+    let lefts: Vec<&&RelationshipEdge> = incoming.iter().take(stack_capacity).collect();
+    let rights: Vec<&&RelationshipEdge> = outgoing.iter().take(stack_capacity).collect();
+
+    // Lay out columns horizontally. If the pane is too narrow drop
+    // neighbours first; centre always renders.
+    let arrow_pad: usize = 4;
+    let needed_w_both = side_box_w + arrow_pad + centre_box_w + arrow_pad + side_box_w;
+    let needed_w_one = side_box_w + arrow_pad + centre_box_w;
+    let (show_left, show_right) = if w >= needed_w_both {
+        (!lefts.is_empty(), !rights.is_empty())
+    } else if w >= needed_w_one {
+        // Only one side fits — prefer outgoing (what the table depends on).
+        if !rights.is_empty() {
+            (false, true)
+        } else {
+            (!lefts.is_empty(), false)
+        }
+    } else {
+        (false, false)
     };
 
-    match &app.erd_chart.status {
-        ErdChartStatus::Ready(lines) => {
-            f.render_widget(
-                Paragraph::new(lines.clone()).style(Style::default().bg(th.bg)),
-                inner,
-            );
+    let centre_x = (w.saturating_sub(centre_box_w)) / 2;
+    let centre_y = (h.saturating_sub(centre_box_h)) / 2;
+    let left_x = 0usize;
+    let right_x = w.saturating_sub(side_box_w);
+
+    // Draw centre card.
+    draw_card(
+        &mut grid,
+        centre_x,
+        centre_y,
+        centre_box_w,
+        centre_box_h,
+        &centre_rows,
+        th.accent,
+        th.accent,
+        true,
+        th,
+    );
+
+    // Helper: distribute n boxes evenly across the available height.
+    let distribute = |n: usize| -> Vec<usize> {
+        if n == 0 {
+            return Vec::new();
         }
-        ErdChartStatus::Rendering => {
-            f.render_widget(
-                placeholder("rendering Mermaid → PNG → terminal…", th.muted),
-                inner,
-            );
+        let total_h = n * side_box_h + n.saturating_sub(1);
+        if total_h >= h {
+            (0..n).map(|i| i * (side_box_h + 1)).collect()
+        } else {
+            let start = (h - total_h) / 2;
+            (0..n).map(|i| start + i * (side_box_h + 1)).collect()
         }
-        ErdChartStatus::Idle => {
-            f.render_widget(placeholder("waiting for schema metadata…", th.muted), inner);
-        }
-        ErdChartStatus::Failed(msg) => {
-            let body = vec![
-                Line::default(),
-                Line::from(Span::styled(
-                    "  Could not render chart:",
-                    Style::default().fg(th.error).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    format!("    {msg}"),
-                    Style::default().fg(th.error),
-                )),
-                Line::default(),
-                Line::from(Span::styled(
-                    "  Press y to save the Mermaid source for manual rendering.",
-                    Style::default().fg(th.muted).add_modifier(Modifier::ITALIC),
-                )),
+    };
+
+    // Left side: incoming FKs ("X.fk_col → centre.pk").
+    if show_left {
+        let ys = distribute(lefts.len());
+        for (i, edge) in lefts.iter().enumerate() {
+            let y = ys[i];
+            let rows = vec![
+                (edge.from_table.clone(), th.accent, true),
+                (
+                    edge.from_columns
+                        .join(",")
+                        .chars()
+                        .take(side_box_w - 4)
+                        .collect::<String>(),
+                    th.accent2,
+                    false,
+                ),
             ];
-            f.render_widget(
-                Paragraph::new(body).style(Style::default().bg(th.bg)),
-                inner,
+            draw_card(
+                &mut grid, left_x, y, side_box_w, side_box_h, &rows, th.border, th.fg, false, th,
             );
-        }
-        ErdChartStatus::MissingTool(hint) => {
-            let body = vec![
-                Line::default(),
-                Line::from(Span::styled(
-                    "  Inline ERD chart needs two external tools:",
-                    Style::default().fg(th.fg).add_modifier(Modifier::BOLD),
-                )),
-                Line::default(),
-                Line::from(Span::styled(
-                    format!("    • {hint}"),
-                    Style::default().fg(th.warning),
-                )),
-                Line::default(),
-                Line::from(Span::styled(
-                    "  Once installed, the chart will render here automatically.",
-                    Style::default().fg(th.muted),
-                )),
-                Line::from(Span::styled(
-                    "  Press y to write the Mermaid source to ./<schema>.mmd in the meantime.",
-                    Style::default().fg(th.muted).add_modifier(Modifier::ITALIC),
-                )),
-            ];
-            f.render_widget(
-                Paragraph::new(body).style(Style::default().bg(th.bg)),
-                inner,
+            // Arrow from right edge of left box → left edge of centre,
+            // anchored to the vertical mid of the source box and the
+            // matching column row of the centre (or its header if we
+            // can't find one).
+            let src_y = y + side_box_h / 2;
+            let dst_y = centre_y + 1 + locate_centre_row(&centre_rows, &edge.to_columns);
+            let label = edge.from_columns.join(",");
+            draw_arrow(
+                &mut grid,
+                left_x + side_box_w - 1,
+                src_y,
+                centre_x,
+                dst_y,
+                &label,
+                th.accent2,
+                false, // ► points right
+                th,
             );
         }
     }
+
+    // Right side: outgoing FKs ("centre.fk_col → Y.pk").
+    if show_right {
+        let ys = distribute(rights.len());
+        for (i, edge) in rights.iter().enumerate() {
+            let y = ys[i];
+            let rows = vec![
+                (edge.to_table.clone(), th.accent, true),
+                (
+                    edge.to_columns
+                        .join(",")
+                        .chars()
+                        .take(side_box_w - 4)
+                        .collect::<String>(),
+                    th.warning,
+                    false,
+                ),
+            ];
+            draw_card(
+                &mut grid, right_x, y, side_box_w, side_box_h, &rows, th.border, th.fg, false, th,
+            );
+            let src_y = centre_y + 1 + locate_centre_row(&centre_rows, &edge.from_columns);
+            let dst_y = y + side_box_h / 2;
+            let label = edge.from_columns.join(",");
+            draw_arrow(
+                &mut grid,
+                centre_x + centre_box_w - 1,
+                src_y,
+                right_x,
+                dst_y,
+                &label,
+                th.accent,
+                false,
+                th,
+            );
+        }
+    }
+
+    // ── footer hint ───────────────────────────────────────────────
+    let hint_y = h.saturating_sub(1);
+    let stats = format!(
+        "  ←{} incoming   {} outgoing→   {} neighbours hidden",
+        incoming.len(),
+        outgoing.len(),
+        incoming.len().saturating_sub(lefts.len()) + outgoing.len().saturating_sub(rights.len()),
+    );
+    put_text(&mut grid, 0, hint_y, &stats, th.muted, false);
+
+    // ── convert grid → ratatui Lines ──────────────────────────────
+    grid_to_lines(&grid, th)
+}
+
+/// Find the row offset in the centre card that matches the first
+/// referenced column name, so the connecting arrow lands on it. Falls
+/// back to the header row when no match is found.
+fn locate_centre_row(rows: &[(String, Color, bool)], cols: &[String]) -> usize {
+    if cols.is_empty() {
+        return 0;
+    }
+    let target = &cols[0];
+    for (i, (label, _, _)) in rows.iter().enumerate().skip(1) {
+        // Centre rows look like "★ name  type". Match on whitespace-
+        // delimited second token.
+        let mut parts = label.split_whitespace();
+        let _marker = parts.next();
+        if let Some(name) = parts.next() {
+            if name == target {
+                return i;
+            }
+        }
+    }
+    0
+}
+
+/// Draw a rounded card with a header row + body lines. `header_color`
+/// styles the title and (when `emphasise` is set) the border.
+#[allow(clippy::too_many_arguments)]
+fn draw_card(
+    grid: &mut [Vec<Cell2>],
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    rows: &[(String, Color, bool)],
+    border: Color,
+    _body_color: Color,
+    emphasise: bool,
+    th: Theme,
+) {
+    if w < 4 || h < 3 {
+        return;
+    }
+    let h_max = grid.len();
+    let w_max = grid.first().map(Vec::len).unwrap_or(0);
+    if y >= h_max || x >= w_max {
+        return;
+    }
+    let h = h.min(h_max - y);
+    let w = w.min(w_max - x);
+
+    let (tl, tr, bl, br, hch, vch) = if emphasise {
+        ('╭', '╮', '╰', '╯', '─', '│')
+    } else {
+        ('┌', '┐', '└', '┘', '─', '│')
+    };
+    // Top + bottom borders.
+    put(grid, x, y, tl, border, false);
+    put(grid, x + w - 1, y, tr, border, false);
+    put(grid, x, y + h - 1, bl, border, false);
+    put(grid, x + w - 1, y + h - 1, br, border, false);
+    for i in 1..w - 1 {
+        put(grid, x + i, y, hch, border, false);
+        put(grid, x + i, y + h - 1, hch, border, false);
+    }
+    for j in 1..h - 1 {
+        put(grid, x, y + j, vch, border, false);
+        put(grid, x + w - 1, y + j, vch, border, false);
+    }
+
+    // Inner rows.
+    for (i, (text, color, bold)) in rows.iter().enumerate() {
+        let row_y = y + 1 + i;
+        if row_y >= y + h - 1 {
+            break;
+        }
+        let inner_w = w - 2;
+        let truncated: String = text.chars().take(inner_w.saturating_sub(2)).collect();
+        put_text(grid, x + 2, row_y, &truncated, *color, *bold);
+        // Insert a horizontal rule under the header.
+        if i == 0 && rows.len() > 1 && row_y + 1 < y + h - 1 {
+            for k in 1..w - 1 {
+                put(grid, x + k, row_y + 1, '─', th.muted, false);
+            }
+        }
+    }
+}
+
+/// Draw a one-cell-thick orthogonal arrow from (x1,y1) to (x2,y2) with
+/// a centred label. Uses box-drawing chars so it composites cleanly
+/// over existing cells. `back_arrow` swaps the arrowhead direction.
+#[allow(clippy::too_many_arguments)]
+fn draw_arrow(
+    grid: &mut [Vec<Cell2>],
+    x1: usize,
+    y1: usize,
+    x2: usize,
+    y2: usize,
+    label: &str,
+    color: Color,
+    back_arrow: bool,
+    _th: Theme,
+) {
+    if x2 <= x1 || grid.is_empty() {
+        return;
+    }
+    let mid_x = x1 + (x2 - x1) / 2;
+    // First leg: horizontal from x1 to mid_x at y1.
+    for x in x1..=mid_x {
+        put(grid, x, y1, '─', color, false);
+    }
+    // Vertical: y1 -> y2 at mid_x.
+    if y1 != y2 {
+        let (lo, hi) = if y1 < y2 { (y1, y2) } else { (y2, y1) };
+        for y in lo..=hi {
+            // Don't overwrite the corners we'll set below.
+            if y != y1 && y != y2 {
+                put(grid, mid_x, y, '│', color, false);
+            }
+        }
+        // Corners.
+        let c1 = if y1 < y2 { '╮' } else { '╯' };
+        let c2 = if y1 < y2 { '╰' } else { '╭' };
+        put(grid, mid_x, y1, c1, color, false);
+        put(grid, mid_x, y2, c2, color, false);
+    }
+    // Second leg: horizontal from mid_x to x2 at y2.
+    for x in mid_x..=x2 {
+        put(grid, x, y2, '─', color, false);
+    }
+    // Arrowhead.
+    let head_x = if back_arrow { x1 } else { x2 };
+    let head_y = if back_arrow { y1 } else { y2 };
+    let head_ch = if back_arrow { '◀' } else { '▶' };
+    put(grid, head_x, head_y, head_ch, color, true);
+
+    // Label sits one row above the horizontal leg with the longest run.
+    if !label.is_empty() {
+        let label_chars: Vec<char> = label.chars().collect();
+        let lbl_y = if y1 == y2 {
+            y1.saturating_sub(1)
+        } else {
+            // Centre on the longer leg; pick the source leg.
+            y1.saturating_sub(1)
+        };
+        let lbl_x = x1 + 1;
+        for (i, ch) in label_chars.iter().enumerate() {
+            if lbl_x + i >= x2 {
+                break;
+            }
+            put(grid, lbl_x + i, lbl_y, *ch, color, false);
+        }
+    }
+}
+
+#[inline]
+fn put(grid: &mut [Vec<Cell2>], x: usize, y: usize, ch: char, fg: Color, bold: bool) {
+    if let Some(row) = grid.get_mut(y) {
+        if let Some(cell) = row.get_mut(x) {
+            *cell = Cell2 { ch, fg, bold };
+        }
+    }
+}
+
+fn put_text(grid: &mut [Vec<Cell2>], x: usize, y: usize, text: &str, fg: Color, bold: bool) {
+    for (i, ch) in text.chars().enumerate() {
+        put(grid, x + i, y, ch, fg, bold);
+    }
+}
+
+fn grid_to_lines(grid: &[Vec<Cell2>], th: Theme) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(grid.len());
+    for row in grid {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut buf = String::new();
+        let mut cur_fg = th.fg;
+        let mut cur_bold = false;
+        for cell in row {
+            if cell.fg != cur_fg || cell.bold != cur_bold {
+                if !buf.is_empty() {
+                    let mut style = Style::default().fg(cur_fg).bg(th.bg);
+                    if cur_bold {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    spans.push(Span::styled(std::mem::take(&mut buf), style));
+                }
+                cur_fg = cell.fg;
+                cur_bold = cell.bold;
+            }
+            buf.push(cell.ch);
+        }
+        if !buf.is_empty() {
+            let mut style = Style::default().fg(cur_fg).bg(th.bg);
+            if cur_bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(buf, style));
+        }
+        out.push(Line::from(spans));
+    }
+    out
 }
 
 /// Alphabetical list of tables in the active schema. Sourced from the
@@ -3130,267 +3461,6 @@ async fn save_mermaid_for_schema(app: &AppState) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Stable FNV-1a 64-bit hash of a string. Used to key chart renders so
-/// we can detect when the Mermaid source has changed without comparing
-/// full strings on every redraw.
-fn fnv1a64(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
-
-/// Decide whether a fresh chart render needs to start, and spawn one if
-/// so. Driven from the event loop after each frame so we react to any
-/// of: (1) Mermaid source changes, (2) inspector resizes, (3) an
-/// initial entry into the ERD tab.
-fn maybe_spawn_chart_render(app: &mut AppState) {
-    if app.detail_tab != DetailTab::Erd {
-        return;
-    }
-    if matches!(app.erd_chart.status, ErdChartStatus::Rendering) {
-        return;
-    }
-    let (w, h) = app.erd_chart.desired_size.get();
-    if w < 16 || h < 6 {
-        // Pane too small to bother rendering. Stay idle.
-        return;
-    }
-    let tables = erd_table_list(app);
-    if tables.is_empty() {
-        return;
-    }
-    let src = mermaid_erdiagram(&tables, &app.relationships, &app.erd_table_info);
-    let hash = fnv1a64(&src);
-    // Re-render only if hash or size changed meaningfully (>=2 cells in
-    // either dim — stops thrashing on 1-cell jitter from layout splits).
-    let size_changed = (w as i32 - app.erd_chart.size.0 as i32).abs() >= 2
-        || (h as i32 - app.erd_chart.size.1 as i32).abs() >= 2;
-    let hash_changed = app.erd_chart.hash != Some(hash);
-    if !hash_changed && !size_changed && matches!(app.erd_chart.status, ErdChartStatus::Ready(_)) {
-        return;
-    }
-    let Some(tx) = app.tx.clone() else {
-        return;
-    };
-    let schema = app.current_schema.clone();
-    app.erd_chart.status = ErdChartStatus::Rendering;
-    app.erd_chart.hash = Some(hash);
-    app.erd_chart.size = (w, h);
-    tokio::spawn(async move {
-        let result = render_mermaid_with_chafa(&src, w, h).await;
-        let _ = tx.send(DbMessage::ErdChart {
-            schema,
-            hash,
-            size: (w, h),
-            result,
-        });
-    });
-}
-
-/// Run the `mmdc` + `chafa` pipeline on `mermaid_src`, returning a
-/// list of styled `Line`s ready to render. Missing binaries surface
-/// as `ErdChartError::MissingTool` (caught from the OS' `NotFound`
-/// when the spawn fails). Each step is wrapped in a timeout so a hung
-/// child can never leave the chart pane stuck on `(rendering…)`.
-async fn render_mermaid_with_chafa(
-    mermaid_src: &str,
-    width: u16,
-    height: u16,
-) -> Result<Vec<Line<'static>>, ErdChartError> {
-    use std::process::Stdio;
-    use tokio::process::Command;
-    use tokio::time::{timeout, Duration};
-
-    fn install_hint(tool: &str) -> String {
-        match tool {
-            "mmdc" => "install Mermaid CLI: `npm i -g @mermaid-js/mermaid-cli`".to_owned(),
-            "chafa" => "install chafa: `sudo apt install chafa` / `brew install chafa`".to_owned(),
-            other => format!("missing tool: {other}"),
-        }
-    }
-
-    /// Map a `tokio::process` spawn outcome onto our error enum,
-    /// distinguishing a missing binary (NotFound) from a runtime
-    /// failure (timeout / non-zero exit / I/O error).
-    async fn run(
-        cmd: &mut Command,
-        tool: &'static str,
-        timeout_secs: u64,
-    ) -> Result<std::process::Output, ErdChartError> {
-        cmd.stdin(Stdio::null());
-        match timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
-            Err(_) => Err(ErdChartError::Failed(format!(
-                "{tool}: timed out after {timeout_secs}s"
-            ))),
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(ErdChartError::MissingTool(install_hint(tool)))
-            }
-            Ok(Err(e)) => Err(ErdChartError::Failed(format!("spawn {tool}: {e}"))),
-            Ok(Ok(out)) => Ok(out),
-        }
-    }
-
-    // Stage source + PNG in a tempdir so the pipeline never touches
-    // the user's working directory.
-    let tmp = tempfile::Builder::new()
-        .prefix("tsql-erd-")
-        .tempdir()
-        .map_err(|e| ErdChartError::Failed(format!("tempdir: {e}")))?;
-    let mmd_path = tmp.path().join("erd.mmd");
-    let png_path = tmp.path().join("erd.png");
-    tokio::fs::write(&mmd_path, mermaid_src.as_bytes())
-        .await
-        .map_err(|e| ErdChartError::Failed(format!("write mmd: {e}")))?;
-
-    // mmdc: render Mermaid to PNG. 60s budget covers the first-run
-    // Chromium download path; subsequent runs are sub-second.
-    let mut mmdc_cmd = Command::new("mmdc");
-    mmdc_cmd
-        .arg("-i")
-        .arg(&mmd_path)
-        .arg("-o")
-        .arg(&png_path)
-        .arg("-b")
-        .arg("transparent")
-        .arg("-t")
-        .arg("dark")
-        .arg("-w")
-        .arg("1600")
-        .arg("-H")
-        .arg("1200");
-    let mmdc_out = run(&mut mmdc_cmd, "mmdc", 60).await?;
-    if !mmdc_out.status.success() {
-        let stderr = String::from_utf8_lossy(&mmdc_out.stderr);
-        let tail: String = stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
-        return Err(ErdChartError::Failed(format!("mmdc: {tail}")));
-    }
-
-    // chafa: rasterize PNG to colored Unicode half-blocks sized for
-    // the chart pane. 10s is generous; chafa returns in milliseconds.
-    let mut chafa_cmd = Command::new("chafa");
-    chafa_cmd
-        .arg("--format=symbols")
-        .arg("--symbols=block+border")
-        .arg(format!("--size={}x{}", width, height))
-        .arg(&png_path);
-    let chafa_out = run(&mut chafa_cmd, "chafa", 10).await?;
-    if !chafa_out.status.success() {
-        let stderr = String::from_utf8_lossy(&chafa_out.stderr);
-        let tail: String = stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
-        return Err(ErdChartError::Failed(format!("chafa: {tail}")));
-    }
-
-    Ok(parse_ansi_to_lines(&chafa_out.stdout))
-}
-
-/// Translate a byte stream of ANSI SGR-coloured text into ratatui
-/// `Line`s. Handles the subset chafa actually emits: SGR `0` (reset),
-/// `1` (bold), `38;2;r;g;b` / `48;2;r;g;b` (24-bit fg/bg),
-/// `38;5;n` / `48;5;n` (256-colour palette). Anything else is
-/// swallowed silently — we'd rather drop a colour than panic on a
-/// rendering glitch.
-fn parse_ansi_to_lines(input: &[u8]) -> Vec<Line<'static>> {
-    let s = String::from_utf8_lossy(input).into_owned();
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current_line: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    let mut style = Style::default();
-
-    let flush = |buf: &mut String, current_line: &mut Vec<Span<'static>>, style: Style| {
-        if !buf.is_empty() {
-            current_line.push(Span::styled(std::mem::take(buf), style));
-        }
-    };
-
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '[' {
-            // CSI: collect parameters until terminator.
-            flush(&mut buf, &mut current_line, style);
-            i += 2;
-            let mut params = String::new();
-            while i < chars.len() {
-                let c = chars[i];
-                if c.is_ascii_alphabetic() {
-                    if c == 'm' {
-                        apply_sgr(&mut style, &params);
-                    }
-                    i += 1;
-                    break;
-                }
-                params.push(c);
-                i += 1;
-            }
-            continue;
-        }
-        if ch == '\n' {
-            flush(&mut buf, &mut current_line, style);
-            lines.push(Line::from(std::mem::take(&mut current_line)));
-            i += 1;
-            continue;
-        }
-        if ch == '\r' {
-            i += 1;
-            continue;
-        }
-        buf.push(ch);
-        i += 1;
-    }
-    flush(&mut buf, &mut current_line, style);
-    if !current_line.is_empty() {
-        lines.push(Line::from(current_line));
-    }
-    lines
-}
-
-/// Apply a single CSI `m` parameter list to a `Style`. Only the SGR
-/// codes chafa emits are handled — others are ignored.
-fn apply_sgr(style: &mut Style, params: &str) {
-    let parts: Vec<&str> = params.split(';').collect();
-    let mut i = 0;
-    while i < parts.len() {
-        let n: u32 = parts[i].parse().unwrap_or(0);
-        match n {
-            0 => *style = Style::default(),
-            1 => *style = style.add_modifier(Modifier::BOLD),
-            22 => *style = style.remove_modifier(Modifier::BOLD),
-            38 if i + 4 < parts.len() && parts[i + 1] == "2" => {
-                let r = parts[i + 2].parse().unwrap_or(0);
-                let g = parts[i + 3].parse().unwrap_or(0);
-                let b = parts[i + 4].parse().unwrap_or(0);
-                *style = style.fg(Color::Rgb(r, g, b));
-                i += 4;
-            }
-            48 if i + 4 < parts.len() && parts[i + 1] == "2" => {
-                let r = parts[i + 2].parse().unwrap_or(0);
-                let g = parts[i + 3].parse().unwrap_or(0);
-                let b = parts[i + 4].parse().unwrap_or(0);
-                *style = style.bg(Color::Rgb(r, g, b));
-                i += 4;
-            }
-            38 if i + 2 < parts.len() && parts[i + 1] == "5" => {
-                let idx = parts[i + 2].parse().unwrap_or(0);
-                *style = style.fg(Color::Indexed(idx));
-                i += 2;
-            }
-            48 if i + 2 < parts.len() && parts[i + 1] == "5" => {
-                let idx = parts[i + 2].parse().unwrap_or(0);
-                *style = style.bg(Color::Indexed(idx));
-                i += 2;
-            }
-            39 => *style = style.fg(Color::Reset),
-            49 => *style = style.bg(Color::Reset),
-            _ => {}
-        }
-        i += 1;
-    }
-}
-
 // ─── SQL editor pane ──────────────────────────────────────────────────────────
 
 fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -3686,22 +3756,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_ansi_to_lines_decodes_24bit_color_and_newlines() {
-        // Two cells: red 'A' on a blue bg, then a reset and a plain 'B'
-        // followed by a newline and an unstyled 'C'.
-        let bytes = b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255mA\x1b[0mB\nC";
-        let lines = super::parse_ansi_to_lines(bytes);
-        assert_eq!(lines.len(), 2, "newline produces two lines");
-        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(first, "AB");
-        // The first span should hold the styled 'A' with the rgb fg/bg.
-        let a = &lines[0].spans[0];
-        assert_eq!(a.content.as_ref(), "A");
-        assert_eq!(a.style.fg, Some(super::Color::Rgb(255, 0, 0)));
-        assert_eq!(a.style.bg, Some(super::Color::Rgb(0, 0, 255)));
-    }
-
-    #[test]
     fn mermaid_erdiagram_emits_columns_and_relationships() {
         use std::collections::HashMap;
         use tsql_db::{ColumnInfo, PrimaryKeyInfo, RelationshipEdge, TableInfo};
@@ -3788,5 +3842,74 @@ mod tests {
         assert_ne!(a, c, "different input produces different hash");
         assert!(a.starts_with("url_"));
         assert!(a[4..].chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn focus_canvas_renders_centre_box_and_arrows() {
+        use tsql_db::{ColumnInfo, ForeignKeyInfo, PrimaryKeyInfo, RelationshipEdge, TableInfo};
+
+        let orders = TableInfo {
+            name: "orders".to_owned(),
+            schema: "public".to_owned(),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    data_type: "int4".to_owned(),
+                    is_nullable: false,
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "customer_id".to_owned(),
+                    data_type: "int4".to_owned(),
+                    is_nullable: false,
+                    default_value: None,
+                },
+            ],
+            indexes: vec![],
+            primary_key: Some(PrimaryKeyInfo {
+                name: "pk".to_owned(),
+                column_names: vec!["id".to_owned()],
+            }),
+            foreign_keys: vec![ForeignKeyInfo {
+                name: "fk".to_owned(),
+                column_names: vec!["customer_id".to_owned()],
+                referenced_table: "customers".to_owned(),
+                referenced_columns: vec!["id".to_owned()],
+            }],
+            constraints: vec![],
+        };
+        let edge = RelationshipEdge {
+            from_table: "orders".to_owned(),
+            from_columns: vec!["customer_id".to_owned()],
+            to_table: "customers".to_owned(),
+            to_columns: vec!["id".to_owned()],
+        };
+        let outgoing: Vec<&RelationshipEdge> = vec![&edge];
+        let incoming: Vec<&RelationshipEdge> = Vec::new();
+        let lines = super::render_focus_canvas(
+            80,
+            14,
+            "orders",
+            Some(&orders),
+            &incoming,
+            &outgoing,
+            Theme::catppuccin_mocha(),
+        );
+        let dump: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(dump.contains("orders"), "centre table name rendered");
+        assert!(dump.contains("customers"), "neighbour rendered");
+        assert!(dump.contains("customer_id"), "FK column on the arrow label");
+        assert!(dump.contains('▶'), "arrowhead drawn");
+        assert!(dump.contains('★'), "PK marker on centre column");
+        assert!(dump.contains('⚷'), "FK marker on centre column");
     }
 }
