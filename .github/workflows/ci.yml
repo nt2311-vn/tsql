@@ -14,6 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Format + clippy run on a single OS — they don't exercise platform
+  # behaviour, just lint the source. Linux is fastest on GitHub-hosted
+  # runners.
   format:
     name: format
     runs-on: ubuntu-latest
@@ -47,9 +50,19 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # Build + unit/integration tests run across every OS we ship binaries
+  # for. macOS catches platform-specific regressions (path separators,
+  # signal handling, terminal capabilities, default config locations)
+  # before they hit users. Windows isn't in the matrix yet — the
+  # crossterm Windows backend works, but `dirs` config-dir semantics
+  # differ enough that we'd want a dedicated pass first.
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -59,6 +72,16 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          # The macos-latest runners are arm64; partition the cache so
+          # they don't fight the x86_64 Linux artifacts.
+          key: ${{ matrix.os }}
+
+      - name: Show toolchain
+        run: rustc --version --verbose
+
+      - name: Build (workspace)
+        run: cargo build --workspace --all-features
 
       - name: Run tests
         run: cargo test --workspace --all-features
@@ -78,12 +101,14 @@ jobs:
 
       - name: Audit dependencies
         # RUSTSEC-2023-0071 (RSA Marvin timing sidechannel) has no
-        # upstream fix and only reaches us transitively through
-        # `sqlx-mysql`, which we don't enable. Mirror the ignore in
-        # `just audit` so the workflow stays green; revisit when
-        # sqlx 0.9 ships with a patched MySQL driver.
+        # upstream fix and reaches us transitively through `sqlx-mysql`.
+        # Mirror the ignore in `just audit` so the workflow stays green;
+        # revisit when sqlx 0.9 ships with a patched MySQL driver.
         run: cargo audit --ignore RUSTSEC-2023-0071
 
+  # Postgres integration test stays Linux-only because GitHub-hosted
+  # runners only expose `services:` containers on Linux. macOS builds
+  # already covered the metadata fetchers via SQLite + MySQL unit tests.
   postgres-integration:
     name: postgres-integration
     runs-on: ubuntu-latest

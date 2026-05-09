@@ -82,11 +82,36 @@ sqlite-down db="erp.db":
     rm -f {{db}}
     @echo "removed {{db}}"
 
+# Start the dockerized MySQL (localhost:33069) seeded from seed/mysql/.
+mysql-up:
+    {{docker_compose}} up -d --wait mysql
+    @echo "mysql ready — try: tsql tui --url mysql://tsql:tsql@127.0.0.1:33069/tsql"
+
+# Stop just the MySQL container; leaves Postgres / MariaDB untouched.
+mysql-down:
+    {{docker_compose}} stop mysql
+    {{docker_compose}} rm -f mysql
+
+# Wipe the MySQL data so the next `mysql-up` re-runs the seed scripts.
+mysql-reseed:
+    {{docker_compose}} down --volumes --remove-orphans mysql
+    just mysql-up
+
+# Start the dockerized MariaDB (localhost:33079) using the same seed.
+mariadb-up:
+    {{docker_compose}} up -d --wait mariadb
+    @echo "mariadb ready — try: tsql tui --url mariadb://tsql:tsql@127.0.0.1:33079/tsql"
+
+# Stop just the MariaDB container.
+mariadb-down:
+    {{docker_compose}} stop mariadb
+    {{docker_compose}} rm -f mariadb
+
 # Bring up every driver sandbox at once.
-drivers-up: postgres-up sqlite-up
+drivers-up: postgres-up sqlite-up mysql-up mariadb-up
 
 # Tear down every driver sandbox at once.
-drivers-down: postgres-down sqlite-down
+drivers-down: postgres-down sqlite-down mysql-down mariadb-down
 
 # Backward-compatible aliases for the original Postgres-only recipes.
 alias up := postgres-up

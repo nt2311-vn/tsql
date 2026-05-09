@@ -49,10 +49,16 @@ impl Default for ProjectInfo {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "lowercase")]
 pub enum DriverKind {
     Postgres,
     Sqlite,
+    /// MySQL and MariaDB share the wire protocol; sqlx's `mysql`
+    /// feature speaks both. URLs starting with either `mysql://` or
+    /// `mariadb://` resolve here. `driver = "mariadb"` is also
+    /// accepted in the TOML config as a friendly alias.
+    #[serde(alias = "mariadb")]
+    Mysql,
 }
 
 impl DriverKind {
@@ -61,11 +67,24 @@ impl DriverKind {
             Ok(Self::Postgres)
         } else if url.starts_with("sqlite:") {
             Ok(Self::Sqlite)
+        } else if url.starts_with("mysql://") || url.starts_with("mariadb://") {
+            Ok(Self::Mysql)
         } else {
             Err(ConfigError::UnsupportedDriver(
                 url.split(':').next().unwrap_or(url).to_owned(),
             ))
         }
+    }
+
+    /// MySQL deserves both spellings of its scheme. sqlx's `MySqlPool`
+    /// only accepts `mysql://`, so we normalise on connect.
+    pub fn normalise_url(self, url: &str) -> String {
+        if matches!(self, Self::Mysql) {
+            if let Some(rest) = url.strip_prefix("mariadb://") {
+                return format!("mysql://{rest}");
+            }
+        }
+        url.to_owned()
     }
 }
 
@@ -143,6 +162,7 @@ pub async fn append_connection(
     let driver = match connection.driver {
         DriverKind::Postgres => "postgres",
         DriverKind::Sqlite => "sqlite",
+        DriverKind::Mysql => "mysql",
     };
     let escaped_url = connection.url.replace('\\', "\\\\").replace('"', "\\\"");
     let mut block = String::new();
@@ -364,6 +384,27 @@ mod tests {
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(raw.contains("${DATABASE_URL}"), "placeholder lost: {raw:?}");
         assert!(raw.contains("[connections.dev]"));
+    }
+
+    #[test]
+    fn default_config_path_resolves_on_every_platform() {
+        // Smoke test: the config path resolution shouldn't panic on
+        // macOS, Linux, or anywhere else `dirs::home_dir()` returns a
+        // value. Running this in CI on `macos-latest` gives us a
+        // platform-specific signal that the path code is portable.
+        // We deliberately don't mutate XDG_CONFIG_HOME here because
+        // `cargo test` runs tests in parallel and env mutation is racy.
+        let path = default_config_path();
+        assert!(
+            path.ends_with("tsql/config.toml") || path.ends_with("tsql\\config.toml"),
+            "unexpected suffix: {}",
+            path.display(),
+        );
+        assert!(
+            path.is_absolute() || path.starts_with("."),
+            "config path should be absolute or relative-to-cwd: {}",
+            path.display(),
+        );
     }
 
     #[tokio::test]

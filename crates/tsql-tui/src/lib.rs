@@ -7,7 +7,9 @@ mod editor;
 use editor::{append_history, highlight_line, history_path, load_history, statement_range_at};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -229,6 +231,10 @@ struct AppState {
     record_offset: usize,
     record_row: usize,
     record_col: usize,
+    /// First visible record column. `Cell` so `draw_records` can slide
+    /// the horizontal window without taking `&mut`. Reset on each
+    /// table load so column counts changing don't leave a stale offset.
+    record_col_offset: std::cell::Cell<usize>,
     record_table_state: TableState,
     relationships: Vec<RelationshipEdge>,
     /// Row index into `relationships` selected on the ERD tab. Used by
@@ -246,6 +252,10 @@ struct AppState {
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
     editor_cursor: usize,
+    /// First visible line in the editor pane (vertical scroll offset).
+    /// Stored in a `Cell` so `draw_editor` can adjust it on the fly to
+    /// keep the cursor inside the viewport without taking `&mut self`.
+    editor_scroll: std::cell::Cell<usize>,
     /// Optional file backing the editor buffer (`Ctrl+S` writes here,
     /// `:w <path>` retargets it). `None` means in-memory only.
     editor_path: Option<PathBuf>,
@@ -303,6 +313,7 @@ impl AppState {
             record_offset: 0,
             record_row: 0,
             record_col: 0,
+            record_col_offset: std::cell::Cell::new(0),
             record_table_state: ts,
             relationships: Vec::new(),
             erd_selected: 0,
@@ -310,6 +321,7 @@ impl AppState {
             erd_chart_fullscreen: false,
             editor: String::new(),
             editor_cursor: 0,
+            editor_scroll: std::cell::Cell::new(0),
             editor_path: None,
             history_path: None,
             history: Vec::new(),
@@ -438,13 +450,46 @@ async fn run_loop(
         if !event::poll(Duration::from_millis(33))? {
             continue;
         }
-        if let Event::Key(key) = event::read()? {
-            if handle_key(app, key).await? {
-                break;
-            }
+        match event::read()? {
+            Event::Key(key) if handle_key(app, key).await? => break,
+            Event::Paste(text) => handle_paste(app, &text),
+            _ => {}
         }
     }
     Ok(())
+}
+
+/// Bracketed-paste handler. Routes the pasted text to whichever buffer
+/// is currently active so users can dump a multi-line SQL script into
+/// the editor or paste a connection URL into the picker without losing
+/// newlines or churning through the per-key insert path.
+fn handle_paste(app: &mut AppState, text: &str) {
+    // Strip the optional CR from CRLF terminators — pastes from Windows
+    // clipboards or DOS-line files would otherwise leave stray `\r` in
+    // the buffer that look like garbage in the gutter.
+    let cleaned = text.replace("\r\n", "\n").replace('\r', "\n");
+    match app.mode {
+        AppMode::Editor => {
+            editor_insert_str(app, &cleaned);
+            app.history_idx = None;
+            let lines = cleaned.matches('\n').count() + 1;
+            app.status = format!("pasted {} chars / {} line(s)", cleaned.len(), lines);
+        }
+        AppMode::Connect
+            if matches!(
+                app.connect_focus,
+                ConnectFocus::NewUrl | ConnectFocus::NameNew
+            ) =>
+        {
+            // URL / name fields are single-line — collapse newlines.
+            app.connect_input.push_str(&cleaned.replace('\n', ""));
+        }
+        _ => {
+            if let Some(buf) = app.command_input.as_mut() {
+                buf.push_str(&cleaned.replace('\n', " "));
+            }
+        }
+    }
 }
 
 /// Apply the result of a background metadata fetch to `AppState`.
@@ -679,6 +724,7 @@ fn close_current_table(app: &mut AppState) {
     app.record_offset = 0;
     app.record_row = 0;
     app.record_col = 0;
+    app.record_col_offset.set(0);
     app.record_table_state.select(Some(0));
     app.pane = BrowserPane::Sidebar;
     app.detail_tab = DetailTab::Records;
@@ -744,6 +790,8 @@ fn qualified_table(app: &AppState) -> String {
     match app.driver {
         DriverKind::Postgres => format!("\"{}\".\"{}\"", app.current_schema, app.current_table),
         DriverKind::Sqlite => format!("\"{}\"", app.current_table),
+        // MySQL identifiers use backticks; the schema is the active database.
+        DriverKind::Mysql => format!("`{}`.`{}`", app.current_schema, app.current_table),
     }
 }
 
@@ -787,9 +835,12 @@ async fn handle_new_url_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
             app.status = "j/k navigate  Enter connect  n new connection  q quit".to_owned();
         }
         KeyCode::Tab => {
+            // Cycle Postgres → SQLite → MySQL → Postgres so all drivers
+            // are reachable from a single key with no shift / chord.
             app.driver = match app.driver {
                 DriverKind::Postgres => DriverKind::Sqlite,
-                DriverKind::Sqlite => DriverKind::Postgres,
+                DriverKind::Sqlite => DriverKind::Mysql,
+                DriverKind::Mysql => DriverKind::Postgres,
             };
         }
         KeyCode::Backspace => {
@@ -1737,6 +1788,7 @@ fn draw_connect(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                 let driver_badge = match conn.driver {
                     DriverKind::Postgres => "PG",
                     DriverKind::Sqlite => "SQ",
+                    DriverKind::Mysql => "MY",
                 };
                 let sel = i == app.connect_idx && app.connect_focus == ConnectFocus::Picker;
                 let st = if sel {
@@ -1795,6 +1847,7 @@ fn draw_connect(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let driver_label = match app.driver {
         DriverKind::Postgres => "Postgres",
         DriverKind::Sqlite => "SQLite",
+        DriverKind::Mysql => "MySQL/MariaDB",
     };
 
     f.render_widget(
@@ -1891,6 +1944,7 @@ fn draw_header(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let driver_label = match app.driver {
         DriverKind::Postgres => "PG",
         DriverKind::Sqlite => "SQ",
+        DriverKind::Mysql => "MY",
     };
     let mode_badge = match app.mode {
         AppMode::Connect => " CONNECT ",
@@ -2082,28 +2136,56 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
-    // Build a zebra-striped grid with vertical column separators. The
-    // widths vector interleaves data columns with 1-wide separator
-    // columns so ratatui's Table draws them as siblings; we render a
-    // styled `│` glyph in each separator slot.
-    let col_count = rec.columns.len().max(1);
+    // ── Horizontal column window ───────────────────────────────
+    // At narrow widths (e.g. half-screen Tmux pane) splitting every
+    // column equally turns each cell into 4–5 chars of garbage. Pick a
+    // sensible minimum cell width (12 cells) and only render as many
+    // columns as fit, with the focused column always visible. `[`/`]`
+    // moves focus, the window slides to follow.
+    let col_total = rec.columns.len();
+    // 14 cells per column = enough to show a `YYYY-MM-DD` date or a
+    // short numeric value with one space of padding. Anything narrower
+    // and even the date prefix in an RFC3339 timestamp gets clipped.
+    let min_cell: u16 = 14;
+    let inner_w = area.width.max(1);
+    let max_cols = ((inner_w + 1) / (min_cell + 1)).max(1) as usize;
+    let visible = col_total.min(max_cols);
+
+    // Slide the offset so `record_col` stays inside [offset, offset+visible).
+    let mut col_off = app
+        .record_col_offset
+        .get()
+        .min(col_total.saturating_sub(visible));
+    if app.record_col < col_off {
+        col_off = app.record_col;
+    } else if app.record_col >= col_off + visible {
+        col_off = app.record_col + 1 - visible;
+    }
+    col_off = col_off.min(col_total.saturating_sub(visible));
+    app.record_col_offset.set(col_off);
+
+    let col_end = (col_off + visible).min(col_total);
+    let visible_count = col_end - col_off;
     let total_pct = 100u16;
-    let sep_count = col_count.saturating_sub(1) as u16;
-    let sep_width = sep_count; // 1 cell each
-    let data_pct = (total_pct.saturating_sub(sep_width) / col_count as u16).max(1);
-    let widths: Vec<Constraint> = build_grid_widths(col_count, data_pct);
+    let sep_count = visible_count.saturating_sub(1) as u16;
+    let data_pct = (total_pct.saturating_sub(sep_count) / visible_count.max(1) as u16).max(1);
+    let widths: Vec<Constraint> = build_grid_widths(visible_count, data_pct);
 
     let header_cells: Vec<Cell<'_>> = interleave_separators(
-        rec.columns.iter().enumerate().map(|(ci, name)| {
-            let st = if ci == app.record_col {
-                Style::default()
-                    .fg(th.accent)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-            };
-            ccell(name.as_str(), st)
-        }),
+        rec.columns[col_off..col_end]
+            .iter()
+            .enumerate()
+            .map(|(off_idx, name)| {
+                let ci = col_off + off_idx;
+                let st = if ci == app.record_col {
+                    Style::default()
+                        .fg(th.accent)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                };
+                ccell(name.as_str(), st)
+            }),
         th,
         /* row_bg */ th.sel_bg,
     );
@@ -2124,18 +2206,25 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                 th.bg
             };
             let cells = interleave_separators(
-                row.iter().enumerate().map(|(ci, val)| {
-                    let st = if ri == app.record_row && ci == app.record_col {
-                        Style::default().fg(th.bg).bg(th.accent)
-                    } else if ri == app.record_row {
-                        Style::default().fg(th.sel_fg).bg(row_bg)
-                    } else if val == "NULL" {
-                        Style::default().fg(th.muted).bg(row_bg)
-                    } else {
-                        Style::default().fg(th.fg).bg(row_bg)
-                    };
-                    ccell(val.as_str(), st)
-                }),
+                row[col_off.min(row.len())..col_end.min(row.len())]
+                    .iter()
+                    .enumerate()
+                    .map(|(off_idx, val)| {
+                        let ci = col_off + off_idx;
+                        let st = if ri == app.record_row && ci == app.record_col {
+                            Style::default().fg(th.bg).bg(th.accent)
+                        } else if ri == app.record_row {
+                            Style::default().fg(th.sel_fg).bg(row_bg)
+                        } else if val == "NULL" {
+                            Style::default().fg(th.muted).bg(row_bg)
+                        } else {
+                            Style::default().fg(th.fg).bg(row_bg)
+                        };
+                        // Left-align body values so a too-wide cell
+                        // truncates from the right (date prefix wins
+                        // over timezone suffix). Headers stay centred.
+                        lcell(format!(" {val}"), st)
+                    }),
                 th,
                 row_bg,
             );
@@ -2144,11 +2233,33 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .collect();
 
     let mut ts = app.record_table_state;
+    let table_area = if col_total > visible_count {
+        // Reserve the bottom row for a scroll indicator so the user
+        // knows there are columns out of view.
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(area);
+        let hint = format!(
+            "  cols {}–{} / {}   [/] scroll",
+            col_off + 1,
+            col_end,
+            col_total
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(th.muted)))
+                .style(Style::default().bg(th.bg)),
+            split[1],
+        );
+        split[0]
+    } else {
+        area
+    };
     f.render_stateful_widget(
         Table::new(rows, widths)
             .header(header)
             .row_highlight_style(Style::default().bg(th.sel_bg)),
-        area,
+        table_area,
         &mut ts,
     );
 }
@@ -2157,6 +2268,14 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 /// tab so headers and body values share the same alignment treatment.
 fn ccell<'a>(content: impl Into<std::borrow::Cow<'a, str>>, style: Style) -> Cell<'a> {
     Cell::from(Line::from(Span::raw(content)).alignment(Alignment::Center)).style(style)
+}
+
+/// Build a left-aligned `Cell`. Used for record body values where the
+/// content can be longer than the column width — left-alignment keeps
+/// the meaningful prefix visible (e.g. `2026-01-05T…` instead of
+/// `-01-05T09:15:00+0` produced by centre-truncation).
+fn lcell<'a>(content: impl Into<std::borrow::Cow<'a, str>>, style: Style) -> Cell<'a> {
+    Cell::from(Line::from(Span::raw(content)).alignment(Alignment::Left)).style(style)
 }
 
 /// Produce `[data, sep, data, sep, …, data]` width constraints for an
@@ -2270,16 +2389,19 @@ fn draw_columns(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         })
         .collect();
 
+    // Mix of fixed-min lengths and percentages: at narrow widths the
+    // PK/FK/Nullable cells shrink to their minimum (the symbol/word
+    // they hold), leaving the percentage columns to absorb the rest.
     f.render_widget(
         Table::new(
             rows,
             [
-                Constraint::Percentage(25),
-                Constraint::Percentage(22),
-                Constraint::Percentage(6),
-                Constraint::Percentage(6),
-                Constraint::Percentage(12),
-                Constraint::Percentage(29),
+                Constraint::Min(10),
+                Constraint::Min(8),
+                Constraint::Length(4),
+                Constraint::Length(4),
+                Constraint::Length(8),
+                Constraint::Min(6),
             ],
         )
         .header(header),
@@ -2354,11 +2476,11 @@ fn draw_indexes(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         Table::new(
             rows,
             [
-                Constraint::Percentage(30),
-                Constraint::Percentage(35),
-                Constraint::Length(8),
-                Constraint::Length(4),
-                Constraint::Percentage(15),
+                Constraint::Min(12),
+                Constraint::Min(10),
+                Constraint::Length(7),
+                Constraint::Length(3),
+                Constraint::Length(7),
             ],
         )
         .header(header),
@@ -2427,10 +2549,10 @@ fn draw_keys(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         Table::new(
             rows,
             [
-                Constraint::Length(6),
-                Constraint::Percentage(30),
-                Constraint::Percentage(30),
-                Constraint::Percentage(34),
+                Constraint::Length(4),
+                Constraint::Min(10),
+                Constraint::Min(10),
+                Constraint::Min(10),
             ],
         )
         .header(header),
@@ -2469,11 +2591,7 @@ fn draw_constraints(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .collect();
 
     f.render_widget(
-        Table::new(
-            rows,
-            [Constraint::Percentage(35), Constraint::Percentage(65)],
-        )
-        .header(header),
+        Table::new(rows, [Constraint::Min(12), Constraint::Min(20)]).header(header),
         area,
     );
 }
@@ -2734,19 +2852,37 @@ fn render_focus_canvas(
         centre_rows.push(("(loading…)".to_owned(), th.muted, false));
     }
 
-    // Box width = max content + 2 padding. Cap so neighbours fit.
+    // Side card width scales with available width. We never go below
+    // 14 (room for ~10 chars of table name) since otherwise the box
+    // truncates short table names like `customers` mid-word.
+    let side_box_w: usize = if w < 80 {
+        14
+    } else if w < 110 {
+        16
+    } else {
+        18
+    };
+    let side_box_h: usize = 3;
+    let arrow_pad: usize = 4;
+
+    // Box width = max content + 2 padding. Cap so neighbours fit if at
+    // all possible — at narrow widths we'd rather truncate the centre
+    // card body than push neighbour cards off-screen.
     let max_centre_w = centre_rows
         .iter()
         .map(|(s, _, _)| s.chars().count())
         .max()
         .unwrap_or(8);
-    let centre_box_w = (max_centre_w + 4).min(w.saturating_sub(8));
-    let centre_box_w = centre_box_w.max(centre_name.chars().count() + 4);
+    // Reserve enough room for at least one side + arrow when w >= 50.
+    let reserved = if w >= 50 {
+        side_box_w + arrow_pad + 2
+    } else {
+        4
+    };
+    let centre_box_w = (max_centre_w + 4)
+        .min(w.saturating_sub(reserved))
+        .max(centre_name.chars().count() + 4);
     let centre_box_h = (centre_rows.len() + 2).min(h);
-
-    // Side card width: tight.
-    let side_box_w: usize = 18;
-    let side_box_h: usize = 3;
 
     // Decide how many neighbours we can show vertically with 1-row gap.
     let stack_capacity = (h.saturating_sub(1) / (side_box_h + 1)).max(1);
@@ -2755,7 +2891,6 @@ fn render_focus_canvas(
 
     // Lay out columns horizontally. If the pane is too narrow drop
     // neighbours first; centre always renders.
-    let arrow_pad: usize = 4;
     let needed_w_both = side_box_w + arrow_pad + centre_box_w + arrow_pad + side_box_w;
     let needed_w_one = side_box_w + arrow_pad + centre_box_w;
     let (show_left, show_right) = if w >= needed_w_both {
@@ -3476,6 +3611,9 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             t.push_str(&p.display().to_string());
             t.push_str("  ");
         }
+        let (cl, cc) = line_col(&app.editor, app.editor_cursor);
+        let total_lines = app.editor.lines().count().max(1);
+        t.push_str(&format!("[Ln {}:{} / {}]  ", cl + 1, cc + 1, total_lines));
         t.push_str("Ctrl+R run all  Ctrl+Enter run current  Ctrl+S save  ");
         if !app.history.is_empty() {
             t.push_str(&format!("Ctrl+P/N hist ({})  ", app.history.len()));
@@ -3507,11 +3645,29 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .split(editor_inner);
     let gutter_area = editor_layout[0];
     let text_area = editor_layout[1];
+    let viewport_h = text_area.height as usize;
 
     // Current-statement byte range, used to highlight the active SQL.
     let stmt_range = statement_range_at(&app.editor, app.editor_cursor);
 
     let (cursor_line, cursor_col) = line_col(&app.editor, app.editor_cursor);
+
+    // Auto-scroll: keep the cursor row inside the viewport. Two-step
+    // clamp — first push the offset down if cursor fell off the bottom,
+    // then up if cursor scrolled above the top. Single-line jumps don't
+    // surprise; jumping to top/bottom (Ctrl+Home equivalents) snaps.
+    let mut scroll = app.editor_scroll.get();
+    if viewport_h > 0 {
+        if cursor_line >= scroll + viewport_h {
+            scroll = cursor_line + 1 - viewport_h;
+        }
+        if cursor_line < scroll {
+            scroll = cursor_line;
+        }
+        let max_scroll = line_count.saturating_sub(viewport_h);
+        scroll = scroll.min(max_scroll);
+        app.editor_scroll.set(scroll);
+    }
 
     let mut byte_offset = 0usize;
     let mut gutter_lines: Vec<Line> = Vec::new();
@@ -3519,6 +3675,13 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     for (idx, line) in app.editor.split('\n').enumerate() {
         let line_start = byte_offset;
         let line_end = line_start + line.len();
+        byte_offset = line_end + 1; // +1 for the '\n' we split on
+        if idx < scroll {
+            continue;
+        }
+        if idx >= scroll + viewport_h && viewport_h > 0 {
+            break;
+        }
         let in_stmt = stmt_range.start <= line_end && line_start <= stmt_range.end;
         let line_bg = if in_stmt && !line.trim().is_empty() {
             th.row_alt_bg
@@ -3541,7 +3704,6 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 
         let mut spans = highlight_line(line, th);
         for span in &mut spans {
-            // Apply the per-line background by patching each span's style.
             let mut st = span.style;
             st.bg = Some(line_bg);
             span.style = st;
@@ -3550,7 +3712,6 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             spans.push(Span::styled(" ", Style::default().bg(line_bg)));
         }
         text_lines.push(Line::from(spans));
-        byte_offset = line_end + 1; // +1 for the '\n' we split on
     }
 
     f.render_widget(
@@ -3558,15 +3719,16 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         gutter_area,
     );
     f.render_widget(
-        Paragraph::new(text_lines)
-            .style(Style::default().fg(th.fg).bg(th.bg))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(text_lines).style(Style::default().fg(th.fg).bg(th.bg)),
         text_area,
     );
 
-    // Position the terminal's hardware cursor inside the text pane.
+    // Position the terminal's hardware cursor inside the text pane,
+    // accounting for the active scroll offset so it lands on the right
+    // visible row.
+    let visible_row = cursor_line.saturating_sub(scroll);
     let cx = text_area.x + (cursor_col as u16).min(text_area.width.saturating_sub(1));
-    let cy = text_area.y + (cursor_line as u16).min(text_area.height.saturating_sub(1));
+    let cy = text_area.y + (visible_row as u16).min(text_area.height.saturating_sub(1));
     f.set_cursor_position((cx, cy));
 
     // ── Results pane: same grid as the Records tab ──
@@ -3614,7 +3776,10 @@ fn muted_para<'a>(text: &'a str, th: Theme) -> Paragraph<'a> {
 fn setup_terminal() -> Result<Terminal<ratatui::backend::CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Bracketed paste lets us receive a multi-line clipboard in a single
+    // `Event::Paste(String)` instead of streaming each character — it's
+    // both faster and keeps history sane (one paste = one history entry).
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     Terminal::new(ratatui::backend::CrosstermBackend::new(stdout)).map_err(Into::into)
 }
 
@@ -3622,7 +3787,11 @@ fn restore_terminal(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -3630,9 +3799,9 @@ fn restore_terminal(
 #[cfg(test)]
 mod tests {
     use super::{
-        close_current_table, line_col, line_end, line_start, move_cursor_vertical,
-        next_char_boundary, prev_char_boundary, short_hash, unique_connection_name, AppState,
-        ConnectionConfig, DetailTab, DriverKind, Theme, ALL_TABS,
+        close_current_table, handle_paste, line_col, line_end, line_start, move_cursor_vertical,
+        next_char_boundary, prev_char_boundary, short_hash, unique_connection_name, AppMode,
+        AppState, ConnectionConfig, DetailTab, DriverKind, Theme, ALL_TABS,
     };
 
     #[test]
@@ -3911,5 +4080,117 @@ mod tests {
         assert!(dump.contains('▶'), "arrowhead drawn");
         assert!(dump.contains('★'), "PK marker on centre column");
         assert!(dump.contains('⚷'), "FK marker on centre column");
+    }
+
+    #[test]
+    fn focus_canvas_renders_neighbours_in_half_width_pane() {
+        // Half-screen pane: 60 cols × 12 rows. Centre + at least one
+        // neighbour should both be visible.
+        use tsql_db::{ColumnInfo, ForeignKeyInfo, PrimaryKeyInfo, RelationshipEdge, TableInfo};
+        let orders = TableInfo {
+            name: "orders".to_owned(),
+            schema: "public".to_owned(),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    data_type: "int4".to_owned(),
+                    is_nullable: false,
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "customer_id".to_owned(),
+                    data_type: "int4".to_owned(),
+                    is_nullable: false,
+                    default_value: None,
+                },
+            ],
+            indexes: vec![],
+            primary_key: Some(PrimaryKeyInfo {
+                name: "pk".to_owned(),
+                column_names: vec!["id".to_owned()],
+            }),
+            foreign_keys: vec![ForeignKeyInfo {
+                name: "fk".to_owned(),
+                column_names: vec!["customer_id".to_owned()],
+                referenced_table: "customers".to_owned(),
+                referenced_columns: vec!["id".to_owned()],
+            }],
+            constraints: vec![],
+        };
+        let edge = RelationshipEdge {
+            from_table: "orders".to_owned(),
+            from_columns: vec!["customer_id".to_owned()],
+            to_table: "customers".to_owned(),
+            to_columns: vec!["id".to_owned()],
+        };
+        let outgoing: Vec<&RelationshipEdge> = vec![&edge];
+        let incoming: Vec<&RelationshipEdge> = Vec::new();
+        let lines = super::render_focus_canvas(
+            60,
+            12,
+            "orders",
+            Some(&orders),
+            &incoming,
+            &outgoing,
+            Theme::catppuccin_mocha(),
+        );
+        let dump: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(dump.contains("orders"), "centre still rendered at 60 cols");
+        assert!(
+            dump.contains("customers"),
+            "neighbour still rendered at 60 cols"
+        );
+        assert!(dump.contains('▶'), "arrowhead present at narrow width");
+        // Line widths must not exceed the requested pane width.
+        for line in &lines {
+            let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(len <= 60, "line of {len} chars exceeds 60-col pane");
+        }
+    }
+
+    #[test]
+    fn handle_paste_inserts_multiline_at_cursor_in_editor() {
+        let mut app = AppState::new(DriverKind::Sqlite, "sqlite::memory:".to_owned());
+        app.mode = AppMode::Editor;
+        app.editor = "SELECT 1;".to_owned();
+        app.editor_cursor = app.editor.len();
+        handle_paste(&mut app, "\nSELECT 2;\nSELECT 3;");
+        assert_eq!(app.editor, "SELECT 1;\nSELECT 2;\nSELECT 3;");
+        assert_eq!(app.editor_cursor, app.editor.len());
+        assert!(app.status.contains("3 line"), "status reports line count");
+    }
+
+    #[test]
+    fn handle_paste_normalises_crlf_to_lf() {
+        let mut app = AppState::new(DriverKind::Sqlite, "sqlite::memory:".to_owned());
+        app.mode = AppMode::Editor;
+        handle_paste(&mut app, "a\r\nb\r\nc");
+        assert_eq!(app.editor, "a\nb\nc", "CRLF and stray CR collapse to LF");
+    }
+
+    #[test]
+    fn driver_kind_detects_mysql_and_mariadb_urls() {
+        assert_eq!(
+            DriverKind::from_url("mysql://u:p@h/db").unwrap(),
+            DriverKind::Mysql
+        );
+        assert_eq!(
+            DriverKind::from_url("mariadb://u:p@h/db").unwrap(),
+            DriverKind::Mysql
+        );
+        assert_eq!(
+            DriverKind::Mysql.normalise_url("mariadb://u:p@h/db"),
+            "mysql://u:p@h/db",
+            "mariadb scheme rewrites to mysql for sqlx"
+        );
     }
 }
