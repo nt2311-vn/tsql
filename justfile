@@ -107,11 +107,27 @@ mariadb-down:
     {{docker_compose}} stop mariadb
     {{docker_compose}} rm -f mariadb
 
+# Start the dockerized MS SQL Server 2022 (localhost:14330). Empty
+# server — sa / Tsqlx_Pass1.  Strong password is mandatory.
+mssql-up:
+    {{docker_compose}} up -d --wait mssql
+    @echo "mssql ready — try: tsqlx tui --url 'mssql://sa:Tsqlx_Pass1@127.0.0.1:14330/master?encrypt=off&trust_cert=true'"
+
+# Stop just the MSSQL container.
+mssql-down:
+    {{docker_compose}} stop mssql
+    {{docker_compose}} rm -f mssql
+
+# Run the MSSQL integration tests against the dockerized server.
+test-mssql:
+    TSQLX_TEST_MSSQL_URL='mssql://sa:Tsqlx_Pass1@127.0.0.1:14330/master?encrypt=off&trust_cert=true' \
+        cargo test -p tsqlx-db --test mssql -- --ignored
+
 # Bring up every driver sandbox at once.
-drivers-up: postgres-up sqlite-up mysql-up mariadb-up
+drivers-up: postgres-up sqlite-up mysql-up mariadb-up mssql-up
 
 # Tear down every driver sandbox at once.
-drivers-down: postgres-down sqlite-down mysql-down mariadb-down
+drivers-down: postgres-down sqlite-down mysql-down mariadb-down mssql-down
 
 # Backward-compatible aliases for the original Postgres-only recipes.
 alias up := postgres-up

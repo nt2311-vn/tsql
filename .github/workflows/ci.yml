@@ -140,3 +140,40 @@ jobs:
         env:
           TSQLX_TEST_POSTGRES_URL: postgres://tsqlx:tsqlx@127.0.0.1:5432/tsqlx
         run: cargo test -p tsqlx-db --test postgres -- --ignored
+
+  # MSSQL integration test. tiberius is pure Rust so no native deps are
+  # needed on the runner; we just need the SQL Server image up. Same
+  # rationale as the Postgres job: Linux-only because GitHub `services:`
+  # containers don't run on the macOS runners.
+  mssql-integration:
+    name: mssql-integration
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Tsqlx_Pass1"
+          MSSQL_PID: "Developer"
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Tsqlx_Pass1' -N -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 30
+          --health-start-period 20s
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run MSSQL integration tests
+        env:
+          TSQLX_TEST_MSSQL_URL: "mssql://sa:Tsqlx_Pass1@127.0.0.1:1433/master?encrypt=off&trust_cert=true"
+        run: cargo test -p tsqlx-db --test mssql -- --ignored
