@@ -1,26 +1,62 @@
 name: release
 
+# Manual-only. Trigger from the Actions tab → Run workflow.
+#
+# What it does, in order:
+#   1. Read the workspace version from Cargo.toml (single source of truth).
+#   2. Verify every `tsql-* = { path = ..., version = "X" }` inter-crate
+#      dep matches the workspace version. Mismatches abort the run.
+#   3. Confirm the corresponding `v<version>` tag doesn't already exist.
+#   4. Run fmt + clippy + test + audit gates.
+#   5. `cargo package --workspace` to surface anything that would break
+#      `cargo publish`'s offline build pass.
+#   6. Publish each crate in dependency order with a 5-attempt retry
+#      loop — crates.io's sparse index can take a few seconds to expose
+#      a freshly-uploaded version to the next publish in line.
+#   7. (optional) Create + push the `vX.Y.Z` tag.
+#   8. (optional) Create a GitHub Release with auto-generated notes.
+#
+# Two safety nets:
+#   - `dry_run` defaults to `false`; flip it to `true` to run the whole
+#     pipeline without actually uploading anything (`cargo publish --dry-run`).
+#   - The publish job runs in the `crates-io-release` GitHub Environment,
+#     which can be gated by required reviewers.
+
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        type: boolean
+        default: false
+        description: 'Dry-run: cargo publish --dry-run; skip tag + release'
+      create_tag:
+        type: boolean
+        default: true
+        description: 'Create and push a v<version> annotated tag after publish'
+      create_github_release:
+        type: boolean
+        default: true
+        description: 'Create a GitHub Release with auto-generated notes'
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: publish
+  preflight:
+    name: pre-flight
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    environment: crates-io-release
-    permissions:
-      contents: read
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -30,24 +66,166 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
+      - name: Read workspace version
+        id: read
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ {print $2; exit}' Cargo.toml)
+          if [[ -z "$version" ]]; then
+            echo "::error::could not extract workspace version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "::notice::releasing tsql v$version (tag v$version)"
+
+      - name: Verify inter-crate dependency versions match workspace
+        run: |
+          set -euo pipefail
+          workspace_v="${{ steps.read.outputs.version }}"
+          mismatches=0
+          for f in crates/*/Cargo.toml; do
+            # Match lines like:
+            #   tsql-core = { path = "../tsql-core", version = "0.1.0" }
+            while IFS= read -r line; do
+              dep_v=$(echo "$line" | sed -E 's/.*version *= *"([^"]+)".*/\1/')
+              if [[ "$dep_v" != "$workspace_v" ]]; then
+                echo "::error file=$f::inter-crate dep pinned at $dep_v but workspace is $workspace_v"
+                mismatches=$((mismatches + 1))
+              fi
+            done < <(grep -E '^tsql-(core|sql|db|tui) *=' "$f" || true)
+          done
+          if [[ $mismatches -gt 0 ]]; then
+            echo "::error::bump every inter-crate version line to $workspace_v before re-running"
+            exit 1
+          fi
+
+      - name: Verify tag does not already exist
+        run: |
+          set -euo pipefail
+          tag="${{ steps.read.outputs.tag }}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "::error::tag $tag already exists locally — bump the workspace version"
+            exit 1
+          fi
+          if git ls-remote --tags origin "refs/tags/$tag" | grep -q "$tag"; then
+            echo "::error::tag $tag already exists on origin — bump the workspace version"
+            exit 1
+          fi
+
+      - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      - name: Run clippy
+      - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Run tests
+      - name: cargo test
         run: cargo test --workspace --all-features
 
-      - name: Package workspace
-        run: cargo package --workspace --allow-dirty --no-verify
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
 
-      - name: Publish crates
+      - name: cargo audit
+        # Same exemption as `just audit` and the ci workflow.
+        run: cargo audit --ignore RUSTSEC-2023-0071
+
+  publish:
+    name: publish to crates.io
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: crates-io-release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify packages build cleanly
+        # `cargo package` runs the same .crate-archive build that
+        # `cargo publish` does — catches missing `description`,
+        # `license`, or any path-only deps before we hit the registry.
+        run: cargo package --workspace
+
+      - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          cargo publish -p tsql-core --token "$CARGO_REGISTRY_TOKEN"
-          cargo publish -p tsql-sql --token "$CARGO_REGISTRY_TOKEN"
-          cargo publish -p tsql-db --token "$CARGO_REGISTRY_TOKEN"
-          cargo publish -p tsql-tui --token "$CARGO_REGISTRY_TOKEN"
-          cargo publish -p tsql --token "$CARGO_REGISTRY_TOKEN"
+          set -euo pipefail
+
+          DRY_FLAG=""
+          if [[ "$DRY_RUN" == "true" ]]; then
+            DRY_FLAG="--dry-run"
+            echo "::notice::dry-run mode — nothing will actually be uploaded"
+          fi
+
+          # crates.io's sparse index needs a moment to surface a newly
+          # uploaded version to the next `cargo publish` in line. We
+          # retry up to 5 times with 20s back-off; that's been more
+          # than enough in practice.
+          publish_one() {
+            local pkg="$1"
+            echo "::group::publish $pkg"
+            for attempt in 1 2 3 4 5; do
+              if cargo publish -p "$pkg" $DRY_FLAG --token "$CARGO_REGISTRY_TOKEN"; then
+                echo "::endgroup::"
+                return 0
+              fi
+              echo "publish $pkg failed (attempt $attempt) — index may still be propagating, sleeping 20s"
+              sleep 20
+            done
+            echo "::endgroup::"
+            echo "::error::failed to publish $pkg after 5 attempts"
+            return 1
+          }
+
+          # Strict topological order:
+          #   tsql-core, tsql-sql have no internal deps
+          #   tsql-db depends on core + sql
+          #   tsql-tui depends on core + db + sql
+          #   tsql (binary) depends on all four
+          publish_one tsql-core
+          publish_one tsql-sql
+          publish_one tsql-db
+          publish_one tsql-tui
+          publish_one tsql
+
+  tag-and-release:
+    name: tag + GitHub release
+    needs: [preflight, publish]
+    if: ${{ inputs.dry_run == false && inputs.create_tag == true }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Create and push annotated tag
+        run: |
+          set -euo pipefail
+          tag="${{ needs.preflight.outputs.tag }}"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_github_release == true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ needs.preflight.outputs.tag }}" \
+            --title "tsql ${{ needs.preflight.outputs.tag }}" \
+            --generate-notes \
+            --verify-tag
