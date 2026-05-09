@@ -27,6 +27,16 @@ impl SqlDocument {
     pub fn tsql_batches(&self) -> Vec<String> {
         split_tsql_batches(&self.text)
     }
+
+    /// PL/SQL batches. Oracle / SQL*Plus uses `/` on its own line as a
+    /// batch terminator — required for anonymous PL/SQL blocks (which
+    /// can't be split on internal `;`) and for `CREATE OR REPLACE
+    /// PROCEDURE` bodies. The `/` line is consumed; each returned
+    /// string is one batch.
+    #[must_use]
+    pub fn plsql_batches(&self) -> Vec<String> {
+        split_plsql_batches(&self.text)
+    }
 }
 
 /// Split a T-SQL script on `GO` batch separators.
@@ -184,6 +194,136 @@ fn consume_to_eol(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
+/// Split a PL/SQL script on `/` batch terminators (SQL*Plus convention).
+///
+/// A separator is a line whose only non-whitespace content is `/`. The
+/// boundary is honored only at line-start so division operators inside
+/// expressions (`SELECT a/b FROM t`) still parse as part of the current
+/// batch. Strings, line comments, and block comments are skipped over
+/// like in [`split_statements`].
+///
+/// PL/SQL blocks (`BEGIN … END;`) routinely contain semicolons that
+/// don't terminate a statement, so we never split on `;` here — the
+/// caller is expected to send each batch verbatim. For non-PL/SQL
+/// scripts that happen to use `;`-only terminators this is still
+/// correct: the whole script becomes one batch and Oracle parses each
+/// statement individually.
+#[must_use]
+pub fn split_plsql_batches(input: &str) -> Vec<String> {
+    let mut batches = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut state = SplitState::Normal;
+    let mut at_line_start = true;
+
+    while let Some(ch) = chars.next() {
+        match state {
+            SplitState::Normal => match ch {
+                '\'' => {
+                    current.push(ch);
+                    at_line_start = false;
+                    state = SplitState::SingleQuoted;
+                }
+                '"' => {
+                    current.push(ch);
+                    at_line_start = false;
+                    state = SplitState::DoubleQuoted;
+                }
+                '-' if chars.peek() == Some(&'-') => {
+                    current.push(ch);
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                    state = SplitState::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    current.push(ch);
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                    state = SplitState::BlockComment;
+                }
+                '/' if at_line_start && line_is_only_terminator(&mut chars) => {
+                    push_statement(&mut batches, &mut current);
+                    consume_to_eol(&mut chars);
+                    at_line_start = true;
+                }
+                '\n' => {
+                    current.push(ch);
+                    at_line_start = true;
+                }
+                ' ' | '\t' | '\r' => {
+                    current.push(ch);
+                }
+                _ => {
+                    current.push(ch);
+                    at_line_start = false;
+                }
+            },
+            SplitState::SingleQuoted => {
+                current.push(ch);
+                if ch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        if let Some(next) = chars.next() {
+                            current.push(next);
+                        }
+                    } else {
+                        state = SplitState::Normal;
+                    }
+                }
+            }
+            SplitState::DoubleQuoted => {
+                current.push(ch);
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        if let Some(next) = chars.next() {
+                            current.push(next);
+                        }
+                    } else {
+                        state = SplitState::Normal;
+                    }
+                }
+            }
+            SplitState::LineComment => {
+                current.push(ch);
+                if ch == '\n' {
+                    state = SplitState::Normal;
+                    at_line_start = true;
+                }
+            }
+            SplitState::BlockComment => {
+                current.push(ch);
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                    state = SplitState::Normal;
+                }
+            }
+            SplitState::DollarQuoted(_) => {
+                current.push(ch);
+            }
+        }
+    }
+
+    push_statement(&mut batches, &mut current);
+    batches
+}
+
+/// Returns true iff the rest of the current line (already past the
+/// leading `/`) is whitespace + EOL/EOF.
+fn line_is_only_terminator(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    let mut probe = chars.clone();
+    loop {
+        match probe.next() {
+            None => return true,
+            Some('\n') => return true,
+            Some(' ') | Some('\t') | Some('\r') => continue,
+            Some(_) => return false,
+        }
+    }
+}
+
 #[must_use]
 pub fn split_statements(input: &str) -> Vec<String> {
     let mut statements = Vec::new();
@@ -321,7 +461,7 @@ fn push_statement(statements: &mut Vec<String>, current: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_statements, split_tsql_batches, SqlDocument};
+    use super::{split_plsql_batches, split_statements, split_tsql_batches, SqlDocument};
 
     #[test]
     fn document_preserves_multiline_sql() {
@@ -405,5 +545,42 @@ mod tests {
     fn document_tsql_batches_round_trip() {
         let doc = SqlDocument::new("a;\nGO\nb;");
         assert_eq!(doc.tsql_batches(), ["a;", "b;"]);
+    }
+
+    #[test]
+    fn plsql_batches_split_on_slash() {
+        let batches = split_plsql_batches("BEGIN NULL; END;\n/\nSELECT * FROM dual;\n/");
+        assert_eq!(batches.len(), 2);
+        assert!(batches[0].contains("BEGIN NULL; END;"));
+        assert_eq!(batches[1], "SELECT * FROM dual;");
+    }
+
+    #[test]
+    fn plsql_batches_keep_division_inside_expression() {
+        let batches = split_plsql_batches("SELECT a/b FROM t;");
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[test]
+    fn plsql_batches_keep_block_comment_open_slash() {
+        let batches = split_plsql_batches(
+            "/* leading comment */\nSELECT 1 FROM dual;\n/\nSELECT 2 FROM dual;",
+        );
+        assert_eq!(batches.len(), 2);
+    }
+
+    #[test]
+    fn plsql_batches_no_terminator_returns_one_batch() {
+        let batches = split_plsql_batches("SELECT 1 FROM dual; SELECT 2 FROM dual;");
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[test]
+    fn document_plsql_batches_round_trip() {
+        let doc = SqlDocument::new("SELECT 1 FROM dual;\n/\nSELECT 2 FROM dual;\n/");
+        assert_eq!(
+            doc.plsql_batches(),
+            ["SELECT 1 FROM dual;", "SELECT 2 FROM dual;"]
+        );
     }
 }

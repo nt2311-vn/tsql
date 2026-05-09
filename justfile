@@ -123,11 +123,30 @@ test-mssql:
     TSQLX_TEST_MSSQL_URL='mssql://sa:Tsqlx_Pass1@127.0.0.1:14330/master?encrypt=off&trust_cert=true' \
         cargo test -p tsqlx-db --test mssql -- --ignored
 
-# Bring up every driver sandbox at once.
+# Start the dockerized Oracle Database 23ai Free (localhost:15210).
+# First start is slow (~90s); subsequent starts hit the data volume.
+oracle-up:
+    {{docker_compose}} up -d --wait oracle
+    @echo "oracle ready — try (needs --features oracle and Instant Client):"
+    @echo "  cargo run -p tsqlx --features oracle -- tui --url 'oracle://tsqlx:tsqlx_pass@127.0.0.1:15210/FREEPDB1'"
+
+# Stop just the Oracle container.
+oracle-down:
+    {{docker_compose}} stop oracle
+    {{docker_compose}} rm -f oracle
+
+# Run the Oracle integration tests against the dockerized server.
+# Requires Oracle Instant Client on the runtime library path.
+test-oracle:
+    TSQLX_TEST_ORACLE_URL='oracle://tsqlx:tsqlx_pass@127.0.0.1:15210/FREEPDB1' \
+        cargo test -p tsqlx-db --features oracle --test oracle -- --ignored
+
+# Bring up every driver sandbox at once.  Oracle deliberately omitted —
+# its first-start cost makes it opt-in.
 drivers-up: postgres-up sqlite-up mysql-up mariadb-up mssql-up
 
 # Tear down every driver sandbox at once.
-drivers-down: postgres-down sqlite-down mysql-down mariadb-down mssql-down
+drivers-down: postgres-down sqlite-down mysql-down mariadb-down mssql-down oracle-down
 
 # Backward-compatible aliases for the original Postgres-only recipes.
 alias up := postgres-up

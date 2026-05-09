@@ -76,3 +76,25 @@ services:
       timeout: 10s
       retries: 30
       start_period: 20s
+
+  # Oracle Database 23ai Free.  The `gvenzl/oracle-free` image is the
+  # community-maintained ergonomic wrapper around Oracle's own Free
+  # release: it accepts plain ORACLE_PASSWORD / APP_USER env vars and
+  # exposes a sane healthcheck out of the box.  First start is slow
+  # (~90s) because the database files have to initialise.
+  #
+  # Login: tsqlx / tsqlx_pass on the FREEPDB1 pluggable database.
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    environment:
+      ORACLE_PASSWORD: "tsqlx_pass"
+      APP_USER: "tsqlx"
+      APP_USER_PASSWORD: "tsqlx_pass"
+    ports:
+      - "15210:1521"
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 60s

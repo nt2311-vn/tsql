@@ -10,6 +10,8 @@ use tsqlx_core::DriverKind;
 use tsqlx_sql::SqlDocument;
 
 pub mod mssql;
+#[cfg(feature = "oracle")]
+pub mod oracle;
 
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -161,6 +163,8 @@ pub enum Pool {
     Sqlite(SqlitePool),
     MySql(MySqlPool),
     Mssql(mssql::MssqlPool),
+    #[cfg(feature = "oracle")]
+    Oracle(oracle::OraclePool),
 }
 
 impl Pool {
@@ -184,8 +188,11 @@ impl Pool {
                 let url = driver.normalise_url(url);
                 Ok(Self::Mssql(mssql::connect_pool(&url).await?))
             }
+            #[cfg(feature = "oracle")]
+            DriverKind::Oracle => Ok(Self::Oracle(oracle::connect_pool(url).await?)),
+            #[cfg(not(feature = "oracle"))]
             DriverKind::Oracle => Err(DbError::Unsupported(
-                "Oracle support requires building tsqlx with `--features oracle` and is not yet implemented in this binary".to_owned(),
+                "Oracle support requires building tsqlx with `--features oracle`".to_owned(),
             )),
         }
     }
@@ -196,6 +203,8 @@ impl Pool {
             Pool::Sqlite(_) => DriverKind::Sqlite,
             Pool::MySql(_) => DriverKind::Mysql,
             Pool::Mssql(_) => DriverKind::Mssql,
+            #[cfg(feature = "oracle")]
+            Pool::Oracle(_) => DriverKind::Oracle,
         }
     }
 
@@ -208,6 +217,11 @@ impl Pool {
             // `simple_query` accepts an arbitrary batch (multiple `;`-
             // separated statements), so we hand it whole batches.
             Pool::Mssql(pool) => mssql::execute_script(pool, &document.tsql_batches()).await,
+            // PL/SQL `/` plays the same role as T-SQL `GO`. Each batch
+            // is dispatched to the oracle crate's blocking client via
+            // spawn_blocking inside `oracle::execute_script`.
+            #[cfg(feature = "oracle")]
+            Pool::Oracle(pool) => oracle::execute_script(pool, &document.plsql_batches()).await,
         }
     }
 
@@ -217,6 +231,8 @@ impl Pool {
             Pool::Sqlite(pool) => fetch_sqlite_overview(pool).await,
             Pool::MySql(pool) => fetch_mysql_overview(pool).await,
             Pool::Mssql(pool) => mssql::fetch_overview(pool).await,
+            #[cfg(feature = "oracle")]
+            Pool::Oracle(pool) => oracle::fetch_overview(pool).await,
         }
     }
 
@@ -226,6 +242,8 @@ impl Pool {
             Pool::Sqlite(pool) => fetch_sqlite_table_info(pool, schema, table).await,
             Pool::MySql(pool) => fetch_mysql_table_info(pool, schema, table).await,
             Pool::Mssql(pool) => mssql::fetch_table_info(pool, schema, table).await,
+            #[cfg(feature = "oracle")]
+            Pool::Oracle(pool) => oracle::fetch_table_info(pool, schema, table).await,
         }
     }
 
@@ -280,6 +298,8 @@ impl Pool {
             Pool::Sqlite(pool) => fetch_sqlite_relationships(pool, schema).await,
             Pool::MySql(pool) => fetch_mysql_relationships(pool, schema).await,
             Pool::Mssql(pool) => mssql::fetch_relationships(pool, schema).await,
+            #[cfg(feature = "oracle")]
+            Pool::Oracle(pool) => oracle::fetch_relationships(pool, schema).await,
         }
     }
 }
