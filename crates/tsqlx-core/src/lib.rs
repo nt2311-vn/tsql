@@ -42,7 +42,7 @@ pub struct ProjectInfo {
 impl Default for ProjectInfo {
     fn default() -> Self {
         Self {
-            name: "tsql",
+            name: "tsqlx",
             version: env!("CARGO_PKG_VERSION"),
         }
     }
@@ -223,7 +223,7 @@ pub fn default_config_path() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".config")
         });
-    base.join("tsql").join("config.toml")
+    base.join("tsqlx").join("config.toml")
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -296,7 +296,7 @@ mod tests {
     fn default_project_info_has_name() {
         let info = ProjectInfo::default();
 
-        assert_eq!(info.name, "tsql");
+        assert_eq!(info.name, "tsqlx");
     }
 
     #[test]
@@ -319,11 +319,11 @@ mod tests {
 
     #[test]
     fn default_config_uses_xdg() {
-        std::env::set_var("XDG_CONFIG_HOME", "/tmp/tsql_xdg_test");
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/tsqlx_xdg_test");
         let path = default_config_path();
         assert_eq!(
             path.to_str().unwrap(),
-            "/tmp/tsql_xdg_test/tsql/config.toml"
+            "/tmp/tsqlx_xdg_test/tsqlx/config.toml"
         );
         std::env::remove_var("XDG_CONFIG_HOME");
     }
@@ -396,7 +396,7 @@ mod tests {
         // `cargo test` runs tests in parallel and env mutation is racy.
         let path = default_config_path();
         assert!(
-            path.ends_with("tsql/config.toml") || path.ends_with("tsql\\config.toml"),
+            path.ends_with("tsqlx/config.toml") || path.ends_with("tsqlx\\config.toml"),
             "unexpected suffix: {}",
             path.display(),
         );

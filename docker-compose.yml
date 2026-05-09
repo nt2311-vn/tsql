@@ -2,55 +2,55 @@ services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: tsql
-      POSTGRES_PASSWORD: tsql
-      POSTGRES_DB: tsql
+      POSTGRES_USER: tsqlx
+      POSTGRES_PASSWORD: tsqlx
+      POSTGRES_DB: tsqlx
     ports:
       - "54329:5432"
     volumes:
       - ./seed:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tsql -d tsql"]
+      test: ["CMD-SHELL", "pg_isready -U tsqlx -d tsqlx"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   # MySQL sandbox. We pin to 8.4 LTS so CHECK constraints (8.0+) and
   # the standard `information_schema.check_constraints` view are both
-  # available — that's what tsql's metadata fetchers rely on.
+  # available — that's what tsqlx's metadata fetchers rely on.
   mysql:
     image: mysql:8.4
     environment:
-      MYSQL_ROOT_PASSWORD: tsql
-      MYSQL_DATABASE: tsql
-      MYSQL_USER: tsql
-      MYSQL_PASSWORD: tsql
+      MYSQL_ROOT_PASSWORD: tsqlx
+      MYSQL_DATABASE: tsqlx
+      MYSQL_USER: tsqlx
+      MYSQL_PASSWORD: tsqlx
     ports:
       - "33069:3306"
     volumes:
       - ./seed/mysql:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u tsql -ptsql --silent"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u tsqlx -ptsql --silent"]
       interval: 5s
       timeout: 5s
       retries: 20
 
   # MariaDB sandbox alongside MySQL. Same wire protocol so the same
-  # tsql driver speaks both — handy for sniffing out engine-specific
+  # tsqlx driver speaks both — handy for sniffing out engine-specific
   # bugs without restarting MySQL.
   mariadb:
     image: mariadb:11.4
     environment:
-      MARIADB_ROOT_PASSWORD: tsql
-      MARIADB_DATABASE: tsql
-      MARIADB_USER: tsql
-      MARIADB_PASSWORD: tsql
+      MARIADB_ROOT_PASSWORD: tsqlx
+      MARIADB_DATABASE: tsqlx
+      MARIADB_USER: tsqlx
+      MARIADB_PASSWORD: tsqlx
     ports:
       - "33079:3306"
     volumes:
       - ./seed/mysql:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -u tsql -ptsql --silent"]
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -u tsqlx -ptsql --silent"]
       interval: 5s
       timeout: 5s
       retries: 20

@@ -4,13 +4,13 @@ A fast, keyboard-first terminal database client for **PostgreSQL**, **SQLite**, 
 
 Runs on **Linux** (any libc) and **macOS** (Apple Silicon + Intel). Pure-Rust dependency tree (`sqlx` + `ratatui` + `crossterm`) means no compiled C blobs to chase across platforms.
 
-Just run `tsql` and you're at a connection picker. No flags. No GUI. No compromises.
+Just run `tsqlx` and you're at a connection picker. No flags. No GUI. No compromises.
 
 ```sh
-tsql
+tsqlx
 ```
 
-It auto-loads `~/.config/tsql/config.toml`, lets you paste a fresh URL, drills down through schemas → tables → records, runs SQL with statement-aware execution, supports bracketed paste of whole multi-line scripts into the editor, and gives you a native pure-Rust ERD visualizer. All from inside your terminal.
+It auto-loads `~/.config/tsqlx/config.toml`, lets you paste a fresh URL, drills down through schemas → tables → records, runs SQL with statement-aware execution, supports bracketed paste of whole multi-line scripts into the editor, and gives you a native pure-Rust ERD visualizer. All from inside your terminal.
 
 ---
 
@@ -73,25 +73,25 @@ TSQL is a small Rust workspace. Each crate has one job and depends only on the l
 ```mermaid
 %%{init: {"theme": "dark"}}%%
 graph TD
-    subgraph cli["tsql-app · binary"]
+    subgraph cli["tsqlx-app · binary"]
         A[main.rs<br/>clap entry]
     end
-    subgraph tui["tsql-tui · TUI engine"]
+    subgraph tui["tsqlx-tui · TUI engine"]
         B[Browser / Editor / Connect]
         B2[Pure-Rust ERD canvas]
         B3[Statement editor + history]
         B4[Bracketed-paste handler]
     end
-    subgraph sql["tsql-sql · statement splitter"]
+    subgraph sql["tsqlx-sql · statement splitter"]
         C[SqlDocument<br/>boundary-aware tokens]
     end
-    subgraph db["tsql-db · driver layer"]
+    subgraph db["tsqlx-db · driver layer"]
         D[Pool::Postgres / Sqlite / MySql]
         D2[Schema introspection]
         D3[StatementOutput streaming]
         D4[Driver-specific cell decoders]
     end
-    subgraph core["tsql-core · config + types"]
+    subgraph core["tsqlx-core · config + types"]
         E[ConnectionConfig<br/>XDG loader / writer]
         E2[DriverKind / env expansion]
     end
@@ -109,11 +109,11 @@ graph TD
 
 Why split this way?
 
-- **`tsql-core`** has no DB or UI deps. Cheap to test, easy to embed.
-- **`tsql-db`** is the only crate that touches `sqlx`. Driver dialects live here.
-- **`tsql-sql`** statement splitting is pure parsing — no IO. Used by the editor's "run current statement" feature.
-- **`tsql-tui`** owns rendering and event handling. Async DB tasks send messages back through an mpsc channel, so the event loop never blocks.
-- **`tsql-app`** is just a thin CLI wrapper around the library crates.
+- **`tsqlx-core`** has no DB or UI deps. Cheap to test, easy to embed.
+- **`tsqlx-db`** is the only crate that touches `sqlx`. Driver dialects live here.
+- **`tsqlx-sql`** statement splitting is pure parsing — no IO. Used by the editor's "run current statement" feature.
+- **`tsqlx-tui`** owns rendering and event handling. Async DB tasks send messages back through an mpsc channel, so the event loop never blocks.
+- **`tsqlx-app`** is just a thin CLI wrapper around the library crates.
 
 ---
 
@@ -276,26 +276,26 @@ flowchart LR
 ## Quick start
 
 ```sh
-# Launch TUI (reads ~/.config/tsql/config.toml if it exists)
-tsql
+# Launch TUI (reads ~/.config/tsqlx/config.toml if it exists)
+tsqlx
 
 # Or connect directly
-tsql tui --url postgres://user:pass@localhost/mydb
-tsql tui --url sqlite:./local.db
-tsql tui --url mysql://tsql:tsql@127.0.0.1:33069/tsql
-tsql tui --url mariadb://tsql:tsql@127.0.0.1:33079/tsql
+tsqlx tui --url postgres://user:pass@localhost/mydb
+tsqlx tui --url sqlite:./local.db
+tsqlx tui --url mysql://tsqlx:tsqlx@127.0.0.1:33069/tsqlx
+tsqlx tui --url mariadb://tsqlx:tsqlx@127.0.0.1:33079/tsqlx
 
 # Run a script
-tsql exec --url sqlite::memory: --file query.sql
+tsqlx exec --url sqlite::memory: --file query.sql
 
 # Validate a config
-tsql config check --config examples/tsql.toml
+tsqlx config check --config examples/tsqlx.toml
 ```
 
 ## Configuration
 
 ```toml
-# ~/.config/tsql/config.toml
+# ~/.config/tsqlx/config.toml
 [editor]
 tab_width = 4
 indent = "spaces"
@@ -377,8 +377,8 @@ stateDiagram-v2
 
 ### macOS notes
 
-- **Config path.** tsql resolves `~/.config/tsql/config.toml` everywhere, including macOS — many CLI tools follow this convention now (helix, neovim, etc). If you'd rather use the macOS-native location, set `XDG_CONFIG_HOME=~/Library/Application\ Support` in your shell rc.
-- **History path.** `XDG_DATA_HOME` honored if set; otherwise falls back to `~/.local/share/tsql/history/`.
+- **Config path.** tsqlx resolves `~/.config/tsqlx/config.toml` everywhere, including macOS — many CLI tools follow this convention now (helix, neovim, etc). If you'd rather use the macOS-native location, set `XDG_CONFIG_HOME=~/Library/Application\ Support` in your shell rc.
+- **History path.** `XDG_DATA_HOME` honored if set; otherwise falls back to `~/.local/share/tsqlx/history/`.
 - **Bracketed paste.** Tested on iTerm2, Terminal.app, Alacritty, WezTerm, and Ghostty. All deliver `Event::Paste` cleanly.
 - **No system clipboard yet.** `y` / `Y` only update the status bar; an `arboard`-backed clipboard hook is on the 0.2.0 roadmap.
 
@@ -391,24 +391,24 @@ A small lite-ERP dataset (customers, products, sales orders, items, work orders,
 ```sh
 # Postgres
 just postgres-up                                  # alias: just up
-tsql tui --url postgres://tsql:tsql@127.0.0.1:54329/tsql
+tsqlx tui --url postgres://tsqlx:tsqlx@127.0.0.1:54329/tsqlx
 just postgres-down                                # alias: just down
 just postgres-reseed                              # wipe volume + re-init
 
 # SQLite
 just sqlite-up                                    # alias: just seed-sqlite
-tsql tui --url sqlite:./erp.db
+tsqlx tui --url sqlite:./erp.db
 just sqlite-down
 
 # MySQL
 just mysql-up
-tsql tui --url mysql://tsql:tsql@127.0.0.1:33069/tsql
+tsqlx tui --url mysql://tsqlx:tsqlx@127.0.0.1:33069/tsqlx
 just mysql-down
 just mysql-reseed                                 # wipe volume + re-init
 
 # MariaDB (same wire protocol; same driver)
 just mariadb-up
-tsql tui --url mariadb://tsql:tsql@127.0.0.1:33079/tsql
+tsqlx tui --url mariadb://tsqlx:tsqlx@127.0.0.1:33079/tsqlx
 just mariadb-down
 
 # All four at once
@@ -437,16 +437,16 @@ just smoke-sqlite   # quick SQLite smoke test
 ### Project layout
 
 ```
-tsql/
+tsqlx/
 ├── crates/
-│   ├── tsql-app/    binary entry (clap)
-│   ├── tsql-tui/    TUI, ERD canvas, SQL editor, paste handler
-│   ├── tsql-sql/    statement splitter
-│   ├── tsql-db/     sqlx pool + introspection (pg / sqlite / mysql)
-│   └── tsql-core/   config types, XDG loader
+│   ├── tsqlx-app/    binary entry (clap)
+│   ├── tsqlx-tui/    TUI, ERD canvas, SQL editor, paste handler
+│   ├── tsqlx-sql/    statement splitter
+│   ├── tsqlx-db/     sqlx pool + introspection (pg / sqlite / mysql)
+│   └── tsqlx-core/   config types, XDG loader
 ├── seed/            Postgres + SQLite ERP sample
 │   └── mysql/       MySQL / MariaDB-flavoured copy of the same data
-├── examples/        sample tsql.toml
+├── examples/        sample tsqlx.toml
 └── docs/            ADRs and design notes
 ```
 

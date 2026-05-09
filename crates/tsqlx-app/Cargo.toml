@@ -1,5 +1,5 @@
 [package]
-name = "tsql"
+name = "tsqlx"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,17 +12,17 @@ keywords = ["sql", "database", "terminal", "tui"]
 categories = ["command-line-utilities", "database"]
 
 [[bin]]
-name = "tsql"
+name = "tsqlx"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
-tsql-core = { path = "../tsql-core", version = "0.2.0" }
-tsql-db = { path = "../tsql-db", version = "0.2.0" }
-tsql-sql = { path = "../tsql-sql", version = "0.2.0" }
-tsql-tui = { path = "../tsql-tui", version = "0.2.0" }
+tsqlx-core = { path = "../tsqlx-core", version = "0.2.0" }
+tsqlx-db = { path = "../tsqlx-db", version = "0.2.0" }
+tsqlx-sql = { path = "../tsqlx-sql", version = "0.2.0" }
+tsqlx-tui = { path = "../tsqlx-tui", version = "0.2.0" }
 
 [lints]
 workspace = true

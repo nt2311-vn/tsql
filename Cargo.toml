@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "crates/tsql-app",
-    "crates/tsql-core",
-    "crates/tsql-db",
-    "crates/tsql-sql",
-    "crates/tsql-tui",
+    "crates/tsqlx-app",
+    "crates/tsqlx-core",
+    "crates/tsqlx-db",
+    "crates/tsqlx-sql",
+    "crates/tsqlx-tui",
 ]
 resolver = "2"
 
@@ -13,7 +13,7 @@ version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["nt2311"]
-repository = "https://github.com/nt2311-vn/tsql"
+repository = "https://github.com/nt2311-vn/tsqlx"
 license = "MIT OR Apache-2.0"
 
 [workspace.lints.rust]

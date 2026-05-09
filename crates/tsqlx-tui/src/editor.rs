@@ -334,7 +334,7 @@ pub fn history_path(connection_label: &str) -> PathBuf {
     } else {
         safe
     };
-    base.join("tsql")
+    base.join("tsqlx")
         .join("history")
         .join(format!("{safe}.txt"))
 }
@@ -450,9 +450,9 @@ mod tests {
 
     #[test]
     fn history_path_sanitises_label() {
-        std::env::set_var("XDG_DATA_HOME", "/tmp/tsql_hist_test");
+        std::env::set_var("XDG_DATA_HOME", "/tmp/tsqlx_hist_test");
         let path = history_path("prod conn?");
-        assert!(path.ends_with("tsql/history/prod_conn_.txt"));
+        assert!(path.ends_with("tsqlx/history/prod_conn_.txt"));
         std::env::remove_var("XDG_DATA_HOME");
     }
 

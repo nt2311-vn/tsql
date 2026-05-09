@@ -1,5 +1,5 @@
 [package]
-name = "tsql-tui"
+name = "tsqlx-tui"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,9 +17,9 @@ crossterm.workspace = true
 dirs.workspace = true
 ratatui.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "rt", "time"] }
-tsql-core = { path = "../tsql-core", version = "0.2.0" }
-tsql-db = { path = "../tsql-db", version = "0.2.0" }
-tsql-sql = { path = "../tsql-sql", version = "0.2.0" }
+tsqlx-core = { path = "../tsqlx-core", version = "0.2.0" }
+tsqlx-db = { path = "../tsqlx-db", version = "0.2.0" }
+tsqlx-sql = { path = "../tsqlx-sql", version = "0.2.0" }
 
 [dev-dependencies]
 tempfile.workspace = true

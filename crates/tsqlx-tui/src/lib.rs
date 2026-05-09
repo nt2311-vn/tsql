@@ -23,9 +23,9 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tsql_core::{append_connection, default_config_path, ConnectionConfig, DriverKind};
-use tsql_db::{DatabaseOverview, Pool, RelationshipEdge, StatementOutput, TableInfo};
-use tsql_sql::SqlDocument;
+use tsqlx_core::{append_connection, default_config_path, ConnectionConfig, DriverKind};
+use tsqlx_db::{DatabaseOverview, Pool, RelationshipEdge, StatementOutput, TableInfo};
+use tsqlx_sql::SqlDocument;
 
 // ─── Background DB messages ──────────────────────────────────────────────────
 //
@@ -119,7 +119,7 @@ enum ConnectFocus {
     Picker,
     NewUrl,
     /// Prompt for a friendly name after a successful new-URL connect, so
-    /// the connection can be persisted to `~/.config/tsql/config.toml`.
+    /// the connection can be persisted to `~/.config/tsqlx/config.toml`.
     /// Empty input + Enter (or Esc) skips saving.
     NameNew,
 }
@@ -214,7 +214,7 @@ struct AppState {
     /// user for a name to persist it under. `None` outside the name flow.
     pending_save: Option<(DriverKind, String)>,
     /// Override for the config file path (test hook). When `None` we use
-    /// `tsql_core::default_config_path()`.
+    /// `tsqlx_core::default_config_path()`.
     config_path_override: Option<PathBuf>,
     theme: Theme,
     mode: AppMode,
@@ -955,7 +955,7 @@ async fn finish_save_prompt(app: &mut AppState, name: Option<String>) {
 /// If `desired` is already taken in the saved list, append `-2`, `-3`, …
 /// until we land on a free key. The saved list is the source of truth
 /// for in-memory state; the on-disk file may have additional entries
-/// (created by other tsql sessions), but that's a corner case we accept.
+/// (created by other tsqlx sessions), but that's a corner case we accept.
 fn unique_connection_name(desired: &str, saved: &[(String, ConnectionConfig)]) -> String {
     let taken: std::collections::HashSet<&str> = saved.iter().map(|(n, _)| n.as_str()).collect();
     if !taken.contains(desired) {
@@ -1001,7 +1001,7 @@ fn short_hash(s: &str) -> String {
 
 /// Open a fresh `Pool` for the active driver/url and load the schema overview.
 /// The pool is stored on `app.pool` so subsequent metadata calls reuse it.
-async fn open_pool_and_overview(app: &mut AppState) -> Result<DatabaseOverview, tsql_db::DbError> {
+async fn open_pool_and_overview(app: &mut AppState) -> Result<DatabaseOverview, tsqlx_db::DbError> {
     let pool = Pool::connect(app.driver, &app.url).await?;
     let overview = pool.fetch_overview().await?;
     app.pool = Some(pool);
@@ -3927,7 +3927,7 @@ mod tests {
     #[test]
     fn mermaid_erdiagram_emits_columns_and_relationships() {
         use std::collections::HashMap;
-        use tsql_db::{ColumnInfo, PrimaryKeyInfo, RelationshipEdge, TableInfo};
+        use tsqlx_db::{ColumnInfo, PrimaryKeyInfo, RelationshipEdge, TableInfo};
 
         let users = TableInfo {
             name: "users".to_owned(),
@@ -3968,7 +3968,7 @@ mod tests {
                 name: "orders_pk".to_owned(),
                 column_names: vec!["id".to_owned()],
             }),
-            foreign_keys: vec![tsql_db::ForeignKeyInfo {
+            foreign_keys: vec![tsqlx_db::ForeignKeyInfo {
                 name: "orders_user_fk".to_owned(),
                 column_names: vec!["user_id".to_owned()],
                 referenced_table: "users".to_owned(),
@@ -4015,7 +4015,7 @@ mod tests {
 
     #[test]
     fn focus_canvas_renders_centre_box_and_arrows() {
-        use tsql_db::{ColumnInfo, ForeignKeyInfo, PrimaryKeyInfo, RelationshipEdge, TableInfo};
+        use tsqlx_db::{ColumnInfo, ForeignKeyInfo, PrimaryKeyInfo, RelationshipEdge, TableInfo};
 
         let orders = TableInfo {
             name: "orders".to_owned(),
@@ -4086,7 +4086,7 @@ mod tests {
     fn focus_canvas_renders_neighbours_in_half_width_pane() {
         // Half-screen pane: 60 cols × 12 rows. Centre + at least one
         // neighbour should both be visible.
-        use tsql_db::{ColumnInfo, ForeignKeyInfo, PrimaryKeyInfo, RelationshipEdge, TableInfo};
+        use tsqlx_db::{ColumnInfo, ForeignKeyInfo, PrimaryKeyInfo, RelationshipEdge, TableInfo};
         let orders = TableInfo {
             name: "orders".to_owned(),
             schema: "public".to_owned(),
