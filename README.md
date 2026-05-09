@@ -2,7 +2,7 @@
 
 A fast, keyboard-first terminal database client for **PostgreSQL**, **SQLite**, **MySQL / MariaDB**, **Microsoft SQL Server**, and **Oracle**, built in Rust.
 
-Runs on **Linux** (any libc) and **macOS** (Apple Silicon + Intel). The Postgres / SQLite / MySQL / MSSQL stack is pure-Rust (`sqlx` + `tiberius` + `ratatui` + `crossterm`) — no compiled C blobs to chase. The Oracle driver is opt-in (`--features oracle`) and links against Oracle Instant Client at runtime.
+Runs on **Linux** (any libc) and **macOS** (Apple Silicon + Intel). Postgres / SQLite / MySQL travel through pure-Rust `sqlx` (rustls TLS); MSSQL travels through `tiberius` against the OS-native TLS stack (SecureTransport on macOS, SChannel on Windows, OpenSSL on Linux). The Oracle driver is opt-in (`--features oracle`) and links against Oracle Instant Client at runtime.
 
 Just run `tsqlx` and you're at a connection picker. No flags. No GUI. No compromises.
 

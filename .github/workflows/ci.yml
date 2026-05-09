@@ -100,19 +100,14 @@ jobs:
         uses: taiki-e/install-action@cargo-audit
 
       - name: Audit dependencies
-        # Keep this list in sync with `just audit` — both reasons + ignores
-        # are documented there. Briefly:
+        # Keep this list in sync with `just audit` — reasons documented
+        # there. Briefly:
         #   RUSTSEC-2023-0071: RSA Marvin (transitive via sqlx-mysql).
-        #   RUSTSEC-2026-0098/0099/0104: rustls-webpki 0.101.x; tiberius
-        #     0.12 pins rustls 0.21 and hasn't bumped to 0.23+ yet.
         #   RUSTSEC-2024-0436 / RUSTSEC-2025-0134: maintenance advisories
         #     for `paste` / `rustls-pemfile`.
         run: |
           cargo audit \
             --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0098 \
-            --ignore RUSTSEC-2026-0099 \
-            --ignore RUSTSEC-2026-0104 \
             --ignore RUSTSEC-2024-0436 \
             --ignore RUSTSEC-2025-0134
 

@@ -11,7 +11,11 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 ### Added
 
 - **Microsoft SQL Server driver.** Full TDS support via `tiberius`
-  + `bb8-tiberius`, no native dependencies (pure Rust, rustls TLS).
+  + `bb8-tiberius`. TLS is provided by the OS stack (SecureTransport
+  on macOS, SChannel on Windows, OpenSSL on Linux) — `tiberius 0.12`
+  pins `rustls 0.21` which transitively brings in vulnerable
+  `rustls-webpki 0.101.x` (CVE-2026-0098/0099/0104), so we route
+  through `native-tls` until tiberius bumps to rustls 0.23+.
   - URL formats: `mssql://`, `sqlserver://`, `tds://` (the last two
     are normalised to `mssql://` on connect). TOML `driver = "sqlserver"`
     and `driver = "tds"` are accepted as aliases.
