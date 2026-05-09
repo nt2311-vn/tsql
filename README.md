@@ -2,6 +2,8 @@
 
 A fast, keyboard-first terminal database client for **PostgreSQL**, **SQLite**, and **MySQL / MariaDB**, built in Rust.
 
+Runs on **Linux** (any libc) and **macOS** (Apple Silicon + Intel). Pure-Rust dependency tree (`sqlx` + `ratatui` + `crossterm`) means no compiled C blobs to chase across platforms.
+
 Just run `tsql` and you're at a connection picker. No flags. No GUI. No compromises.
 
 ```sh
@@ -363,6 +365,24 @@ stateDiagram-v2
 | Editor      | `Esc`           | Back to browser                                     |
 
 ---
+
+## Platforms
+
+| OS                  | Build        | Test in CI       | Notes                                                 |
+| ------------------- | ------------ | ---------------- | ----------------------------------------------------- |
+| Linux (x86_64)      | ✅ supported | `ubuntu-latest`  | Primary dev target                                    |
+| macOS (Apple Silicon, arm64) | ✅ supported | `macos-latest`   | Tested on every PR via `dtolnay/rust-toolchain@stable` |
+| macOS (Intel, x86_64) | ✅ supported | not in CI matrix | Same code path as arm64 — built locally with `cargo build --target x86_64-apple-darwin` |
+| Windows             | ⏳ untested   | not in CI        | `crossterm` Windows backend should work; `dirs` config-dir semantics differ — needs a dedicated pass |
+
+### macOS notes
+
+- **Config path.** tsql resolves `~/.config/tsql/config.toml` everywhere, including macOS — many CLI tools follow this convention now (helix, neovim, etc). If you'd rather use the macOS-native location, set `XDG_CONFIG_HOME=~/Library/Application\ Support` in your shell rc.
+- **History path.** `XDG_DATA_HOME` honored if set; otherwise falls back to `~/.local/share/tsql/history/`.
+- **Bracketed paste.** Tested on iTerm2, Terminal.app, Alacritty, WezTerm, and Ghostty. All deliver `Event::Paste` cleanly.
+- **No system clipboard yet.** `y` / `Y` only update the status bar; an `arboard`-backed clipboard hook is on the 0.2.0 roadmap.
+
+The CI `test (macos-latest)` job builds the workspace, runs `cargo test --workspace --all-features`, and exercises the SQLite + MySQL/MariaDB unit suites on Apple Silicon hosts. Postgres integration is Linux-only because GitHub-hosted runners only expose `services:` containers there — the Postgres metadata fetchers themselves are pure Rust and platform-independent.
 
 ## Sample ERP database
 

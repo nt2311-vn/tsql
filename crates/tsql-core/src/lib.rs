@@ -386,6 +386,27 @@ mod tests {
         assert!(raw.contains("[connections.dev]"));
     }
 
+    #[test]
+    fn default_config_path_resolves_on_every_platform() {
+        // Smoke test: the config path resolution shouldn't panic on
+        // macOS, Linux, or anywhere else `dirs::home_dir()` returns a
+        // value. Running this in CI on `macos-latest` gives us a
+        // platform-specific signal that the path code is portable.
+        // We deliberately don't mutate XDG_CONFIG_HOME here because
+        // `cargo test` runs tests in parallel and env mutation is racy.
+        let path = default_config_path();
+        assert!(
+            path.ends_with("tsql/config.toml") || path.ends_with("tsql\\config.toml"),
+            "unexpected suffix: {}",
+            path.display(),
+        );
+        assert!(
+            path.is_absolute() || path.starts_with("."),
+            "config path should be absolute or relative-to-cwd: {}",
+            path.display(),
+        );
+    }
+
     #[tokio::test]
     async fn append_connection_rejects_invalid_names() {
         let dir = tempdir().expect("tempdir");
