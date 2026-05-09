@@ -24,5 +24,9 @@ tsqlx-db = { path = "../tsqlx-db", version = "0.3.0" }
 tsqlx-sql = { path = "../tsqlx-sql", version = "0.3.0" }
 tsqlx-tui = { path = "../tsqlx-tui", version = "0.3.0" }
 
+[features]
+default = []
+oracle = ["tsqlx-db/oracle"]
+
 [lints]
 workspace = true

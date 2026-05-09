@@ -13,10 +13,19 @@ categories = ["command-line-utilities", "database"]
 
 [dependencies]
 sqlx.workspace = true
+tiberius.workspace = true
+bb8.workspace = true
+bb8-tiberius.workspace = true
+futures-util.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+oracle = { version = "0.6", optional = true }
 tsqlx-core = { path = "../tsqlx-core", version = "0.3.0" }
 tsqlx-sql = { path = "../tsqlx-sql", version = "0.3.0" }
+
+[features]
+default = []
+oracle = ["dep:oracle"]
 
 [lints]
 workspace = true

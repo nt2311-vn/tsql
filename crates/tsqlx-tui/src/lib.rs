@@ -792,6 +792,8 @@ fn qualified_table(app: &AppState) -> String {
         DriverKind::Sqlite => format!("\"{}\"", app.current_table),
         // MySQL identifiers use backticks; the schema is the active database.
         DriverKind::Mysql => format!("`{}`.`{}`", app.current_schema, app.current_table),
+        DriverKind::Mssql => format!("[{}].[{}]", app.current_schema, app.current_table),
+        DriverKind::Oracle => format!("\"{}\".\"{}\"", app.current_schema, app.current_table),
     }
 }
 
@@ -835,12 +837,14 @@ async fn handle_new_url_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
             app.status = "j/k navigate  Enter connect  n new connection  q quit".to_owned();
         }
         KeyCode::Tab => {
-            // Cycle Postgres → SQLite → MySQL → Postgres so all drivers
-            // are reachable from a single key with no shift / chord.
+            // Cycle Postgres → SQLite → MySQL → MSSQL → Oracle → Postgres
+            // so every driver is reachable from a single key.
             app.driver = match app.driver {
                 DriverKind::Postgres => DriverKind::Sqlite,
                 DriverKind::Sqlite => DriverKind::Mysql,
-                DriverKind::Mysql => DriverKind::Postgres,
+                DriverKind::Mysql => DriverKind::Mssql,
+                DriverKind::Mssql => DriverKind::Oracle,
+                DriverKind::Oracle => DriverKind::Postgres,
             };
         }
         KeyCode::Backspace => {
@@ -1789,6 +1793,8 @@ fn draw_connect(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                     DriverKind::Postgres => "PG",
                     DriverKind::Sqlite => "SQ",
                     DriverKind::Mysql => "MY",
+                    DriverKind::Mssql => "MS",
+                    DriverKind::Oracle => "OR",
                 };
                 let sel = i == app.connect_idx && app.connect_focus == ConnectFocus::Picker;
                 let st = if sel {
@@ -1848,6 +1854,8 @@ fn draw_connect(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         DriverKind::Postgres => "Postgres",
         DriverKind::Sqlite => "SQLite",
         DriverKind::Mysql => "MySQL/MariaDB",
+        DriverKind::Mssql => "MS SQL Server",
+        DriverKind::Oracle => "Oracle",
     };
 
     f.render_widget(
@@ -1945,6 +1953,8 @@ fn draw_header(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         DriverKind::Postgres => "PG",
         DriverKind::Sqlite => "SQ",
         DriverKind::Mysql => "MY",
+        DriverKind::Mssql => "MS",
+        DriverKind::Oracle => "OR",
     };
     let mode_badge = match app.mode {
         AppMode::Connect => " CONNECT ",
