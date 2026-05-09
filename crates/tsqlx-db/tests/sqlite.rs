@@ -1,16 +1,16 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tsql_core::DriverKind;
-use tsql_db::{
+use tsqlx_core::DriverKind;
+use tsqlx_db::{
     execute_script, fetch_overview, fetch_records, fetch_relationships, fetch_table_info,
 };
-use tsql_sql::SqlDocument;
+use tsqlx_sql::SqlDocument;
 
 static DB_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn tmp_db_url() -> (String, String) {
     let id = DB_SEQ.fetch_add(1, Ordering::SeqCst);
-    let path = format!("/tmp/tsql_test_{id}.db");
+    let path = format!("/tmp/tsqlx_test_{id}.db");
     let _ = std::fs::remove_file(&path);
     let url = format!("sqlite:{path}");
     (url, path)

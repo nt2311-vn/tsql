@@ -2717,20 +2717,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "tsql"
+name = "tsqlx"
 version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "tokio",
- "tsql-core",
- "tsql-db",
- "tsql-sql",
- "tsql-tui",
+ "tsqlx-core",
+ "tsqlx-db",
+ "tsqlx-sql",
+ "tsqlx-tui",
 ]
 
 [[package]]
-name = "tsql-core"
+name = "tsqlx-core"
 version = "0.2.0"
 dependencies = [
  "dirs",
@@ -2742,22 +2742,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "tsql-db"
+name = "tsqlx-db"
 version = "0.2.0"
 dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
- "tsql-core",
- "tsql-sql",
+ "tsqlx-core",
+ "tsqlx-sql",
 ]
 
 [[package]]
-name = "tsql-sql"
+name = "tsqlx-sql"
 version = "0.2.0"
 
 [[package]]
-name = "tsql-tui"
+name = "tsqlx-tui"
 version = "0.2.0"
 dependencies = [
  "anyhow",
@@ -2766,9 +2766,9 @@ dependencies = [
  "ratatui",
  "tempfile",
  "tokio",
- "tsql-core",
- "tsql-db",
- "tsql-sql",
+ "tsqlx-core",
+ "tsqlx-db",
+ "tsqlx-sql",
 ]
 
 [[package]]

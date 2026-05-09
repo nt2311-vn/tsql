@@ -116,13 +116,13 @@ jobs:
       postgres:
         image: postgres:17-alpine
         env:
-          POSTGRES_USER: tsql
-          POSTGRES_PASSWORD: tsql
-          POSTGRES_DB: tsql
+          POSTGRES_USER: tsqlx
+          POSTGRES_PASSWORD: tsqlx
+          POSTGRES_DB: tsqlx
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U tsql -d tsql"
+          --health-cmd "pg_isready -U tsqlx -d tsqlx"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -138,5 +138,5 @@ jobs:
 
       - name: Run Postgres integration tests
         env:
-          TSQL_TEST_POSTGRES_URL: postgres://tsql:tsql@127.0.0.1:5432/tsql
-        run: cargo test -p tsql-db --test postgres -- --ignored
+          TSQLX_TEST_POSTGRES_URL: postgres://tsqlx:tsqlx@127.0.0.1:5432/tsqlx
+        run: cargo test -p tsqlx-db --test postgres -- --ignored

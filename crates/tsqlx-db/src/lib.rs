@@ -6,8 +6,8 @@ use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 use thiserror::Error;
-use tsql_core::DriverKind;
-use tsql_sql::SqlDocument;
+use tsqlx_core::DriverKind;
+use tsqlx_sql::SqlDocument;
 
 #[derive(Debug, Error)]
 pub enum DbError {

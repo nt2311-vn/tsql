@@ -1,15 +1,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tsql_core::DriverKind;
-use tsql_db::{
+use tsqlx_core::DriverKind;
+use tsqlx_db::{
     execute_script, fetch_overview, fetch_records, fetch_relationships, fetch_table_info,
 };
-use tsql_sql::SqlDocument;
+use tsqlx_sql::SqlDocument;
 
 static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn pg_url() -> String {
-    std::env::var("TSQL_TEST_POSTGRES_URL").expect("TSQL_TEST_POSTGRES_URL is set")
+    std::env::var("TSQLX_TEST_POSTGRES_URL").expect("TSQLX_TEST_POSTGRES_URL is set")
 }
 
 /// Each test creates and tears down its own dedicated schema so parallel runs
@@ -17,7 +17,7 @@ fn pg_url() -> String {
 fn unique_schema(prefix: &str) -> String {
     let id = SCHEMA_SEQ.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
-    format!("tsql_test_{prefix}_{pid}_{id}")
+    format!("tsqlx_test_{prefix}_{pid}_{id}")
 }
 
 async fn drop_schema(url: &str, schema: &str) {
@@ -26,15 +26,15 @@ async fn drop_schema(url: &str, schema: &str) {
 }
 
 #[tokio::test]
-#[ignore = "requires TSQL_TEST_POSTGRES_URL"]
+#[ignore = "requires TSQLX_TEST_POSTGRES_URL"]
 async fn executes_postgres_script() {
     let url = pg_url();
     let document = SqlDocument::new(
         r#"
-        drop table if exists tsql_test_users;
-        create table tsql_test_users(id serial primary key, name text not null);
-        insert into tsql_test_users(name) values ('ada'), ('grace');
-        select id, name from tsql_test_users order by id;
+        drop table if exists tsqlx_test_users;
+        create table tsqlx_test_users(id serial primary key, name text not null);
+        insert into tsqlx_test_users(name) values ('ada'), ('grace');
+        select id, name from tsqlx_test_users order by id;
         "#,
     );
 
@@ -49,7 +49,7 @@ async fn executes_postgres_script() {
 }
 
 #[tokio::test]
-#[ignore = "requires TSQL_TEST_POSTGRES_URL"]
+#[ignore = "requires TSQLX_TEST_POSTGRES_URL"]
 async fn postgres_overview_lists_tables_and_schemas() {
     let url = pg_url();
     let schema = unique_schema("ov");
@@ -88,7 +88,7 @@ async fn postgres_overview_lists_tables_and_schemas() {
 }
 
 #[tokio::test]
-#[ignore = "requires TSQL_TEST_POSTGRES_URL"]
+#[ignore = "requires TSQLX_TEST_POSTGRES_URL"]
 async fn postgres_table_info_columns_and_pk() {
     let url = pg_url();
     let schema = unique_schema("cols");
@@ -129,7 +129,7 @@ async fn postgres_table_info_columns_and_pk() {
 /// `feat/xdg-config-connection-picker` branch: the FK metadata query was
 /// silently broken because no integration test exercised the metadata path.
 #[tokio::test]
-#[ignore = "requires TSQL_TEST_POSTGRES_URL"]
+#[ignore = "requires TSQLX_TEST_POSTGRES_URL"]
 async fn postgres_table_info_foreign_keys() {
     let url = pg_url();
     let schema = unique_schema("fk");
@@ -163,7 +163,7 @@ async fn postgres_table_info_foreign_keys() {
 }
 
 #[tokio::test]
-#[ignore = "requires TSQL_TEST_POSTGRES_URL"]
+#[ignore = "requires TSQLX_TEST_POSTGRES_URL"]
 async fn postgres_relationships_for_schema() {
     let url = pg_url();
     let schema = unique_schema("rel");
@@ -191,7 +191,7 @@ async fn postgres_relationships_for_schema() {
 }
 
 #[tokio::test]
-#[ignore = "requires TSQL_TEST_POSTGRES_URL"]
+#[ignore = "requires TSQLX_TEST_POSTGRES_URL"]
 async fn postgres_fetch_records_paginated() {
     let url = pg_url();
     let schema = unique_schema("pg");

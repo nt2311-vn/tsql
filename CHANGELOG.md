@@ -53,7 +53,7 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
   dependency tree (`sqlx + runtime-tokio-rustls`, `ratatui`,
   `crossterm`, `dirs`); now exercised on every PR via a
   `[ubuntu-latest, macos-latest]` matrix in `ci.yml`. New
-  cross-platform test in `tsql-core` exercises path resolution
+  cross-platform test in `tsqlx-core` exercises path resolution
   on Apple Silicon. README has a Platforms table and macOS notes.
 - **Manual-trigger release workflow.** `release.yml` is now
   `workflow_dispatch` only with `dry_run`, `create_tag`, and
@@ -98,8 +98,8 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 - **Persist new connections.** After typing a URL via `n new
   connection`, the connect screen prompts for a friendly name. Empty +
   Enter (or Esc) skips; otherwise the URL is appended to
-  `~/.config/tsql/config.toml` so it shows in the picker next time.
-  `tsql_core::append_connection` writes raw TOML so existing
+  `~/.config/tsqlx/config.toml` so it shows in the picker next time.
+  `tsqlx_core::append_connection` writes raw TOML so existing
   `${ENV_VAR}` placeholders and comments survive byte-for-byte. Name
   collisions are resolved with a `-N` numeric suffix.
 - **Number-key tab navigation.** `1`-`6` jump straight to Records,
@@ -207,14 +207,14 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
   terminal-compat fallback) runs only the statement under the cursor,
   `Ctrl+S` saves to the buffer's file, `:w [path]` and `:e <path>`
   palette commands for save/open, and per-connection persistent history
-  stored under `~/.local/share/tsql/history/<name>.txt` (capped at 500
+  stored under `~/.local/share/tsqlx/history/<name>.txt` (capped at 500
   deduped entries).
 - **Narrower sidebar.** Browser sidebar is now 18% of terminal width
   (down from 24%), giving the detail pane more room.
 
 ### Added (earlier)
 
-- **Postgres metadata integration tests** (`crates/tsql-db/tests/postgres.rs`):
+- **Postgres metadata integration tests** (`crates/tsqlx-db/tests/postgres.rs`):
   `postgres_overview_lists_tables_and_schemas`,
   `postgres_table_info_columns_and_pk`,
   `postgres_table_info_foreign_keys` (regression: catches the `FROM ,`
@@ -222,7 +222,7 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
   `postgres_relationships_for_schema`, and
   `postgres_fetch_records_paginated`. Each test creates a unique
   throwaway schema so parallel runs cannot collide.
-- **Reusable connection `Pool`** in `tsql-db`: `Pool::Postgres(PgPool)` /
+- **Reusable connection `Pool`** in `tsqlx-db`: `Pool::Postgres(PgPool)` /
   `Pool::Sqlite(SqlitePool)` with `connect`, `execute_script`,
   `fetch_overview`, `fetch_table_info`, `fetch_records`,
   `fetch_relationships` methods. The TUI now opens a pool once per
@@ -250,14 +250,14 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
   `o` opens the owning (source) table. Sidebar selection follows the
   jump when the table is visible.
 - Expanded `0.1.0` scope: TUI database browser with Vim navigation and ERD.
-- Database introspection APIs in `tsql-db` for SQLite and Postgres.
+- Database introspection APIs in `tsqlx-db` for SQLite and Postgres.
 - `fetch_overview`, `fetch_table_info`, and `fetch_records` metadata loaders.
 - `fetch_relationships` loader for schema-scoped ERD views.
 - `just smoke-metadata` task for introspection verification.
 - Hybrid CLI/TUI `0.1.0` MVP work.
-- `tsql config check` for TOML configuration validation.
-- `tsql exec` for executing SQL files or stdin against SQLite and Postgres.
-- Minimal `tsql tui` Ratatui interface with Catppuccin Mocha styling.
+- `tsqlx config check` for TOML configuration validation.
+- `tsqlx exec` for executing SQL files or stdin against SQLite and Postgres.
+- Minimal `tsqlx tui` Ratatui interface with Catppuccin Mocha styling.
 - Multi-statement SQL splitting for pasted SQL scripts.
 - SQLite integration test.
 - Postgres Docker Compose and CI integration test support.

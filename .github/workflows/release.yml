@@ -4,7 +4,7 @@ name: release
 #
 # What it does, in order:
 #   1. Read the workspace version from Cargo.toml (single source of truth).
-#   2. Verify every `tsql-* = { path = ..., version = "X" }` inter-crate
+#   2. Verify every `tsqlx-* = { path = ..., version = "X" }` inter-crate
 #      dep matches the workspace version. Mismatches abort the run.
 #   3. Confirm the corresponding `v<version>` tag doesn't already exist.
 #   4. Run fmt + clippy + test + audit gates.
@@ -77,7 +77,7 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
-          echo "::notice::releasing tsql v$version (tag v$version)"
+          echo "::notice::releasing tsqlx v$version (tag v$version)"
 
       - name: Verify inter-crate dependency versions match workspace
         run: |
@@ -86,14 +86,14 @@ jobs:
           mismatches=0
           for f in crates/*/Cargo.toml; do
             # Match lines like:
-            #   tsql-core = { path = "../tsql-core", version = "0.1.0" }
+            #   tsqlx-core = { path = "../tsqlx-core", version = "0.1.0" }
             while IFS= read -r line; do
               dep_v=$(echo "$line" | sed -E 's/.*version *= *"([^"]+)".*/\1/')
               if [[ "$dep_v" != "$workspace_v" ]]; then
                 echo "::error file=$f::inter-crate dep pinned at $dep_v but workspace is $workspace_v"
                 mismatches=$((mismatches + 1))
               fi
-            done < <(grep -E '^tsql-(core|sql|db|tui) *=' "$f" || true)
+            done < <(grep -E '^tsqlx-(core|sql|db|tui) *=' "$f" || true)
           done
           if [[ $mismatches -gt 0 ]]; then
             echo "::error::bump every inter-crate version line to $workspace_v before re-running"
@@ -184,15 +184,15 @@ jobs:
           }
 
           # Strict topological order:
-          #   tsql-core, tsql-sql have no internal deps
-          #   tsql-db depends on core + sql
-          #   tsql-tui depends on core + db + sql
-          #   tsql (binary) depends on all four
-          publish_one tsql-core
-          publish_one tsql-sql
-          publish_one tsql-db
-          publish_one tsql-tui
-          publish_one tsql
+          #   tsqlx-core, tsqlx-sql have no internal deps
+          #   tsqlx-db depends on core + sql
+          #   tsqlx-tui depends on core + db + sql
+          #   tsqlx (binary) depends on all four
+          publish_one tsqlx-core
+          publish_one tsqlx-sql
+          publish_one tsqlx-db
+          publish_one tsqlx-tui
+          publish_one tsqlx
 
   tag-and-release:
     name: tag + GitHub release
@@ -226,6 +226,6 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "${{ needs.preflight.outputs.tag }}" \
-            --title "tsql ${{ needs.preflight.outputs.tag }}" \
+            --title "tsqlx ${{ needs.preflight.outputs.tag }}" \
             --generate-notes \
             --verify-tag

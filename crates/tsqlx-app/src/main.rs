@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncReadExt;
-use tsql_core::{AppConfig, ConnectionConfig, DriverKind};
-use tsql_db::{execute_script, QueryOutput};
-use tsql_sql::SqlDocument;
+use tsqlx_core::{AppConfig, ConnectionConfig, DriverKind};
+use tsqlx_db::{execute_script, QueryOutput};
+use tsqlx_sql::SqlDocument;
 
 #[derive(Debug, Parser)]
-#[command(name = "tsql")]
+#[command(name = "tsqlx")]
 #[command(author, version, about)]
 struct Cli {
     #[command(subcommand)]
@@ -91,15 +91,15 @@ async fn main() -> Result<()> {
         }) => {
             if url.is_some() || connection.is_some() {
                 let conn = resolve_connection(config, connection, url, driver).await?;
-                tsql_tui::run(conn.driver, conn.url).await
+                tsqlx_tui::run(conn.driver, conn.url).await
             } else {
                 let saved = load_saved_connections(config).await;
-                tsql_tui::run_connect(saved).await
+                tsqlx_tui::run_connect(saved).await
             }
         }
         None => {
             let saved = load_saved_connections(None).await;
-            tsql_tui::run_connect(saved).await
+            tsqlx_tui::run_connect(saved).await
         }
     }
 }

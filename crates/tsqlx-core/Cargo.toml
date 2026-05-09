@@ -1,22 +1,26 @@
 [package]
-name = "tsql-db"
+name = "tsqlx-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
-description = "Database driver boundaries for TSQL."
+description = "Core domain types for TSQL."
 readme = "../../README.md"
 keywords = ["sql", "database", "terminal", "tui"]
 categories = ["command-line-utilities", "database"]
 
 [dependencies]
-sqlx.workspace = true
+dirs.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tsql-core = { path = "../tsql-core", version = "0.2.0" }
-tsql-sql = { path = "../tsql-sql", version = "0.2.0" }
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

@@ -41,25 +41,25 @@ test:
 
 # Run the Postgres integration tests against the dockerized DB (run `just up` first).
 test-integration:
-    TSQL_TEST_POSTGRES_URL=postgres://tsql:tsql@127.0.0.1:54329/tsql cargo test -p tsql-db --test postgres -- --ignored
+    TSQLX_TEST_POSTGRES_URL=postgres://tsqlx:tsqlx@127.0.0.1:54329/tsqlx cargo test -p tsqlx-db --test postgres -- --ignored
 
 # Smoke test: run the example SQL script against in-memory SQLite via the CLI.
 smoke-sqlite:
-    cargo run -p tsql -- exec --url sqlite::memory: --file examples/query.sql
+    cargo run -p tsqlx -- exec --url sqlite::memory: --file examples/query.sql
 
 # Smoke test the Postgres metadata fetchers. Requires `just up` first.
 smoke-metadata:
-    TSQL_TEST_POSTGRES_URL=postgres://tsql:tsql@127.0.0.1:54329/tsql cargo test -p tsql-db --test metadata -- --ignored
+    TSQLX_TEST_POSTGRES_URL=postgres://tsqlx:tsqlx@127.0.0.1:54329/tsqlx cargo test -p tsqlx-db --test metadata -- --ignored
 
 # ─── Driver sandboxes ─────────────────────────────────────────────────────────
-# Per-driver up/down recipes spin up a seeded sandbox so you can poke at tsql
+# Per-driver up/down recipes spin up a seeded sandbox so you can poke at tsqlx
 # against any supported driver without remembering compose flags. The seed
 # scripts in seed/ are portable, so every driver gets the same ERP dataset.
 
 # Start the dockerized Postgres (localhost:54329) seeded from seed/.
 postgres-up:
     {{docker_compose}} up -d --wait postgres
-    @echo "postgres ready — try: tsql tui --url postgres://tsql:tsql@127.0.0.1:54329/tsql"
+    @echo "postgres ready — try: tsqlx tui --url postgres://tsqlx:tsqlx@127.0.0.1:54329/tsqlx"
 
 # Stop the dockerized Postgres and remove orphan containers (keeps the volume).
 postgres-down:
@@ -75,7 +75,7 @@ sqlite-up db="erp.db":
     rm -f {{db}}
     sqlite3 {{db}} < seed/01_schema.sql
     sqlite3 {{db}} < seed/02_data.sql
-    @echo "sqlite ready — try: tsql tui --url sqlite:./{{db}}"
+    @echo "sqlite ready — try: tsqlx tui --url sqlite:./{{db}}"
 
 # Remove the local SQLite sandbox file (default: ./erp.db).
 sqlite-down db="erp.db":
@@ -85,7 +85,7 @@ sqlite-down db="erp.db":
 # Start the dockerized MySQL (localhost:33069) seeded from seed/mysql/.
 mysql-up:
     {{docker_compose}} up -d --wait mysql
-    @echo "mysql ready — try: tsql tui --url mysql://tsql:tsql@127.0.0.1:33069/tsql"
+    @echo "mysql ready — try: tsqlx tui --url mysql://tsqlx:tsqlx@127.0.0.1:33069/tsqlx"
 
 # Stop just the MySQL container; leaves Postgres / MariaDB untouched.
 mysql-down:
@@ -100,7 +100,7 @@ mysql-reseed:
 # Start the dockerized MariaDB (localhost:33079) using the same seed.
 mariadb-up:
     {{docker_compose}} up -d --wait mariadb
-    @echo "mariadb ready — try: tsql tui --url mariadb://tsql:tsql@127.0.0.1:33079/tsql"
+    @echo "mariadb ready — try: tsqlx tui --url mariadb://tsqlx:tsqlx@127.0.0.1:33079/tsqlx"
 
 # Stop just the MariaDB container.
 mariadb-down:
@@ -143,42 +143,42 @@ ci: fmt-check lint test audit
 ci-full: ci test-integration
 
 # ─── Release build ────────────────────────────────────────────────────────────
-# These recipes are about building the optimized `tsql` binary locally;
+# These recipes are about building the optimized `tsqlx` binary locally;
 # nothing here touches git tags, crates.io, or GitHub. The CI publish
 # workflow lives in `.github/workflows/release.yml` and is unrelated.
 
 # Print the workspace version that release-* recipes embed in the binary.
 release-version:
-    @echo "tsql {{version}}"
+    @echo "tsqlx {{version}}"
 
 # Pre-flight gates (fmt + clippy + tests + audit + smoke) before a release build.
 release-check: fmt-check lint test audit smoke-sqlite
 
-# Build the optimized release binary into `target/release/tsql`.
+# Build the optimized release binary into `target/release/tsqlx`.
 release-build:
-    cargo build --release -p tsql
+    cargo build --release -p tsqlx
 
 # Print release-binary status: existence, size, mtime, SHA-256, --version output.
 release-status:
-    @if [ ! -x target/release/tsql ]; then \
+    @if [ ! -x target/release/tsqlx ]; then \
         echo "no release binary yet  (run \`just release-build\`)"; \
         exit 0; \
     fi
-    @echo "── target/release/tsql ──"
-    @ls -lh target/release/tsql | awk '{print "size  :", $5; print "mtime :", $6, $7, $8}'
-    @printf "sha256: " && sha256sum target/release/tsql | awk '{print $1}'
-    @printf "tsql  : " && target/release/tsql --version 2>/dev/null || echo "(binary did not respond to --version)"
+    @echo "── target/release/tsqlx ──"
+    @ls -lh target/release/tsqlx | awk '{print "size  :", $5; print "mtime :", $6, $7, $8}'
+    @printf "sha256: " && sha256sum target/release/tsqlx | awk '{print $1}'
+    @printf "tsqlx  : " && target/release/tsqlx --version 2>/dev/null || echo "(binary did not respond to --version)"
 
 # Build the release binary and print its status in one step (build + verify).
 release: release-build release-status
 
 # Build, then run the release binary; pass args after the recipe (default --help).
 release-run *args="--help": release-build
-    ./target/release/tsql {{args}}
+    ./target/release/tsqlx {{args}}
 
-# Install the release binary into ~/.cargo/bin/tsql (so `tsql` is on your PATH).
+# Install the release binary into ~/.cargo/bin/tsqlx (so `tsqlx` is on your PATH).
 release-install:
-    cargo install --path crates/tsql-app --force
+    cargo install --path crates/tsqlx-app --force
 
 # Remove the release build artifacts (keeps the debug target dir intact).
 release-clean:
