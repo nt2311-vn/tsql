@@ -30,7 +30,7 @@ services:
     volumes:
       - ./seed/mysql:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u tsqlx -ptsql --silent"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u tsqlx -ptsqlx --silent"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -50,7 +50,51 @@ services:
     volumes:
       - ./seed/mysql:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -u tsqlx -ptsql --silent"]
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -u tsqlx -ptsqlx --silent"]
       interval: 5s
       timeout: 5s
       retries: 20
+
+  # Microsoft SQL Server 2022. Empty server (no seed) — MSSQL doesn't
+  # honor docker-entrypoint-initdb.d the way Postgres/MySQL do, and
+  # our integration tests bring their own per-test schema anyway.
+  # Login: sa / Tsqlx_Pass1.  Strong password is mandatory (8+ chars,
+  # mixed case + digit + symbol) or the image refuses to start.
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Tsqlx_Pass1"
+      MSSQL_PID: "Developer"
+    ports:
+      - "14330:1433"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Tsqlx_Pass1' -N -C -Q 'SELECT 1' || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  # Oracle Database 23ai Free.  The `gvenzl/oracle-free` image is the
+  # community-maintained ergonomic wrapper around Oracle's own Free
+  # release: it accepts plain ORACLE_PASSWORD / APP_USER env vars and
+  # exposes a sane healthcheck out of the box.  First start is slow
+  # (~90s) because the database files have to initialise.
+  #
+  # Login: tsqlx / tsqlx_pass on the FREEPDB1 pluggable database.
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    environment:
+      ORACLE_PASSWORD: "tsqlx_pass"
+      APP_USER: "tsqlx"
+      APP_USER_PASSWORD: "tsqlx_pass"
+    ports:
+      - "15210:1521"
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
