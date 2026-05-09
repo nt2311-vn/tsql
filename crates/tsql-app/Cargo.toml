@@ -19,10 +19,10 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
-tsql-core = { path = "../tsql-core", version = "0.1.0" }
-tsql-db = { path = "../tsql-db", version = "0.1.0" }
-tsql-sql = { path = "../tsql-sql", version = "0.1.0" }
-tsql-tui = { path = "../tsql-tui", version = "0.1.0" }
+tsql-core = { path = "../tsql-core", version = "0.2.0" }
+tsql-db = { path = "../tsql-db", version = "0.2.0" }
+tsql-sql = { path = "../tsql-sql", version = "0.2.0" }
+tsql-tui = { path = "../tsql-tui", version = "0.2.0" }
 
 [lints]
 workspace = true

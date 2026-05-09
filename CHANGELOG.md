@@ -6,6 +6,93 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-09
+
+### Added
+
+- **MySQL / MariaDB driver.** Full `information_schema` introspection
+  (cols, PKs, FKs, indexes, CHECK constraints) and a cell decoder
+  covering signed/unsigned ints, `BigDecimal`, chrono date/time,
+  JSON, and byte vectors. URLs starting with `mysql://` or
+  `mariadb://` resolve to the same `Pool::MySql` variant; sqlx only
+  speaks `mysql://` so `DriverKind::Mysql.normalise_url` rewrites
+  `mariadb://` on connect. Dockerized `mysql:8.4` and `mariadb:11.4`
+  sandboxes via `just mysql-up` / `just mariadb-up`, with a
+  MySQL-flavoured ERP seed at `seed/mysql/` (sized VARCHARs +
+  explicit `FOREIGN KEY` constraints since MySQL silently ignores
+  inline `REFERENCES`).
+- **Pure-Rust ERD visualizer.** Replaced the `mmdc` + `chafa`
+  pipeline with a hand-rolled box-drawing canvas centred on the
+  selected table. No external tools, no async render pipeline,
+  microsecond redraws. Centre card shows full column list with
+  `★` PK and `⚷` FK markers; side cards show 1-hop neighbours with
+  FK column names labelling each connector arrow. Pane shrinks
+  gracefully — drops the less-useful side, then both, before
+  refusing to render. Side card width adapts to pane width
+  (14/16/18 cells) so half-screen panes still show neighbours.
+- **Multi-line SQL editor.**
+  - Bracketed paste enabled at startup; pasting a whole `.sql`
+    file arrives as one `Event::Paste(String)` instead of one key
+    per character. CRLF / stray CR collapsed to LF.
+  - Cursor-following vertical auto-scroll (`editor_scroll: Cell`)
+    so an arbitrarily long buffer always shows the cursor row.
+  - Editor banner shows `[Ln L:C / total]` so position is clear
+    even in a 200-line buffer.
+- **Half-width terminal layouts.**
+  - Records grid: horizontal column window auto-following the
+    focused column (`[`/`]` slides it). Min cell width 14 so the
+    `YYYY-MM-DD` date prefix always fits. Body cells now
+    left-aligned (`lcell`) so RFC3339 timestamps truncate cleanly
+    from the right instead of getting both ends chopped by
+    centre-alignment. Bottom-row scroll indicator shows
+    `cols X–Y / N` when there are off-screen columns.
+  - Columns / Indexes / Keys / Constraints tabs: percentage widths
+    swapped for `Min(N) + Length(N)` so narrow panes show full
+    names instead of clipping to four chars.
+- **macOS support.** Already worked thanks to a pure-Rust
+  dependency tree (`sqlx + runtime-tokio-rustls`, `ratatui`,
+  `crossterm`, `dirs`); now exercised on every PR via a
+  `[ubuntu-latest, macos-latest]` matrix in `ci.yml`. New
+  cross-platform test in `tsql-core` exercises path resolution
+  on Apple Silicon. README has a Platforms table and macOS notes.
+- **Manual-trigger release workflow.** `release.yml` is now
+  `workflow_dispatch` only with `dry_run`, `create_tag`, and
+  `create_github_release` inputs. Pre-flight job verifies
+  inter-crate version pins match the workspace, refuses to
+  proceed if `vX.Y.Z` already exists, and runs fmt + clippy +
+  test + audit. Publish job retries each `cargo publish` up to
+  five times to handle sparse-index propagation lag. Final job
+  creates the annotated tag and a GitHub Release with auto-notes.
+
+### Changed
+
+- **Editor key map.** `Up` / `Down` arrow keys now move the cursor
+  vertically inside the editor (previously a no-op). `Ctrl+P` /
+  `Ctrl+N` keep their history-recall role.
+- **Driver toggle on the connect screen.** `Tab` cycles
+  `Postgres → SQLite → MySQL → Postgres` so all three drivers are
+  reachable without a chord.
+- **README.** Rewritten with a status gantt chart, four-driver
+  matrix table, runtime sequence diagram including the paste path,
+  editor data flow chart, ERD render flow, and a Platforms section.
+
+### Removed
+
+- **`mmdc` + `chafa` pipeline** and all of its scaffolding:
+  `ErdChart`, `ErdChartStatus`, `ErdChartError`,
+  `parse_ansi_to_lines`, `apply_sgr`, `render_mermaid_with_chafa`,
+  `maybe_spawn_chart_render`, `fnv1a64`. Dropped runtime `tempfile`
+  dep and the unused `tokio` `process` feature.
+
+### Fixed
+
+- Records body cells centre-truncating values like RFC3339
+  timestamps to garbage like `-01-05T09:15:00+0` (centre alignment
+  chopped both ends). Now left-aligned so the meaningful prefix
+  always wins.
+
+## [0.1.0] - earlier
+
 ### Added
 
 - **Persist new connections.** After typing a URL via `n new

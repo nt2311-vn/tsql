@@ -2718,7 +2718,7 @@ dependencies = [
 
 [[package]]
 name = "tsql"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "tsql-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "serde",
@@ -2743,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "tsql-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sqlx",
  "thiserror 2.0.18",
@@ -2754,11 +2754,11 @@ dependencies = [
 
 [[package]]
 name = "tsql-sql"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "tsql-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossterm 0.28.1",
