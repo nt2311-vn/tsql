@@ -35,6 +35,6 @@ bb8 = "0.9"
 bb8-tiberius = { version = "0.16", default-features = false, features = ["with-tokio", "chrono"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 thiserror = "2.0"
-tokio = { version = "1.43", features = ["fs", "io-std", "io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1.52", features = ["fs", "io-std", "io-util", "macros", "rt-multi-thread"] }
 toml = "0.8"
 tempfile = "3.10"
