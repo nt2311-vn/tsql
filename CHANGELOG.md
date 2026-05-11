@@ -6,7 +6,58 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ## [Unreleased]
 
-## [0.3.0] - in flight
+## [0.4.0] - 2026-05-11
+
+### Added
+
+- **Theme switcher.** Six built-in themes — Catppuccin Mocha,
+  Macchiato, Frappe, and Latte alongside Tokyo Night and Gruvbox
+  Dark. `Ctrl+T` cycles through them from any mode (Connect /
+  Browser / Editor); the choice is written back to
+  `[editor].theme` in `~/.config/tsqlx/config.toml` via
+  `toml_edit` so comments, ordering, and `${ENV_VAR}` placeholders
+  survive the round-trip.
+- **`/` live search filter.** Pressing `/` in the Browser pane opens
+  a vim-style filter prompt that updates the view per keystroke.
+  Sidebar pane filters schemas + tables by case-insensitive
+  substring; schemas with no matching child are hidden and matching
+  schemas auto-expand. Records detail tab filters rows where any
+  cell matches. Enter commits the filter and returns focus to
+  navigation; Esc in the prompt clears the filter.
+- **System clipboard via `arboard`.** `y` (cell or columns) and
+  `Y` (row TSV) now hit the OS clipboard. Lazy-init on first yank
+  so headless / no-`DISPLAY` sessions still launch the TUI; if the
+  clipboard backend can't be reached the yank falls back to a
+  status-bar preview so the user always sees what would have been
+  copied. Linux pulls only the pure-Rust `wayland-data-control` +
+  `x11rb` backends (no GTK).
+
+### Fixed
+
+- **`cargo audit` CI failure on `odpic-sys`.** The Oracle driver
+  introduced in 0.3.0 pulls in `odpic-sys` transitively. A
+  transient broken entry in the crates.io index periodically made
+  `cargo audit`'s "Updating crates.io index" phase fail with
+  `parse error: couldn't resolve dependency: odpic-sys`. The CI
+  audit step now pre-clones the RustSec advisory database with a
+  shallow `git clone` and runs `cargo audit --no-fetch`, which
+  skips both the index refresh and cargo-audit's own DB fetch.
+- **Stale `actions/checkout@v4` reference** in the Postgres
+  integration job bumped to `@v6` to match the rest of the
+  workflow.
+
+### Dependencies
+
+- Bump `crossterm` 0.28 → 0.29 (removes the duplicate version
+  pulled in transitively by `ratatui`).
+- Bump `toml` 0.8 → 1.x for the new spec-1.1 parser. The only
+  surface we use (`from_str`, `de::Error`) is unchanged.
+- Bump `tokio` 1.52.1 → 1.52.3 (patch).
+- Add `arboard` 3.x (default features off, only the pure-Rust
+  Linux backends enabled).
+- Add `toml_edit` 0.22 for round-tripping the user's config file.
+
+## [0.3.0] - 2026-05-10
 
 ### Added
 
