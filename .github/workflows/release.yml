@@ -125,10 +125,22 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
 
+      - name: Fetch RustSec advisory database
+        # Matches the pre-clone step in `ci.yml`. `cargo audit
+        # --no-fetch` below refuses to run without the DB on disk.
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cargo"
+          rm -rf "$HOME/.cargo/advisory-db"
+          git clone --depth 1 \
+            https://github.com/RustSec/advisory-db.git \
+            "$HOME/.cargo/advisory-db"
+
       - name: cargo audit
         # `--no-fetch` + the same RUSTSEC exemption as `just audit` and
         # the ci workflow. See `.github/workflows/ci.yml` for the
-        # rationale on skipping the crates.io index refresh.
+        # rationale on pre-cloning the advisory DB and skipping the
+        # cargo-audit fetch.
         run: |
           cargo audit --no-fetch \
             --ignore RUSTSEC-2023-0071 \

@@ -99,14 +99,28 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
 
+      - name: Fetch RustSec advisory database
+        # `cargo audit --no-fetch` refuses to run if the DB isn't on
+        # disk, so we pre-clone it here instead of letting cargo-audit
+        # fetch. Pinning this to a manual clone also lets us control
+        # the clone depth and keeps us off cargo-audit's slower-path
+        # fetch helper.
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cargo"
+          rm -rf "$HOME/.cargo/advisory-db"
+          git clone --depth 1 \
+            https://github.com/RustSec/advisory-db.git \
+            "$HOME/.cargo/advisory-db"
+
       - name: Audit dependencies
-        # `--no-fetch` skips `cargo audit`'s crates.io index refresh;
-        # we rely solely on the committed Cargo.lock + the advisory DB
-        # checked out by the previous step. This dodges an upstream
-        # cargo-audit bug where a transient broken entry in the
-        # registry (recently: `odpic-sys`, reached by the optional
-        # Oracle driver) makes the index parser choke before it even
-        # reads our lockfile.
+        # `--no-fetch` skips cargo-audit's own advisory-db + crates.io
+        # index refresh. We rely solely on the committed Cargo.lock
+        # plus the advisory DB cloned in the previous step. This
+        # dodges an upstream cargo-audit bug where a transient broken
+        # entry in the registry (recently: `odpic-sys`, reached by
+        # the optional Oracle driver) makes the index parser choke
+        # before it even reads our lockfile.
         #
         # Keep this ignore list in sync with `just audit` — reasons
         # documented there. Briefly:
