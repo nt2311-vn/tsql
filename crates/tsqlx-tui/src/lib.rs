@@ -418,6 +418,23 @@ struct AppState {
     /// `:` in Browser mode and is typing a command; `None` otherwise. The
     /// status bar swaps for a `:`-prefixed prompt while this is `Some`.
     command_input: Option<String>,
+    /// Live `/` filter input. `Some((target, buffer))` while the user is
+    /// typing into the filter prompt; `None` otherwise. Each keystroke
+    /// mirrors into `sidebar_filter` / `records_filter` so the result
+    /// updates in real time.
+    filter_input: Option<(FilterTarget, String)>,
+    /// Applied substring filter for the sidebar (schema + table names).
+    /// Empty string means no filter.
+    sidebar_filter: String,
+    /// Applied substring filter for the records grid. Matches against the
+    /// stringified cell values (any column). Empty string means no filter.
+    records_filter: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterTarget {
+    Sidebar,
+    Records,
 }
 
 impl AppState {
@@ -469,21 +486,44 @@ impl AppState {
             tx: None,
             pending: 0,
             command_input: None,
+            filter_input: None,
+            sidebar_filter: String::new(),
+            records_filter: String::new(),
         }
     }
 
+    /// Indices into `records.rows` passing the current `records_filter`.
+    /// When the filter is empty this is a simple `0..len` range.
+    fn filtered_row_indices(&self) -> Vec<usize> {
+        let Some(rec) = &self.records else {
+            return Vec::new();
+        };
+        if self.records_filter.is_empty() {
+            return (0..rec.rows.len()).collect();
+        }
+        let needle = self.records_filter.to_lowercase();
+        rec.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.iter().any(|cell| cell.to_lowercase().contains(&needle)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     fn selected_cell(&self) -> Option<String> {
+        let idx = *self.filtered_row_indices().get(self.record_row)?;
         self.records
             .as_ref()
-            .and_then(|r| r.rows.get(self.record_row))
+            .and_then(|r| r.rows.get(idx))
             .and_then(|row| row.get(self.record_col))
             .cloned()
     }
 
     fn selected_row_tsv(&self) -> Option<String> {
+        let idx = *self.filtered_row_indices().get(self.record_row)?;
         self.records
             .as_ref()
-            .and_then(|r| r.rows.get(self.record_row))
+            .and_then(|r| r.rows.get(idx))
             .map(|row| row.join("\t"))
     }
 }
@@ -492,14 +532,37 @@ impl AppState {
 
 fn rebuild_sidebar(app: &mut AppState, overview: &DatabaseOverview) {
     app.sidebar.clear();
+    let filter = app.sidebar_filter.to_lowercase();
+    let filtering = !filter.is_empty();
     for schema in &overview.schemas {
-        let expanded = app.current_schema == schema.name;
+        let schema_matches = filtering && schema.name.to_lowercase().contains(&filter);
+        // Collect tables we'd render under this schema, respecting the filter.
+        let matching_tables: Vec<&String> = if filtering && !schema_matches {
+            schema
+                .tables
+                .iter()
+                .filter(|t| t.to_lowercase().contains(&filter))
+                .collect()
+        } else {
+            schema.tables.iter().collect()
+        };
+        // Skip schemas that don't contribute anything to the filtered view.
+        if filtering && !schema_matches && matching_tables.is_empty() {
+            continue;
+        }
+        // Auto-expand schemas that have matches while filtering, so users
+        // see hits without an extra keystroke.
+        let expanded = if filtering {
+            schema_matches || !matching_tables.is_empty()
+        } else {
+            app.current_schema == schema.name
+        };
         app.sidebar.push(SidebarEntry::Schema {
             name: schema.name.clone(),
             expanded,
         });
         if expanded {
-            for table in &schema.tables {
+            for table in matching_tables {
                 app.sidebar.push(SidebarEntry::Table {
                     schema: schema.name.clone(),
                     name: table.clone(),
@@ -655,6 +718,10 @@ fn handle_paste(app: &mut AppState, text: &str) {
         _ => {
             if let Some(buf) = app.command_input.as_mut() {
                 buf.push_str(&cleaned.replace('\n', " "));
+            } else if let Some((target, buf)) = app.filter_input.as_mut() {
+                let t = *target;
+                buf.push_str(&cleaned.replace('\n', " "));
+                sync_filter(app, t);
             }
         }
     }
@@ -779,6 +846,11 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         return handle_command_key(app, key).await;
     }
 
+    // The `/` filter prompt likewise steals input while open.
+    if app.filter_input.is_some() {
+        return handle_filter_key(app, key);
+    }
+
     // Ctrl+T cycles the theme from any mode and persists the choice.
     if (key.code, key.modifiers) == (KeyCode::Char('t'), KeyModifiers::CONTROL) {
         cycle_theme(app).await;
@@ -811,6 +883,90 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         AppMode::Connect => handle_connect_key(app, key).await,
         AppMode::Editor => handle_editor_key(app, key).await,
         AppMode::Browser => handle_browser_key(app, key).await,
+    }
+}
+
+/// Apply the current sidebar filter against the stashed overview, so
+/// live-typed `/` input updates the list each keystroke. No-op until
+/// the overview has been loaded.
+fn reapply_sidebar_filter(app: &mut AppState) {
+    if let Some(ov) = app.overview.clone() {
+        rebuild_sidebar(app, &ov);
+    }
+}
+
+/// Handle key input while the `/` filter prompt is open. Each
+/// non-control character appends to the buffer AND mirrors into the
+/// target filter, so the sidebar/records view updates in real time.
+/// Enter closes the prompt keeping the filter; Esc closes the prompt
+/// AND clears the filter.
+fn handle_filter_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    let Some((target, buf)) = app.filter_input.as_mut() else {
+        return Ok(false);
+    };
+    let target = *target;
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            // Cancel: drop the filter entirely and refresh the view.
+            app.filter_input = None;
+            match target {
+                FilterTarget::Sidebar => {
+                    app.sidebar_filter.clear();
+                    reapply_sidebar_filter(app);
+                }
+                FilterTarget::Records => {
+                    app.records_filter.clear();
+                    app.record_row = 0;
+                    app.record_table_state.select(Some(0));
+                }
+            }
+            app.status = nav_hint();
+        }
+        (KeyCode::Enter, _) => {
+            // Commit: keep the filter applied, return focus to navigation.
+            app.filter_input = None;
+            let active = match target {
+                FilterTarget::Sidebar => &app.sidebar_filter,
+                FilterTarget::Records => &app.records_filter,
+            };
+            app.status = if active.is_empty() {
+                nav_hint()
+            } else {
+                format!("filter: /{active}   (press / again to change, Esc in / to clear)")
+            };
+        }
+        (KeyCode::Backspace, _) => {
+            buf.pop();
+            sync_filter(app, target);
+        }
+        (KeyCode::Char(ch), m) if !m.contains(KeyModifiers::CONTROL) => {
+            buf.push(ch);
+            sync_filter(app, target);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// Mirror the filter-input buffer into the active target filter and
+/// refresh whichever view it drives.
+fn sync_filter(app: &mut AppState, target: FilterTarget) {
+    let Some((_, buf)) = &app.filter_input else {
+        return;
+    };
+    let snapshot = buf.clone();
+    match target {
+        FilterTarget::Sidebar => {
+            app.sidebar_filter = snapshot;
+            reapply_sidebar_filter(app);
+        }
+        FilterTarget::Records => {
+            app.records_filter = snapshot;
+            // Keep the row selection valid — filtering may have
+            // removed the previously-selected row.
+            app.record_row = 0;
+            app.record_table_state.select(Some(0));
+        }
     }
 }
 
@@ -1510,6 +1666,27 @@ async fn handle_browser_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 BrowserPane::Detail => BrowserPane::Sidebar,
             };
         }
+        // `/` opens a live filter. Sidebar pane filters the schema/table
+        // list; the Records tab filters rows. Other detail tabs have no
+        // filter target today, so `/` falls through to the default arm.
+        (KeyCode::Char('/'), KeyModifiers::NONE) => {
+            let target = match app.pane {
+                BrowserPane::Sidebar => Some(FilterTarget::Sidebar),
+                BrowserPane::Detail if app.detail_tab == DetailTab::Records => {
+                    Some(FilterTarget::Records)
+                }
+                BrowserPane::Detail => None,
+            };
+            if let Some(target) = target {
+                // Seed the input with the currently-applied filter so
+                // the user can edit in place instead of retyping.
+                let seed = match target {
+                    FilterTarget::Sidebar => app.sidebar_filter.clone(),
+                    FilterTarget::Records => app.records_filter.clone(),
+                };
+                app.filter_input = Some((target, seed));
+            }
+        }
         (KeyCode::Char('e'), _) | (KeyCode::Char('i'), _) => {
             app.mode = AppMode::Editor;
             app.status = editor_hint();
@@ -1641,11 +1818,12 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         }
         KeyCode::Char('j') | KeyCode::Down if app.detail_tab == DetailTab::Records => {
             if let Some(rec) = &app.records {
-                let max = rec.rows.len().saturating_sub(1);
+                let filtered_len = app.filtered_row_indices().len();
+                let max = filtered_len.saturating_sub(1);
                 if app.record_row < max {
                     app.record_row += 1;
                     app.record_table_state.select(Some(app.record_row));
-                } else if rec.rows.len() >= 50 {
+                } else if app.records_filter.is_empty() && rec.rows.len() >= 50 {
                     app.record_offset += 50;
                     let s = app.current_schema.clone();
                     let t = app.current_table.clone();
@@ -2383,14 +2561,19 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         .style(Style::default().bg(th.sel_bg))
         .height(1);
 
-    let rows: Vec<Row> = rec
-        .rows
+    // Only render rows passing the records filter. `filtered` is a
+    // Vec<usize> of indices into `rec.rows`; `record_row` tracks the
+    // index into this filtered view so j/k navigation and y/Y yanks
+    // stay in sync with what the user sees.
+    let filtered = app.filtered_row_indices();
+    let rows: Vec<Row> = filtered
         .iter()
         .enumerate()
-        .map(|(ri, row)| {
-            let row_bg = if ri == app.record_row {
+        .map(|(vi, &ri)| {
+            let row = &rec.rows[ri];
+            let row_bg = if vi == app.record_row {
                 th.sel_bg
-            } else if ri % 2 == 1 {
+            } else if vi % 2 == 1 {
                 th.row_alt_bg
             } else {
                 th.bg
@@ -2401,9 +2584,9 @@ fn draw_records(f: &mut Frame<'_>, app: &AppState, area: Rect) {
                     .enumerate()
                     .map(|(off_idx, val)| {
                         let ci = col_off + off_idx;
-                        let st = if ri == app.record_row && ci == app.record_col {
+                        let st = if vi == app.record_row && ci == app.record_col {
                             Style::default().fg(th.bg).bg(th.accent)
-                        } else if ri == app.record_row {
+                        } else if vi == app.record_row {
                             Style::default().fg(th.sel_fg).bg(row_bg)
                         } else if val == "NULL" {
                             Style::default().fg(th.muted).bg(row_bg)
@@ -3945,6 +4128,14 @@ fn draw_status(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         let cursor_y = area.y;
         f.set_cursor_position((cursor_x, cursor_y));
         (prompt, th.accent)
+    } else if let Some((_, buf)) = &app.filter_input {
+        // Same treatment as the command palette, but with a `/` prefix
+        // so users can see which mode they're in.
+        let prompt = format!("/{buf}");
+        let cursor_x = area.x + prompt.chars().count() as u16;
+        let cursor_y = area.y;
+        f.set_cursor_position((cursor_x, cursor_y));
+        (prompt, th.accent)
     } else if let Some(err) = &app.last_error {
         (format!(" ✗  {err}"), th.error)
     } else {
@@ -3990,8 +4181,9 @@ fn restore_terminal(
 mod tests {
     use super::{
         close_current_table, handle_paste, line_col, line_end, line_start, move_cursor_vertical,
-        next_char_boundary, prev_char_boundary, short_hash, unique_connection_name, AppMode,
-        AppState, ConnectionConfig, DetailTab, DriverKind, Theme, ALL_TABS,
+        next_char_boundary, prev_char_boundary, rebuild_sidebar, short_hash,
+        unique_connection_name, AppMode, AppState, ConnectionConfig, DetailTab, DriverKind,
+        SidebarEntry, StatementOutput, Theme, ALL_TABS,
     };
 
     #[test]
@@ -4382,6 +4574,85 @@ mod tests {
             "mysql://u:p@h/db",
             "mariadb scheme rewrites to mysql for sqlx"
         );
+    }
+
+    #[test]
+    fn sidebar_filter_hides_non_matching_schemas_and_tables() {
+        use tsqlx_db::{DatabaseOverview, SchemaInfo};
+        let mut app = AppState::new(DriverKind::Sqlite, "sqlite::memory:".to_owned());
+        let ov = DatabaseOverview {
+            schemas: vec![
+                SchemaInfo {
+                    name: "public".to_owned(),
+                    tables: vec!["users".to_owned(), "orders".to_owned()],
+                },
+                SchemaInfo {
+                    name: "internal".to_owned(),
+                    tables: vec!["audit_log".to_owned()],
+                },
+            ],
+        };
+        app.overview = Some(ov.clone());
+
+        // No filter: all schemas present, collapsed (only schema rows).
+        rebuild_sidebar(&mut app, &ov);
+        assert_eq!(app.sidebar.len(), 2, "both schemas listed");
+
+        // Filter on "orde" → only `public` schema, expanded, with `orders`.
+        app.sidebar_filter = "orde".to_owned();
+        rebuild_sidebar(&mut app, &ov);
+        let names: Vec<String> = app.sidebar.iter().map(SidebarEntry::display).collect();
+        assert!(
+            names.iter().any(|n| n.contains("public")),
+            "schema kept: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("orders")),
+            "matching table shown: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("users")),
+            "non-matching table hidden: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("internal")),
+            "empty schema hidden: {names:?}"
+        );
+
+        // Schema-name match surfaces all of that schema's tables.
+        app.sidebar_filter = "intern".to_owned();
+        rebuild_sidebar(&mut app, &ov);
+        let names: Vec<String> = app.sidebar.iter().map(SidebarEntry::display).collect();
+        assert!(names.iter().any(|n| n.contains("internal")));
+        assert!(names.iter().any(|n| n.contains("audit_log")));
+    }
+
+    #[test]
+    fn records_filter_narrows_visible_rows_and_yanks() {
+        let mut app = AppState::new(DriverKind::Sqlite, "sqlite::memory:".to_owned());
+        app.records = Some(StatementOutput {
+            statement: "SELECT * FROM users".to_owned(),
+            columns: vec!["id".to_owned(), "name".to_owned()],
+            rows: vec![
+                vec!["1".to_owned(), "Alice".to_owned()],
+                vec!["2".to_owned(), "Bob".to_owned()],
+                vec!["3".to_owned(), "Charlie".to_owned()],
+            ],
+            rows_affected: 0,
+        });
+        app.records_filter = "bob".to_owned();
+        let visible = app.filtered_row_indices();
+        assert_eq!(visible, vec![1], "case-insensitive substring match");
+
+        // `record_row` indexes into the filtered view: row 0 ⇒ Bob.
+        app.record_row = 0;
+        app.record_col = 1;
+        assert_eq!(app.selected_cell().as_deref(), Some("Bob"));
+        assert_eq!(app.selected_row_tsv().as_deref(), Some("2\tBob"));
+
+        // Empty filter restores the full view.
+        app.records_filter.clear();
+        assert_eq!(app.filtered_row_indices(), vec![0, 1, 2]);
     }
 
     #[test]
