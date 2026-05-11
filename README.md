@@ -1,8 +1,8 @@
-# TSQL
+# TSQLX
 
-A fast, keyboard-first terminal database client for **PostgreSQL**, **SQLite**, and **MySQL / MariaDB**, built in Rust.
+A fast, keyboard-first terminal database client for **PostgreSQL**, **SQLite**, **MySQL / MariaDB**, **Microsoft SQL Server**, and **Oracle**, built in Rust.
 
-Runs on **Linux** (any libc) and **macOS** (Apple Silicon + Intel). Pure-Rust dependency tree (`sqlx` + `ratatui` + `crossterm`) means no compiled C blobs to chase across platforms.
+Runs on **Linux** (any libc) and **macOS** (Apple Silicon + Intel). Postgres / SQLite / MySQL travel through pure-Rust `sqlx` (rustls TLS); MSSQL travels through `tiberius` against the OS-native TLS stack (SecureTransport on macOS, SChannel on Windows, OpenSSL on Linux). The Oracle driver is opt-in (`--features oracle`) and links against Oracle Instant Client at runtime.
 
 Just run `tsqlx` and you're at a connection picker. No flags. No GUI. No compromises.
 
@@ -26,7 +26,8 @@ gantt
     PostgreSQL                  :done,    pg,   2026-01-01, 60d
     SQLite                      :done,    sl,   2026-01-15, 50d
     MySQL / MariaDB             :done,    my,   2026-04-15, 30d
-    MSSQL / Oracle              :         ms,   after my, 60d
+    MS SQL Server (tiberius)    :active,  ms,   after my, 30d
+    Oracle (oracle, opt-in)     :active,  or,   after ms, 30d
     section TUI
     Browser + 6 detail tabs     :done,    br,   2026-02-01, 70d
     Records grid (zebra, yank)  :done,    rg,   2026-02-20, 45d
@@ -46,6 +47,8 @@ gantt
 | PostgreSQL driver      | ✅ Stable     | Full metadata: cols, indexes, PKs, FKs, CHECK constraints      |
 | SQLite driver          | ✅ Stable     | PRAGMA-driven introspection; `:memory:` and file URLs          |
 | MySQL / MariaDB driver | ✅ Stable     | `information_schema` introspection; CHECK on 8.0+/10.2+        |
+| MS SQL Server driver   | 🟡 0.3.0      | `tiberius` + `bb8`; `sys.*` introspection; T-SQL `GO` batches  |
+| Oracle driver          | 🟡 0.3.0      | `oracle` crate behind `--features oracle`; PL/SQL `/` batches  |
 | TUI browser            | ✅ Stable     | Schemas → tables → 6 detail tabs                               |
 | Records grid           | ✅ Stable     | Paginated 50/page, zebra rows, `y`/`Y` yank                    |
 | SQL editor             | ✅ Stable     | Run all / run-current, history, `:w` `:e`, multiline           |
@@ -59,7 +62,6 @@ gantt
 | `/` search filter      | ✅ Stable     | Sidebar (schema/table names) + Records (any cell)              |
 | System clipboard       | ✅ Stable     | `arboard` for `y`/`Y`; falls back to status bar when headless  |
 | Connection pool reuse  | 🟡 Planned   | Pool already wired; needs caching layer                        |
-| MSSQL / Oracle         | ⏳ Later      | After MySQL is stable                                          |
 | SQL autocomplete       | ⏳ Later      | Driver-aware identifier + keyword completion                   |
 
 Legend: ✅ shipped · 🟡 in flight (next minor) · ⏳ later milestone
@@ -68,7 +70,7 @@ Legend: ✅ shipped · 🟡 in flight (next minor) · ⏳ later milestone
 
 ## Architecture
 
-TSQL is a small Rust workspace. Each crate has one job and depends only on the layers below it.
+TSQLX is a small Rust workspace. Each crate has one job and depends only on the layers below it.
 
 ```mermaid
 %%{init: {"theme": "dark"}}%%
@@ -86,7 +88,7 @@ graph TD
         C[SqlDocument<br/>boundary-aware tokens]
     end
     subgraph db["tsqlx-db · driver layer"]
-        D[Pool::Postgres / Sqlite / MySql]
+        D[Pool::Postgres / Sqlite / MySql / Mssql / Oracle]
         D2[Schema introspection]
         D3[StatementOutput streaming]
         D4[Driver-specific cell decoders]
@@ -123,33 +125,43 @@ Why split this way?
 %%{init: {"theme": "dark"}}%%
 flowchart LR
     URL[connection URL] --> Detect{DriverKind::from_url}
-    Detect -- "postgres://"<br/>"postgresql://" --> PG[(PostgreSQL)]
-    Detect -- "sqlite:..." --> SL[(SQLite)]
-    Detect -- "mysql://"<br/>"mariadb://" --> MY[(MySQL / MariaDB)]
-    PG --> PoolPG[Pool::Postgres<br/>PgPool · sqlx-postgres]
-    SL --> PoolSL[Pool::Sqlite<br/>SqlitePool · sqlx-sqlite]
-    MY --> PoolMY[Pool::MySql<br/>MySqlPool · sqlx-mysql]
+    Detect -->|postgres:// or postgresql://| PG[(PostgreSQL)]
+    Detect -->|sqlite:...| SL[(SQLite)]
+    Detect -->|mysql:// or mariadb://| MY[(MySQL / MariaDB)]
+    Detect -->|mssql:// sqlserver:// tds://| MS[(MS SQL Server)]
+    Detect -->|oracle://| OR[(Oracle)]
+    PG --> PoolPG[Pool::Postgres - sqlx-postgres]
+    SL --> PoolSL[Pool::Sqlite - sqlx-sqlite]
+    MY --> PoolMY[Pool::MySql - sqlx-mysql]
+    MS --> PoolMS[Pool::Mssql - tiberius + bb8]
+    OR --> PoolOR[Pool::Oracle - oracle crate]
     PoolPG --> Meta[Schema introspection]
     PoolSL --> Meta
     PoolMY --> Meta
-    Meta --> TUI[Same TUI views<br/>for every driver]
+    PoolMS --> Meta
+    PoolOR --> Meta
+    Meta --> TUI[Same TUI views for every driver]
 ```
 
-| Capability                | Postgres                   | SQLite                  | MySQL / MariaDB             |
-| ------------------------- | -------------------------- | ----------------------- | --------------------------- |
-| Multiple schemas          | ✅ `pg_namespace`           | One schema (`main`)     | ✅ Each DATABASE              |
-| Columns + types           | ✅ `information_schema`     | ✅ `PRAGMA table_info`   | ✅ `information_schema`       |
-| Primary keys              | ✅                          | ✅                       | ✅                            |
-| Foreign keys              | ✅                          | ✅ `PRAGMA fk_list`      | ✅ Explicit `FOREIGN KEY` †   |
-| Composite FKs             | ✅                          | ✅                       | ✅                            |
-| Indexes (multi-col)       | ✅ + access method          | ✅ btree                 | ✅ + index_type               |
-| CHECK constraints         | ✅ `pg_constraint`          | ⚠️ surfaced on column   | ✅ MySQL 8.0+ / MariaDB 10.2+ |
-| TIMESTAMP / DATE decoding | ✅ chrono                   | ✅ chrono                | ✅ chrono                     |
-| NUMERIC / DECIMAL         | ✅ `BigDecimal`             | ✅                       | ✅ `BigDecimal`               |
-| JSON                      | ✅                          | n/a                     | ✅                            |
-| UUID                      | ✅                          | TEXT                    | TEXT                         |
+| Capability                | Postgres                   | SQLite                  | MySQL / MariaDB             | MS SQL Server                       | Oracle                                |
+| ------------------------- | -------------------------- | ----------------------- | --------------------------- | ----------------------------------- | ------------------------------------- |
+| Multiple schemas          | ✅ `pg_namespace`           | One schema (`main`)     | ✅ Each DATABASE              | ✅ `sys.schemas`                      | ✅ Each `OWNER`                        |
+| Columns + types           | ✅ `information_schema`     | ✅ `PRAGMA table_info`   | ✅ `information_schema`       | ✅ `sys.columns` + `sys.types`        | ✅ `ALL_TAB_COLUMNS`                   |
+| Primary keys              | ✅                          | ✅                       | ✅                            | ✅ `sys.indexes is_primary_key`       | ✅ `ALL_CONSTRAINTS type='P'`          |
+| Foreign keys              | ✅                          | ✅ `PRAGMA fk_list`      | ✅ Explicit `FOREIGN KEY` †   | ✅ `sys.foreign_keys`                 | ✅ `ALL_CONSTRAINTS type='R'`          |
+| Composite FKs             | ✅                          | ✅                       | ✅                            | ✅                                    | ✅                                     |
+| Indexes (multi-col)       | ✅ + access method          | ✅ btree                 | ✅ + index_type               | ✅ + `type_desc`                      | ✅                                     |
+| CHECK constraints         | ✅ `pg_constraint`          | ⚠️ surfaced on column   | ✅ MySQL 8.0+ / MariaDB 10.2+ | ✅ `sys.check_constraints`            | ✅ `ALL_CONSTRAINTS type='C'`          |
+| TIMESTAMP / DATE decoding | ✅ chrono                   | ✅ chrono                | ✅ chrono                     | ✅ chrono                             | ✅ chrono                              |
+| NUMERIC / DECIMAL         | ✅ `BigDecimal`             | ✅                       | ✅ `BigDecimal`               | ✅ `Numeric`                          | ✅                                     |
+| JSON                      | ✅                          | n/a                     | ✅                            | n/a (NVARCHAR(MAX) + `ISJSON`)       | ✅ `JSON` (21c+) or `CLOB`             |
+| UUID                      | ✅                          | TEXT                    | TEXT                         | ✅ `uniqueidentifier`                 | RAW(16)                               |
 
 † MySQL silently ignores inline `REFERENCES` clauses. Use explicit `CONSTRAINT … FOREIGN KEY` blocks (the bundled `seed/mysql/01_schema.sql` is already adapted).
+
+**MS SQL Server URL format** — `mssql://user:pass@host:port/database?encrypt=on&trust_cert=true&instance=NAMED`. Schemes `sqlserver://` and `tds://` are accepted as aliases. T-SQL `GO` is recognised as a batch separator in scripts.
+
+**Oracle URL format** — `oracle://user:pass@host:port/service_name`. Requires building with `--features oracle` and having Oracle Instant Client (≥ 19c) on the runtime `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`. PL/SQL `BEGIN…END;` blocks and `/`-on-its-own-line batch terminators are honoured.
 
 ---
 
@@ -166,7 +178,7 @@ sequenceDiagram
     participant P as paste handler
     participant U as draw(frame)
     participant T as tokio task
-    participant DB as Pool (PG/SL/MY)
+    participant DB as Pool (PG/SL/MY/MS/OR)
 
     K->>L: KeyEvent or Paste(text)
     alt key
@@ -467,7 +479,14 @@ Pull requests must pass:
 
 ## Roadmap
 
-### 0.2.0 (next)
+### 0.3.0 (in flight)
+
+- ✅ Project rename: `tsql` → `tsqlx` (`tsql` was taken on crates.io)
+- 🟡 MS SQL Server driver via `tiberius` + `bb8`; T-SQL `GO` batches
+- 🟡 Oracle driver via the `oracle` crate (opt-in `--features oracle`); PL/SQL `/` batches
+- 🟡 `mssql://`, `sqlserver://`, `tds://`, `oracle://` URL schemes
+
+### Later
 
 - ~~`/` search filter (sidebar + records)~~ ✅ shipped
 - ~~System clipboard via `arboard` for `y`/`Y`~~ ✅ shipped

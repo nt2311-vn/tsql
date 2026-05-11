@@ -18,9 +18,9 @@ crossterm.workspace = true
 dirs.workspace = true
 ratatui.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "rt", "time"] }
-tsqlx-core = { path = "../tsqlx-core", version = "0.2.0" }
-tsqlx-db = { path = "../tsqlx-db", version = "0.2.0" }
-tsqlx-sql = { path = "../tsqlx-sql", version = "0.2.0" }
+tsqlx-core = { path = "../tsqlx-core", version = "0.3.0" }
+tsqlx-db = { path = "../tsqlx-db", version = "0.3.0" }
+tsqlx-sql = { path = "../tsqlx-sql", version = "0.3.0" }
 
 [dev-dependencies]
 tempfile.workspace = true

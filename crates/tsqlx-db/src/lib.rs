@@ -9,10 +9,38 @@ use thiserror::Error;
 use tsqlx_core::DriverKind;
 use tsqlx_sql::SqlDocument;
 
+pub mod mssql;
+#[cfg(feature = "oracle")]
+pub mod oracle;
+
 #[derive(Debug, Error)]
 pub enum DbError {
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
+    #[error("MSSQL error: {0}")]
+    Mssql(String),
+    #[error("Oracle error: {0}")]
+    Oracle(String),
+    #[error("operation not yet supported for this driver: {0}")]
+    Unsupported(String),
+}
+
+impl From<tiberius::error::Error> for DbError {
+    fn from(value: tiberius::error::Error) -> Self {
+        Self::Mssql(value.to_string())
+    }
+}
+
+impl From<bb8::RunError<bb8_tiberius::Error>> for DbError {
+    fn from(value: bb8::RunError<bb8_tiberius::Error>) -> Self {
+        Self::Mssql(value.to_string())
+    }
+}
+
+impl From<bb8_tiberius::Error> for DbError {
+    fn from(value: bb8_tiberius::Error) -> Self {
+        Self::Mssql(value.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +48,8 @@ pub enum DatabaseDriver {
     Postgres,
     Sqlite,
     MySql,
+    Mssql,
+    Oracle,
 }
 
 impl From<DriverKind> for DatabaseDriver {
@@ -28,6 +58,8 @@ impl From<DriverKind> for DatabaseDriver {
             DriverKind::Postgres => Self::Postgres,
             DriverKind::Sqlite => Self::Sqlite,
             DriverKind::Mysql => Self::MySql,
+            DriverKind::Mssql => Self::Mssql,
+            DriverKind::Oracle => Self::Oracle,
         }
     }
 }
@@ -130,6 +162,9 @@ pub enum Pool {
     Postgres(PgPool),
     Sqlite(SqlitePool),
     MySql(MySqlPool),
+    Mssql(mssql::MssqlPool),
+    #[cfg(feature = "oracle")]
+    Oracle(oracle::OraclePool),
 }
 
 impl Pool {
@@ -149,6 +184,16 @@ impl Pool {
                     .await?;
                 Ok(Self::MySql(pool))
             }
+            DriverKind::Mssql => {
+                let url = driver.normalise_url(url);
+                Ok(Self::Mssql(mssql::connect_pool(&url).await?))
+            }
+            #[cfg(feature = "oracle")]
+            DriverKind::Oracle => Ok(Self::Oracle(oracle::connect_pool(url).await?)),
+            #[cfg(not(feature = "oracle"))]
+            DriverKind::Oracle => Err(DbError::Unsupported(
+                "Oracle support requires building tsqlx with `--features oracle`".to_owned(),
+            )),
         }
     }
 
@@ -157,15 +202,26 @@ impl Pool {
             Pool::Postgres(_) => DriverKind::Postgres,
             Pool::Sqlite(_) => DriverKind::Sqlite,
             Pool::MySql(_) => DriverKind::Mysql,
+            Pool::Mssql(_) => DriverKind::Mssql,
+            #[cfg(feature = "oracle")]
+            Pool::Oracle(_) => DriverKind::Oracle,
         }
     }
 
     pub async fn execute_script(&self, document: &SqlDocument) -> Result<QueryOutput, DbError> {
-        let stmts = document.statements();
         match self {
-            Pool::Postgres(pool) => execute_postgres(pool, &stmts).await,
-            Pool::Sqlite(pool) => execute_sqlite(pool, &stmts).await,
-            Pool::MySql(pool) => execute_mysql(pool, &stmts).await,
+            Pool::Postgres(pool) => execute_postgres(pool, &document.statements()).await,
+            Pool::Sqlite(pool) => execute_sqlite(pool, &document.statements()).await,
+            Pool::MySql(pool) => execute_mysql(pool, &document.statements()).await,
+            // T-SQL `GO` is a client-side batch separator; tiberius's
+            // `simple_query` accepts an arbitrary batch (multiple `;`-
+            // separated statements), so we hand it whole batches.
+            Pool::Mssql(pool) => mssql::execute_script(pool, &document.tsql_batches()).await,
+            // PL/SQL `/` plays the same role as T-SQL `GO`. Each batch
+            // is dispatched to the oracle crate's blocking client via
+            // spawn_blocking inside `oracle::execute_script`.
+            #[cfg(feature = "oracle")]
+            Pool::Oracle(pool) => oracle::execute_script(pool, &document.plsql_batches()).await,
         }
     }
 
@@ -174,6 +230,9 @@ impl Pool {
             Pool::Postgres(pool) => fetch_postgres_overview(pool).await,
             Pool::Sqlite(pool) => fetch_sqlite_overview(pool).await,
             Pool::MySql(pool) => fetch_mysql_overview(pool).await,
+            Pool::Mssql(pool) => mssql::fetch_overview(pool).await,
+            #[cfg(feature = "oracle")]
+            Pool::Oracle(pool) => oracle::fetch_overview(pool).await,
         }
     }
 
@@ -182,6 +241,9 @@ impl Pool {
             Pool::Postgres(pool) => fetch_postgres_table_info(pool, schema, table).await,
             Pool::Sqlite(pool) => fetch_sqlite_table_info(pool, schema, table).await,
             Pool::MySql(pool) => fetch_mysql_table_info(pool, schema, table).await,
+            Pool::Mssql(pool) => mssql::fetch_table_info(pool, schema, table).await,
+            #[cfg(feature = "oracle")]
+            Pool::Oracle(pool) => oracle::fetch_table_info(pool, schema, table).await,
         }
     }
 
@@ -205,6 +267,18 @@ impl Pool {
                 // tables in another database (USE) works.
                 format!("SELECT * FROM `{schema}`.`{table}` LIMIT {limit} OFFSET {offset}")
             }
+            DriverKind::Mssql => {
+                // T-SQL OFFSET/FETCH requires ORDER BY. Use a no-op
+                // ordering so callers don't need to know a key.
+                format!(
+                    "SELECT * FROM [{schema}].[{table}] ORDER BY (SELECT NULL) OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
+                )
+            }
+            DriverKind::Oracle => {
+                format!(
+                    "SELECT * FROM \"{schema}\".\"{table}\" OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
+                )
+            }
         };
         let document = SqlDocument::new(sql);
         self.execute_script(&document)
@@ -223,6 +297,9 @@ impl Pool {
             Pool::Postgres(pool) => fetch_postgres_relationships(pool, schema).await,
             Pool::Sqlite(pool) => fetch_sqlite_relationships(pool, schema).await,
             Pool::MySql(pool) => fetch_mysql_relationships(pool, schema).await,
+            Pool::Mssql(pool) => mssql::fetch_relationships(pool, schema).await,
+            #[cfg(feature = "oracle")]
+            Pool::Oracle(pool) => oracle::fetch_relationships(pool, schema).await,
         }
     }
 }

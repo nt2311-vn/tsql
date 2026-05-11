@@ -107,11 +107,46 @@ mariadb-down:
     {{docker_compose}} stop mariadb
     {{docker_compose}} rm -f mariadb
 
-# Bring up every driver sandbox at once.
-drivers-up: postgres-up sqlite-up mysql-up mariadb-up
+# Start the dockerized MS SQL Server 2022 (localhost:14330). Empty
+# server — sa / Tsqlx_Pass1.  Strong password is mandatory.
+mssql-up:
+    {{docker_compose}} up -d --wait mssql
+    @echo "mssql ready — try: tsqlx tui --url 'mssql://sa:Tsqlx_Pass1@127.0.0.1:14330/master?encrypt=off&trust_cert=true'"
+
+# Stop just the MSSQL container.
+mssql-down:
+    {{docker_compose}} stop mssql
+    {{docker_compose}} rm -f mssql
+
+# Run the MSSQL integration tests against the dockerized server.
+test-mssql:
+    TSQLX_TEST_MSSQL_URL='mssql://sa:Tsqlx_Pass1@127.0.0.1:14330/master?encrypt=off&trust_cert=true' \
+        cargo test -p tsqlx-db --test mssql -- --ignored
+
+# Start the dockerized Oracle Database 23ai Free (localhost:15210).
+# First start is slow (~90s); subsequent starts hit the data volume.
+oracle-up:
+    {{docker_compose}} up -d --wait oracle
+    @echo "oracle ready — try (needs --features oracle and Instant Client):"
+    @echo "  cargo run -p tsqlx --features oracle -- tui --url 'oracle://tsqlx:tsqlx_pass@127.0.0.1:15210/FREEPDB1'"
+
+# Stop just the Oracle container.
+oracle-down:
+    {{docker_compose}} stop oracle
+    {{docker_compose}} rm -f oracle
+
+# Run the Oracle integration tests against the dockerized server.
+# Requires Oracle Instant Client on the runtime library path.
+test-oracle:
+    TSQLX_TEST_ORACLE_URL='oracle://tsqlx:tsqlx_pass@127.0.0.1:15210/FREEPDB1' \
+        cargo test -p tsqlx-db --features oracle --test oracle -- --ignored
+
+# Bring up every driver sandbox at once.  Oracle deliberately omitted —
+# its first-start cost makes it opt-in.
+drivers-up: postgres-up sqlite-up mysql-up mariadb-up mssql-up
 
 # Tear down every driver sandbox at once.
-drivers-down: postgres-down sqlite-down mysql-down mariadb-down
+drivers-down: postgres-down sqlite-down mysql-down mariadb-down mssql-down oracle-down
 
 # Backward-compatible aliases for the original Postgres-only recipes.
 alias up := postgres-up
@@ -123,12 +158,19 @@ alias seed-sqlite := sqlite-up
 
 # Audit dependencies against the RustSec advisory database.
 #
-# RUSTSEC-2023-0071 (RSA timing sidechannel) has no upstream fix and
-# only reaches us transitively through `sqlx-mysql`, which we don't
-# enable. Ignore it explicitly so CI stays green; revisit when sqlx
-# 0.9 publishes a patched MySQL driver.
+# RUSTSEC-2023-0071 (RSA Marvin timing sidechannel) has no upstream
+# fix and only reaches us transitively through `sqlx-mysql`, which
+# we don't enable. Revisit when sqlx 0.9 ships with a patched MySQL
+# driver.
+#
+# RUSTSEC-2024-0436 (paste unmaintained) and RUSTSEC-2025-0134
+# (rustls-pemfile unmaintained) are maintenance advisories with no
+# CVE; ignored until upstream updates land.
 audit:
-    cargo audit --ignore RUSTSEC-2023-0071
+    cargo audit \
+        --ignore RUSTSEC-2023-0071 \
+        --ignore RUSTSEC-2024-0436 \
+        --ignore RUSTSEC-2025-0134
 
 # Run cargo audit and remind that TruffleHog/Gitleaks/Semgrep/Trivy live in CI.
 security: audit

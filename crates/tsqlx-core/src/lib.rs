@@ -68,6 +68,16 @@ pub enum DriverKind {
     /// accepted in the TOML config as a friendly alias.
     #[serde(alias = "mariadb")]
     Mysql,
+    /// Microsoft SQL Server / Azure SQL via the TDS protocol
+    /// (driver: `tiberius`). URLs accept `mssql://`, `sqlserver://`,
+    /// or `tds://`. `driver = "sqlserver"` and `driver = "tds"` are
+    /// TOML aliases.
+    #[serde(alias = "sqlserver", alias = "tds")]
+    Mssql,
+    /// Oracle Database (driver: `oracle` crate, requires Oracle
+    /// Instant Client at runtime; build with `--features oracle`).
+    /// URL format: `oracle://user:pass@host:port/service_name`.
+    Oracle,
 }
 
 impl DriverKind {
@@ -78,6 +88,13 @@ impl DriverKind {
             Ok(Self::Sqlite)
         } else if url.starts_with("mysql://") || url.starts_with("mariadb://") {
             Ok(Self::Mysql)
+        } else if url.starts_with("mssql://")
+            || url.starts_with("sqlserver://")
+            || url.starts_with("tds://")
+        {
+            Ok(Self::Mssql)
+        } else if url.starts_with("oracle://") {
+            Ok(Self::Oracle)
         } else {
             Err(ConfigError::UnsupportedDriver(
                 url.split(':').next().unwrap_or(url).to_owned(),
@@ -85,15 +102,28 @@ impl DriverKind {
         }
     }
 
-    /// MySQL deserves both spellings of its scheme. sqlx's `MySqlPool`
-    /// only accepts `mysql://`, so we normalise on connect.
+    /// Some drivers accept friendlier scheme aliases than their
+    /// underlying client library. We normalise to the canonical form
+    /// here so the rest of the stack sees a single shape.
     pub fn normalise_url(self, url: &str) -> String {
-        if matches!(self, Self::Mysql) {
-            if let Some(rest) = url.strip_prefix("mariadb://") {
-                return format!("mysql://{rest}");
+        match self {
+            Self::Mysql => {
+                if let Some(rest) = url.strip_prefix("mariadb://") {
+                    format!("mysql://{rest}")
+                } else {
+                    url.to_owned()
+                }
             }
+            Self::Mssql => {
+                for prefix in ["sqlserver://", "tds://"] {
+                    if let Some(rest) = url.strip_prefix(prefix) {
+                        return format!("mssql://{rest}");
+                    }
+                }
+                url.to_owned()
+            }
+            _ => url.to_owned(),
         }
-        url.to_owned()
     }
 }
 
@@ -172,6 +202,8 @@ pub async fn append_connection(
         DriverKind::Postgres => "postgres",
         DriverKind::Sqlite => "sqlite",
         DriverKind::Mysql => "mysql",
+        DriverKind::Mssql => "mssql",
+        DriverKind::Oracle => "oracle",
     };
     let escaped_url = connection.url.replace('\\', "\\\\").replace('"', "\\\"");
     let mut block = String::new();
@@ -359,6 +391,60 @@ mod tests {
         let info = ProjectInfo::default();
 
         assert_eq!(info.name, "tsqlx");
+    }
+
+    #[test]
+    fn driver_kind_recognises_mssql_url_aliases() {
+        for url in [
+            "mssql://sa:p@host/db",
+            "sqlserver://sa:p@host/db",
+            "tds://sa:p@host/db",
+        ] {
+            assert_eq!(
+                DriverKind::from_url(url).unwrap(),
+                DriverKind::Mssql,
+                "url `{url}` should parse to Mssql"
+            );
+        }
+        assert_eq!(
+            DriverKind::Mssql.normalise_url("sqlserver://sa:p@host/db"),
+            "mssql://sa:p@host/db"
+        );
+        assert_eq!(
+            DriverKind::Mssql.normalise_url("tds://sa:p@host/db"),
+            "mssql://sa:p@host/db"
+        );
+    }
+
+    #[test]
+    fn driver_kind_recognises_oracle_url() {
+        assert_eq!(
+            DriverKind::from_url("oracle://user:pass@host:1521/ORCLPDB1").unwrap(),
+            DriverKind::Oracle
+        );
+    }
+
+    #[test]
+    fn driver_kind_serde_aliases() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+            [connections.ms]
+            driver = "sqlserver"
+            url = "mssql://sa:p@host/db"
+
+            [connections.ms2]
+            driver = "tds"
+            url = "mssql://sa:p@host/db"
+
+            [connections.ora]
+            driver = "oracle"
+            url = "oracle://u:p@host/db"
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(cfg.connection("ms").unwrap().driver, DriverKind::Mssql);
+        assert_eq!(cfg.connection("ms2").unwrap().driver, DriverKind::Mssql);
+        assert_eq!(cfg.connection("ora").unwrap().driver, DriverKind::Oracle);
     }
 
     #[test]
