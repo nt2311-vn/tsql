@@ -100,13 +100,21 @@ jobs:
         uses: taiki-e/install-action@cargo-audit
 
       - name: Audit dependencies
-        # Keep this list in sync with `just audit` — reasons documented
-        # there. Briefly:
+        # `--no-fetch` skips `cargo audit`'s crates.io index refresh;
+        # we rely solely on the committed Cargo.lock + the advisory DB
+        # checked out by the previous step. This dodges an upstream
+        # cargo-audit bug where a transient broken entry in the
+        # registry (recently: `odpic-sys`, reached by the optional
+        # Oracle driver) makes the index parser choke before it even
+        # reads our lockfile.
+        #
+        # Keep this ignore list in sync with `just audit` — reasons
+        # documented there. Briefly:
         #   RUSTSEC-2023-0071: RSA Marvin (transitive via sqlx-mysql).
         #   RUSTSEC-2024-0436 / RUSTSEC-2025-0134: maintenance advisories
         #     for `paste` / `rustls-pemfile`.
         run: |
-          cargo audit \
+          cargo audit --no-fetch \
             --ignore RUSTSEC-2023-0071 \
             --ignore RUSTSEC-2024-0436 \
             --ignore RUSTSEC-2025-0134
@@ -133,7 +141,7 @@ jobs:
           --health-retries 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
