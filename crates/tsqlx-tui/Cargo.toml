@@ -12,6 +12,7 @@ keywords = ["sql", "database", "terminal", "tui"]
 categories = ["command-line-utilities", "database"]
 
 [dependencies]
+arboard.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 dirs.workspace = true

@@ -429,6 +429,11 @@ struct AppState {
     /// Applied substring filter for the records grid. Matches against the
     /// stringified cell values (any column). Empty string means no filter.
     records_filter: String,
+    /// System clipboard handle, lazily initialised. `None` means the
+    /// clipboard backend (X11 / Wayland / win32 / macOS) couldn't be
+    /// reached — usually an SSH session with no DISPLAY. In that case
+    /// yanks fall back to a status-bar preview.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -489,6 +494,9 @@ impl AppState {
             filter_input: None,
             sidebar_filter: String::new(),
             records_filter: String::new(),
+            // Init lazily on first yank so tests / headless runs don't
+            // pay the cost of opening the X11 / Wayland connection.
+            clipboard: None,
         }
     }
 
@@ -817,6 +825,38 @@ fn apply_db_message(app: &mut AppState, msg: DbMessage) {
             }
         }
     }
+}
+
+/// Copy `text` to the system clipboard and write a status line that
+/// includes the `label` and a truncated preview. If the clipboard
+/// backend can't be reached the yank is silently demoted to a
+/// status-bar preview so the user still sees what would have been
+/// copied — this matches how the old status-only yank behaved in
+/// headless sessions.
+fn yank_to_clipboard(app: &mut AppState, label: &str, text: &str) {
+    // Lazy-init on first yank. A session that started before a
+    // graphical server was available (e.g. tmux on tty) can still
+    // succeed on a later yank once a DISPLAY exists.
+    if app.clipboard.is_none() {
+        app.clipboard = arboard::Clipboard::new().ok();
+    }
+    let preview = truncate_for_status(text, 60);
+    match app.clipboard.as_mut() {
+        Some(cb) => match cb.set_text(text.to_owned()) {
+            Ok(()) => app.status = format!("copied {label}: {preview}"),
+            Err(e) => app.status = format!("yanked {label}: {preview}  (clipboard: {e})"),
+        },
+        None => app.status = format!("yanked {label}: {preview}  (no clipboard)"),
+    }
+}
+
+fn truncate_for_status(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 /// Advance to the next theme in the registry, persist it to the user's
@@ -1878,14 +1918,18 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         KeyCode::Char('y') => match app.detail_tab {
             DetailTab::Records => {
                 if let Some(val) = app.selected_cell() {
-                    app.status = format!("yanked: {val}");
+                    yank_to_clipboard(app, "cell", &val);
                 }
             }
             DetailTab::Columns => {
                 if let Some(info) = &app.table_info {
-                    let col_names: Vec<&str> =
-                        info.columns.iter().map(|c| c.name.as_str()).collect();
-                    app.status = format!("yanked columns: {}", col_names.join(", "));
+                    let col_names = info
+                        .columns
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    yank_to_clipboard(app, "columns", &col_names);
                 }
             }
             DetailTab::Erd => match save_mermaid_for_schema(app).await {
@@ -1900,7 +1944,7 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         },
         KeyCode::Char('Y') if app.detail_tab == DetailTab::Records => {
             if let Some(tsv) = app.selected_row_tsv() {
-                app.status = format!("yanked row: {tsv}");
+                yank_to_clipboard(app, "row", &tsv);
             }
         }
         KeyCode::Esc => {
@@ -4181,9 +4225,9 @@ fn restore_terminal(
 mod tests {
     use super::{
         close_current_table, handle_paste, line_col, line_end, line_start, move_cursor_vertical,
-        next_char_boundary, prev_char_boundary, rebuild_sidebar, short_hash,
-        unique_connection_name, AppMode, AppState, ConnectionConfig, DetailTab, DriverKind,
-        SidebarEntry, StatementOutput, Theme, ALL_TABS,
+        next_char_boundary, prev_char_boundary, rebuild_sidebar, short_hash, truncate_for_status,
+        unique_connection_name, yank_to_clipboard, AppMode, AppState, ConnectionConfig, DetailTab,
+        DriverKind, SidebarEntry, StatementOutput, Theme, ALL_TABS,
     };
 
     #[test]
@@ -4653,6 +4697,35 @@ mod tests {
         // Empty filter restores the full view.
         app.records_filter.clear();
         assert_eq!(app.filtered_row_indices(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn truncate_for_status_caps_long_strings() {
+        assert_eq!(truncate_for_status("short", 10), "short");
+        let long: String = "a".repeat(80);
+        let out = truncate_for_status(&long, 10);
+        assert_eq!(out.chars().count(), 11, "10 chars + ellipsis");
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn yank_to_clipboard_falls_back_to_status_without_display() {
+        // The test runner has no clipboard backend in CI / headless,
+        // and `AppState::new` leaves `clipboard = None`. We assert the
+        // user-visible message either reports a successful copy OR
+        // falls back to a status-bar preview — never silently drops.
+        let mut app = AppState::new(DriverKind::Sqlite, "sqlite::memory:".to_owned());
+        yank_to_clipboard(&mut app, "cell", "hello world");
+        assert!(
+            app.status.contains("hello world"),
+            "preview must appear in status: {}",
+            app.status,
+        );
+        assert!(
+            app.status.starts_with("copied cell:") || app.status.starts_with("yanked cell:"),
+            "either path is acceptable: {}",
+            app.status,
+        );
     }
 
     #[test]
