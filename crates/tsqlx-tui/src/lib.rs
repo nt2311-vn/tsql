@@ -23,7 +23,9 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tsqlx_core::{append_connection, default_config_path, ConnectionConfig, DriverKind};
+use tsqlx_core::{
+    append_connection, default_config_path, set_editor_theme, ConnectionConfig, DriverKind,
+};
 use tsqlx_db::{DatabaseOverview, Pool, RelationshipEdge, StatementOutput, TableInfo};
 use tsqlx_sql::SqlDocument;
 
@@ -102,6 +104,142 @@ impl Theme {
             active_border: Color::Rgb(137, 180, 250),
             row_alt_bg: Color::Rgb(36, 36, 56),
         }
+    }
+
+    #[must_use]
+    pub const fn catppuccin_macchiato() -> Self {
+        Self {
+            name: "catppuccin-macchiato",
+            bg: Color::Rgb(36, 39, 58),
+            fg: Color::Rgb(202, 211, 245),
+            accent: Color::Rgb(138, 173, 244),
+            accent2: Color::Rgb(198, 160, 246),
+            success: Color::Rgb(166, 218, 149),
+            error: Color::Rgb(237, 135, 150),
+            warning: Color::Rgb(238, 212, 159),
+            muted: Color::Rgb(110, 115, 141),
+            sel_bg: Color::Rgb(73, 77, 100),
+            sel_fg: Color::Rgb(202, 211, 245),
+            border: Color::Rgb(73, 77, 100),
+            active_border: Color::Rgb(138, 173, 244),
+            row_alt_bg: Color::Rgb(42, 45, 66),
+        }
+    }
+
+    #[must_use]
+    pub const fn catppuccin_frappe() -> Self {
+        Self {
+            name: "catppuccin-frappe",
+            bg: Color::Rgb(48, 52, 70),
+            fg: Color::Rgb(198, 208, 245),
+            accent: Color::Rgb(140, 170, 238),
+            accent2: Color::Rgb(202, 158, 230),
+            success: Color::Rgb(166, 209, 137),
+            error: Color::Rgb(231, 130, 132),
+            warning: Color::Rgb(229, 200, 144),
+            muted: Color::Rgb(115, 121, 148),
+            sel_bg: Color::Rgb(81, 87, 109),
+            sel_fg: Color::Rgb(198, 208, 245),
+            border: Color::Rgb(81, 87, 109),
+            active_border: Color::Rgb(140, 170, 238),
+            row_alt_bg: Color::Rgb(55, 59, 80),
+        }
+    }
+
+    #[must_use]
+    pub const fn catppuccin_latte() -> Self {
+        Self {
+            name: "catppuccin-latte",
+            bg: Color::Rgb(239, 241, 245),
+            fg: Color::Rgb(76, 79, 105),
+            accent: Color::Rgb(30, 102, 245),
+            accent2: Color::Rgb(136, 57, 239),
+            success: Color::Rgb(64, 160, 43),
+            error: Color::Rgb(210, 15, 57),
+            warning: Color::Rgb(223, 142, 29),
+            muted: Color::Rgb(140, 143, 161),
+            sel_bg: Color::Rgb(204, 208, 218),
+            sel_fg: Color::Rgb(76, 79, 105),
+            border: Color::Rgb(188, 192, 204),
+            active_border: Color::Rgb(30, 102, 245),
+            row_alt_bg: Color::Rgb(230, 233, 239),
+        }
+    }
+
+    #[must_use]
+    pub const fn tokyo_night() -> Self {
+        Self {
+            name: "tokyo-night",
+            bg: Color::Rgb(26, 27, 38),
+            fg: Color::Rgb(192, 202, 245),
+            accent: Color::Rgb(122, 162, 247),
+            accent2: Color::Rgb(187, 154, 247),
+            success: Color::Rgb(158, 206, 106),
+            error: Color::Rgb(247, 118, 142),
+            warning: Color::Rgb(224, 175, 104),
+            muted: Color::Rgb(86, 95, 137),
+            sel_bg: Color::Rgb(40, 52, 87),
+            sel_fg: Color::Rgb(192, 202, 245),
+            border: Color::Rgb(59, 66, 97),
+            active_border: Color::Rgb(122, 162, 247),
+            row_alt_bg: Color::Rgb(31, 35, 53),
+        }
+    }
+
+    #[must_use]
+    pub const fn gruvbox_dark() -> Self {
+        Self {
+            name: "gruvbox-dark",
+            bg: Color::Rgb(40, 40, 40),
+            fg: Color::Rgb(235, 219, 178),
+            accent: Color::Rgb(131, 165, 152),
+            accent2: Color::Rgb(211, 134, 155),
+            success: Color::Rgb(184, 187, 38),
+            error: Color::Rgb(251, 73, 52),
+            warning: Color::Rgb(250, 189, 47),
+            muted: Color::Rgb(146, 131, 116),
+            sel_bg: Color::Rgb(60, 56, 54),
+            sel_fg: Color::Rgb(235, 219, 178),
+            border: Color::Rgb(80, 73, 69),
+            active_border: Color::Rgb(250, 189, 47),
+            row_alt_bg: Color::Rgb(50, 48, 47),
+        }
+    }
+
+    /// All themes shipped with tsqlx, in `Ctrl+T` cycle order.
+    #[must_use]
+    pub fn all() -> &'static [fn() -> Self] {
+        const ALL: &[fn() -> Theme] = &[
+            Theme::catppuccin_mocha,
+            Theme::catppuccin_macchiato,
+            Theme::catppuccin_frappe,
+            Theme::catppuccin_latte,
+            Theme::tokyo_night,
+            Theme::gruvbox_dark,
+        ];
+        ALL
+    }
+
+    /// Lookup by config name; unknown names fall back to the default theme.
+    #[must_use]
+    pub fn by_name(name: &str) -> Self {
+        Self::all()
+            .iter()
+            .map(|f| f())
+            .find(|t| t.name == name)
+            .unwrap_or_else(Self::catppuccin_mocha)
+    }
+
+    /// Next theme in the cycle.
+    #[must_use]
+    pub fn next_in_cycle(self) -> Self {
+        let all = Self::all();
+        let idx = all
+            .iter()
+            .map(|f| f())
+            .position(|t| t.name == self.name)
+            .unwrap_or(0);
+        all[(idx + 1) % all.len()]()
     }
 }
 
@@ -380,9 +518,28 @@ fn rebuild_sidebar(app: &mut AppState, overview: &DatabaseOverview) {
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
+/// Startup customisation plumbed from `~/.config/tsqlx/config.toml`.
+#[derive(Debug, Clone, Default)]
+pub struct StartupOptions {
+    /// Theme name from `[editor].theme` (e.g. `"catppuccin-mocha"`).
+    /// `None` keeps the default theme.
+    pub theme: Option<String>,
+    /// Path to the active `config.toml`, used when persisting runtime
+    /// theme changes. `None` disables persistence.
+    pub config_path: Option<PathBuf>,
+}
+
 pub async fn run(driver: DriverKind, url: String) -> Result<()> {
+    run_with_options(driver, url, StartupOptions::default()).await
+}
+
+pub async fn run_with_options(driver: DriverKind, url: String, opts: StartupOptions) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = AppState::new(driver, url);
+    if let Some(name) = opts.theme.as_deref() {
+        app.theme = Theme::by_name(name);
+    }
+    app.config_path_override = opts.config_path;
     let (tx, rx) = unbounded_channel();
     app.tx = Some(tx);
 
@@ -405,8 +562,19 @@ pub async fn run(driver: DriverKind, url: String) -> Result<()> {
 }
 
 pub async fn run_connect(connections: Vec<(String, ConnectionConfig)>) -> Result<()> {
+    run_connect_with_options(connections, StartupOptions::default()).await
+}
+
+pub async fn run_connect_with_options(
+    connections: Vec<(String, ConnectionConfig)>,
+    opts: StartupOptions,
+) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = AppState::new(DriverKind::Postgres, String::new());
+    if let Some(name) = opts.theme.as_deref() {
+        app.theme = Theme::by_name(name);
+    }
+    app.config_path_override = opts.config_path;
     let (tx, rx) = unbounded_channel();
     app.tx = Some(tx);
     app.mode = AppMode::Connect;
@@ -584,6 +752,22 @@ fn apply_db_message(app: &mut AppState, msg: DbMessage) {
     }
 }
 
+/// Advance to the next theme in the registry, persist it to the user's
+/// `config.toml`, and surface the result in the status bar. A failed
+/// save keeps the new theme for the session and reports the error.
+async fn cycle_theme(app: &mut AppState) {
+    let next = app.theme.next_in_cycle();
+    app.theme = next;
+    let path = app
+        .config_path_override
+        .clone()
+        .unwrap_or_else(default_config_path);
+    match set_editor_theme(&path, next.name).await {
+        Ok(()) => app.status = format!("theme: {} (saved)", next.name),
+        Err(e) => app.status = format!("theme: {} (save failed: {e})", next.name),
+    }
+}
+
 async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     // Ctrl+C is always a hard quit, even from text-entry contexts.
     if (key.code, key.modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL) {
@@ -593,6 +777,12 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     // The command palette steals all input while open.
     if app.command_input.is_some() {
         return handle_command_key(app, key).await;
+    }
+
+    // Ctrl+T cycles the theme from any mode and persists the choice.
+    if (key.code, key.modifiers) == (KeyCode::Char('t'), KeyModifiers::CONTROL) {
+        cycle_theme(app).await;
+        return Ok(false);
     }
 
     match (key.code, key.modifiers) {
@@ -4192,5 +4382,25 @@ mod tests {
             "mysql://u:p@h/db",
             "mariadb scheme rewrites to mysql for sqlx"
         );
+    }
+
+    #[test]
+    fn theme_registry_lookup_and_cycle() {
+        assert_eq!(Theme::by_name("catppuccin-mocha").name, "catppuccin-mocha");
+        assert_eq!(Theme::by_name("tokyo-night").name, "tokyo-night");
+        assert_eq!(
+            Theme::by_name("does-not-exist").name,
+            "catppuccin-mocha",
+            "unknown name falls back to default"
+        );
+
+        let mut t = Theme::catppuccin_mocha();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..Theme::all().len() {
+            seen.insert(t.name);
+            t = t.next_in_cycle();
+        }
+        assert_eq!(t.name, "catppuccin-mocha", "cycle returns to start");
+        assert_eq!(seen.len(), Theme::all().len(), "every theme visited once");
     }
 }
