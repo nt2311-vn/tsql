@@ -3248,7 +3248,7 @@ dependencies = [
 
 [[package]]
 name = "tsqlx"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3261,7 +3261,7 @@ dependencies = [
 
 [[package]]
 name = "tsqlx-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dirs",
  "serde",
@@ -3274,7 +3274,7 @@ dependencies = [
 
 [[package]]
 name = "tsqlx-db"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bb8",
  "bb8-tiberius",
@@ -3290,11 +3290,11 @@ dependencies = [
 
 [[package]]
 name = "tsqlx-sql"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "tsqlx-tui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arboard",
