@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncReadExt;
-use tsqlx_core::{AppConfig, ConnectionConfig, DriverKind};
+use tsqlx_core::{default_config_path, AppConfig, ConnectionConfig, DriverKind};
 use tsqlx_db::{execute_script, QueryOutput};
 use tsqlx_sql::SqlDocument;
+use tsqlx_tui::StartupOptions;
 
 #[derive(Debug, Parser)]
 #[command(name = "tsqlx")]
@@ -89,18 +90,29 @@ async fn main() -> Result<()> {
             url,
             driver,
         }) => {
+            let opts = startup_options(config.clone()).await;
             if url.is_some() || connection.is_some() {
                 let conn = resolve_connection(config, connection, url, driver).await?;
-                tsqlx_tui::run(conn.driver, conn.url).await
+                tsqlx_tui::run_with_options(conn.driver, conn.url, opts).await
             } else {
                 let saved = load_saved_connections(config).await;
-                tsqlx_tui::run_connect(saved).await
+                tsqlx_tui::run_connect_with_options(saved, opts).await
             }
         }
         None => {
+            let opts = startup_options(None).await;
             let saved = load_saved_connections(None).await;
-            tsqlx_tui::run_connect(saved).await
+            tsqlx_tui::run_connect_with_options(saved, opts).await
         }
+    }
+}
+
+async fn startup_options(config: Option<PathBuf>) -> StartupOptions {
+    let path = config.unwrap_or_else(default_config_path);
+    let theme = AppConfig::load(&path).await.ok().map(|c| c.editor.theme);
+    StartupOptions {
+        theme,
+        config_path: Some(path),
     }
 }
 

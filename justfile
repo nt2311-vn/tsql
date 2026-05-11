@@ -167,7 +167,7 @@ alias seed-sqlite := sqlite-up
 # (rustls-pemfile unmaintained) are maintenance advisories with no
 # CVE; ignored until upstream updates land.
 audit:
-    cargo audit \
+    cargo audit --no-fetch \
         --ignore RUSTSEC-2023-0071 \
         --ignore RUSTSEC-2024-0436 \
         --ignore RUSTSEC-2025-0134

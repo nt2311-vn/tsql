@@ -31,6 +31,15 @@ pub enum ConfigError {
     },
     #[error("connection name `{0}` is invalid (must be a non-empty TOML key)")]
     InvalidConnectionName(String),
+    #[error("failed to edit TOML config `{path}`: {source}")]
+    Edit {
+        path: String,
+        // Boxed to keep `ConfigError` small enough for clippy's
+        // `result_large_err` threshold.
+        source: Box<toml_edit::TomlError>,
+    },
+    #[error("malformed config `{path}`: {message}")]
+    Malformed { path: String, message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +249,58 @@ pub async fn append_connection(
     Ok(())
 }
 
+/// Update (or insert) `[editor].theme` in the user's TOML config,
+/// preserving surrounding comments, ordering, and env-var placeholders.
+/// Creates the file (and its parent directory) on demand.
+pub async fn set_editor_theme(path: &Path, theme: &str) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|source| ConfigError::Write {
+                    path: parent.display().to_string(),
+                    source,
+                })?;
+        }
+    }
+
+    let existing = if path.exists() {
+        fs::read_to_string(path)
+            .await
+            .map_err(|source| ConfigError::Read {
+                path: path.display().to_string(),
+                source,
+            })?
+    } else {
+        String::new()
+    };
+
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|source| ConfigError::Edit {
+            path: path.display().to_string(),
+            source: Box::new(source),
+        })?;
+
+    let editor = doc
+        .entry("editor")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ConfigError::Malformed {
+            path: path.display().to_string(),
+            message: "expected `[editor]` to be a table".to_owned(),
+        })?;
+    editor["theme"] = toml_edit::value(theme);
+
+    fs::write(path, doc.to_string())
+        .await
+        .map_err(|source| ConfigError::Write {
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(())
+}
+
 fn is_valid_connection_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -320,7 +381,8 @@ pub fn expand_environment_variables(input: &str) -> Result<String, ConfigError> 
 mod tests {
     use super::{
         append_connection, default_config_path, expand_environment_variables,
-        is_valid_connection_name, AppConfig, ConnectionConfig, DriverKind, ProjectInfo,
+        is_valid_connection_name, set_editor_theme, AppConfig, ConnectionConfig, DriverKind,
+        ProjectInfo,
     };
     use tempfile::tempdir;
 
@@ -506,5 +568,60 @@ mod tests {
             .expect_err("must reject");
         assert!(matches!(err, super::ConfigError::InvalidConnectionName(_)));
         assert!(!path.exists(), "no file should have been created");
+    }
+
+    #[tokio::test]
+    async fn set_editor_theme_creates_file_when_missing() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("config.toml");
+        set_editor_theme(&path, "tokyo-night").await.expect("write");
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(raw.contains("[editor]"), "missing section: {raw}");
+        assert!(raw.contains("theme = \"tokyo-night\""), "raw: {raw}");
+    }
+
+    #[tokio::test]
+    async fn set_editor_theme_updates_existing_value_in_place() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let original = concat!(
+            "# user config\n",
+            "[editor]\n",
+            "tab_width = 2\n",
+            "theme = \"catppuccin-mocha\"\n",
+            "\n",
+            "[connections.prod]\n",
+            "driver = \"postgres\"\n",
+            "url = \"${DATABASE_URL}\"\n",
+        );
+        tokio::fs::write(&path, original).await.unwrap();
+
+        set_editor_theme(&path, "gruvbox-dark").await.unwrap();
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(raw.contains("# user config"), "comment lost: {raw}");
+        assert!(raw.contains("tab_width = 2"), "tab_width lost: {raw}");
+        assert!(raw.contains("theme = \"gruvbox-dark\""), "raw: {raw}");
+        assert!(
+            !raw.contains("catppuccin-mocha"),
+            "old value remains: {raw}"
+        );
+        assert!(
+            raw.contains("${DATABASE_URL}"),
+            "env placeholder lost: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_editor_theme_inserts_section_when_absent() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let original = "[connections.prod]\ndriver = \"sqlite\"\nurl = \"sqlite::memory:\"\n";
+        tokio::fs::write(&path, original).await.unwrap();
+
+        set_editor_theme(&path, "catppuccin-latte").await.unwrap();
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(raw.contains("[editor]"), "section not inserted: {raw}");
+        assert!(raw.contains("theme = \"catppuccin-latte\""), "raw: {raw}");
+        assert!(raw.contains("[connections.prod]"), "existing section lost");
     }
 }

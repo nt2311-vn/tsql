@@ -36,9 +36,9 @@ gantt
     Bracketed-paste multiline   :done,    bp,   2026-04-25, 14d
     Vertical scroll editor      :done,    vs,   2026-04-25, 14d
     section Polish
-    /search filter (sidebar)    :         sf,   after vs, 30d
-    System clipboard (arboard)  :         cb,   after vs, 14d
-    Theme switcher              :         th,   after sf, 21d
+    /search filter (sidebar)    :done,    sf,   2026-05-10, 7d
+    System clipboard (arboard)  :done,    cb,   2026-05-10, 7d
+    Theme switcher              :done,    th,   2026-05-10, 7d
     SQL autocomplete            :         ac,   after th, 60d
 ```
 
@@ -57,10 +57,10 @@ gantt
 | ERD visualizer         | ✅ Stable     | Pure-Rust focused graph (no external tools)                    |
 | `.mmd` export          | ✅ Stable     | `y` on ERD tab → `<schema>.mmd` for GitHub/Notion              |
 | Connection persist     | ✅ Stable     | `n` flow appends to `config.toml` with name prompt             |
-| Catppuccin Mocha       | ✅ Stable     | Only theme; PK/FK/NULL aware                                   |
-| Theme switcher         | 🟡 Planned   | Frappe / Latte / custom                                        |
-| `/` search filter      | 🟡 Planned   | Across sidebar + records                                       |
-| System clipboard       | 🟡 Planned   | `arboard` for `y`/`Y`                                          |
+| Catppuccin Mocha       | ✅ Stable     | Default theme; PK/FK/NULL aware                                |
+| Theme switcher         | ✅ Stable     | `Ctrl+T` cycles 6 themes; persists to `config.toml`            |
+| `/` search filter      | ✅ Stable     | Sidebar (schema/table names) + Records (any cell)              |
+| System clipboard       | ✅ Stable     | `arboard` for `y`/`Y`; falls back to status bar when headless  |
 | Connection pool reuse  | 🟡 Planned   | Pool already wired; needs caching layer                        |
 | SQL autocomplete       | ⏳ Later      | Driver-aware identifier + keyword completion                   |
 
@@ -352,6 +352,8 @@ stateDiagram-v2
 | ----------- | --------------- | --------------------------------------------------- |
 | All         | `q`             | Quit (except when typing)                           |
 | All         | `Ctrl+C`        | Force quit                                          |
+| All         | `Ctrl+T`        | Cycle theme (saves to `config.toml`)                |
+| Browser     | `/`             | Live filter: sidebar names or Records rows          |
 | Connect     | `j/k`           | Navigate saved connections                          |
 | Connect     | `Enter`         | Connect to selected                                 |
 | Connect     | `n`             | New connection (paste URL, then name to persist)    |
@@ -364,8 +366,8 @@ stateDiagram-v2
 | Browser     | `1`–`6`         | Jump straight to a detail tab                       |
 | Browser     | `Shift+X`       | Close the active table                              |
 | Browser     | `e` or `i`      | Open SQL editor                                     |
-| Browser     | `y`             | Yank cell value (or `.mmd` export on ERD tab)       |
-| Browser     | `Y`             | Yank entire row (TSV)                               |
+| Browser     | `y`             | Copy cell to system clipboard (ERD tab: `.mmd` export) |
+| Browser     | `Y`             | Copy entire row (TSV) to system clipboard           |
 | Browser     | `:`             | Command palette (`:select`, `:w`, `:e`, `:help`, `:q`) |
 | ERD         | `j/k`           | Focus a different table                             |
 | ERD         | `Enter` / `o`   | Open the focused table                              |
@@ -486,10 +488,15 @@ Pull requests must pass:
 
 ### Later
 
-- `/` search filter (sidebar + records)
-- System clipboard via `arboard` for `y`/`Y`
+- ~~`/` search filter (sidebar + records)~~ ✅ shipped
+- ~~System clipboard via `arboard` for `y`/`Y`~~ ✅ shipped
+- ~~Theme switcher (Frappe / Latte / custom)~~ ✅ shipped — 6 themes, `Ctrl+T` cycles
 - Loading spinner for in-flight DB tasks
-- Theme switcher (Frappe / Latte / custom)
+
+### 0.3.0
+
+- MSSQL driver
+- Oracle driver
 - SQL syntax highlighting overhaul + formatter
 - Driver-aware autocomplete
 
