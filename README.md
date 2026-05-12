@@ -14,6 +14,55 @@ It auto-loads `~/.config/tsqlx/config.toml`, lets you paste a fresh URL, drills 
 
 ---
 
+## Install
+
+### From crates.io (recommended)
+
+```sh
+cargo install tsqlx
+```
+
+This builds the `tsqlx` binary from source and drops it into `~/.cargo/bin/`. Make sure that directory is on your `PATH`.
+
+To force a reinstall on top of an older version:
+
+```sh
+cargo install tsqlx --force
+```
+
+#### With the Oracle driver (opt-in)
+
+The Oracle driver links against the proprietary Oracle Instant Client at runtime, so it is gated behind a Cargo feature:
+
+```sh
+cargo install tsqlx --features oracle
+```
+
+You must have **Oracle Instant Client 12.1 or newer** installed and discoverable via `LD_LIBRARY_PATH` (Linux) or `DYLD_LIBRARY_PATH` (macOS). Without the feature flag, the other four drivers (PostgreSQL, SQLite, MySQL/MariaDB, MS SQL Server) work out of the box.
+
+### Prerequisites
+
+- **Rust 1.85+** (`rustup update stable`)
+- A C toolchain (`build-essential` on Debian/Ubuntu, Xcode CLI tools on macOS) — required by `ring`/`rustls` and `tiberius`.
+- On Linux, OpenSSL headers are needed for the MSSQL driver's native TLS: `apt install libssl-dev pkg-config` (Debian/Ubuntu) or equivalent.
+
+### From source
+
+```sh
+git clone https://github.com/nt2311-vn/tsqlx
+cd tsqlx
+cargo install --path crates/tsqlx-app
+```
+
+### Verify
+
+```sh
+tsqlx --version
+tsqlx --help
+```
+
+---
+
 ## Status at a glance
 
 ```mermaid
@@ -508,4 +557,9 @@ Tag-based manual release to crates.io via the protected GitHub Actions environme
 
 ## License
 
-Licensed under either MIT or Apache-2.0.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
