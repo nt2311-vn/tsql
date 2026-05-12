@@ -19,10 +19,10 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
-tsqlx-core = { path = "../tsqlx-core", version = "0.4.0" }
-tsqlx-db = { path = "../tsqlx-db", version = "0.4.0" }
-tsqlx-sql = { path = "../tsqlx-sql", version = "0.4.0" }
-tsqlx-tui = { path = "../tsqlx-tui", version = "0.4.0" }
+tsqlx-core = { path = "../tsqlx-core", version = "0.4.1" }
+tsqlx-db = { path = "../tsqlx-db", version = "0.4.1" }
+tsqlx-sql = { path = "../tsqlx-sql", version = "0.4.1" }
+tsqlx-tui = { path = "../tsqlx-tui", version = "0.4.1" }
 
 [features]
 default = []

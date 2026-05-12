@@ -20,8 +20,8 @@ futures-util.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 oracle = { version = "0.6", optional = true }
-tsqlx-core = { path = "../tsqlx-core", version = "0.4.0" }
-tsqlx-sql = { path = "../tsqlx-sql", version = "0.4.0" }
+tsqlx-core = { path = "../tsqlx-core", version = "0.4.1" }
+tsqlx-sql = { path = "../tsqlx-sql", version = "0.4.1" }
 
 [features]
 default = []
