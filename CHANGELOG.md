@@ -6,6 +6,18 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-12
+
+### Added
+
+- **Install section in README.** `cargo install tsqlx`, opt-in
+  `--features oracle` (with Oracle Instant Client note), build
+  prerequisites (Rust 1.85+, C toolchain, OpenSSL headers for
+  the MSSQL driver), from-source flow, and a verify step.
+- **`LICENSE-MIT` and `LICENSE-APACHE`** at the repo root so the
+  `MIT OR Apache-2.0` metadata declared by every crate is backed
+  by real files in both the repo and the published tarballs.
+
 ## [0.4.0] - 2026-05-11
 
 ### Added
