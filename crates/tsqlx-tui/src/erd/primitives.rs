@@ -32,6 +32,12 @@ impl Cell2 {
 }
 
 /// Build the focused-graph canvas. Returns one styled `Line` per row.
+///
+/// `centre_scroll` is the index of the first column to render inside
+/// the centre card. Pass `0` for "from the top". When the available
+/// height can't hold every remaining column, the function appends
+/// `↑ N hidden above` / `↓ M hidden below` indicators so the user
+/// knows scrolling is meaningful.
 #[allow(clippy::too_many_arguments)]
 pub fn render_focus_canvas(
     width: u16,
@@ -40,6 +46,7 @@ pub fn render_focus_canvas(
     centre_info: Option<&TableInfo>,
     incoming: &[&RelationshipEdge],
     outgoing: &[&RelationshipEdge],
+    centre_scroll: usize,
     th: Theme,
 ) -> Vec<Line<'static>> {
     let w = width as usize;
@@ -48,6 +55,9 @@ pub fn render_focus_canvas(
 
     // ── centre card ────────────────────────────────────────────────
     // Build rows: header (table name) + horizontal rule + columns.
+    // Columns past the available card height get truncated with a
+    // "↑ N hidden above" / "↓ N hidden below" marker so the user
+    // knows the centre card has more to scroll through (J/K).
     let mut centre_rows: Vec<(String, Color, bool)> = Vec::new();
     centre_rows.push((centre_name.to_owned(), th.accent, true));
     if let Some(info) = centre_info {
@@ -62,7 +72,38 @@ pub fn render_focus_canvas(
             .flat_map(|fk| fk.column_names.iter().map(String::as_str))
             .collect();
         let name_w = info.columns.iter().map(|c| c.name.len()).max().unwrap_or(4);
-        for c in info.columns.iter().take(8) {
+        // Cap visible columns by the pane height: header + rule + N
+        // columns + 2 borders. Leave one slot for each indicator we
+        // might need.
+        let total = info.columns.len();
+        let scroll = centre_scroll.min(total.saturating_sub(1));
+        // Visible budget = h - header - borders. We compute it
+        // generously here; `draw_card` will clip if there's overflow.
+        // Reserve up to 2 lines for the hidden-above / hidden-below
+        // indicators.
+        let body_budget = h.saturating_sub(4); // borders + header + rule
+        let above = scroll;
+        let need_above_marker = above > 0;
+        let mut visible_rows = body_budget;
+        if need_above_marker {
+            visible_rows = visible_rows.saturating_sub(1);
+        }
+        // Tentatively assume we won't need a below-marker. Decide
+        // after slicing.
+        let end = (scroll + visible_rows).min(total);
+        let below = total.saturating_sub(end);
+        let need_below_marker = below > 0;
+        let end = if need_below_marker {
+            // Reserve one row for the marker by shrinking the window.
+            (scroll + visible_rows.saturating_sub(1)).min(total)
+        } else {
+            end
+        };
+        let below = total.saturating_sub(end);
+        if need_above_marker {
+            centre_rows.push((format!("↑ {above} hidden above"), th.muted, false));
+        }
+        for c in &info.columns[scroll..end] {
             let (marker, color) = if pk_set.contains(c.name.as_str()) {
                 ('★', th.warning)
             } else if fk_set.contains(c.name.as_str()) {
@@ -73,12 +114,8 @@ pub fn render_focus_canvas(
             let label = format!("{marker} {:<w$}  {}", c.name, c.data_type, w = name_w);
             centre_rows.push((label, color, false));
         }
-        if info.columns.len() > 8 {
-            centre_rows.push((
-                format!("… (+{} more)", info.columns.len() - 8),
-                th.muted,
-                false,
-            ));
+        if below > 0 {
+            centre_rows.push((format!("↓ {below} hidden below"), th.muted, false));
         }
     } else {
         centre_rows.push(("(loading…)".to_owned(), th.muted, false));
@@ -468,4 +505,98 @@ pub(crate) fn grid_to_lines(grid: &[Vec<Cell2>], th: Theme) -> Vec<Line<'static>
         out.push(Line::from(spans));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tsqlx_db::{ColumnInfo, PrimaryKeyInfo};
+
+    fn theme() -> Theme {
+        Theme::catppuccin_mocha()
+    }
+
+    fn dump(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn big_table(n: usize) -> TableInfo {
+        TableInfo {
+            name: "big".to_owned(),
+            schema: "public".to_owned(),
+            columns: (0..n)
+                .map(|i| ColumnInfo {
+                    name: format!("c{i:02}"),
+                    data_type: "int".to_owned(),
+                    is_nullable: false,
+                    default_value: None,
+                })
+                .collect(),
+            indexes: vec![],
+            primary_key: Some(PrimaryKeyInfo {
+                name: "pk".to_owned(),
+                column_names: vec!["c00".to_owned()],
+            }),
+            foreign_keys: vec![],
+            constraints: vec![],
+        }
+    }
+
+    /// A tall pane (height = 30) should now show *every* column of a
+    /// 20-column table — there is no 8-column cap any more. The old
+    /// behaviour appended `… (+12 more)`; the new behaviour fits all
+    /// 20 in the card body.
+    #[test]
+    fn tall_pane_renders_all_twenty_columns_no_eight_cap() {
+        let t = big_table(20);
+        let lines = render_focus_canvas(80, 30, "big", Some(&t), &[], &[], 0, theme());
+        let d = dump(&lines);
+        for i in 0..20 {
+            let needle = format!("c{i:02}");
+            assert!(
+                d.contains(&needle),
+                "column {needle} must render; canvas:\n{d}"
+            );
+        }
+        assert!(
+            !d.contains("(+12 more)"),
+            "old truncation marker must not appear; canvas:\n{d}"
+        );
+    }
+
+    /// When the pane is short, the card body fits ~3-4 columns and
+    /// the renderer announces what is hidden so the user knows
+    /// J/K means something.
+    #[test]
+    fn short_pane_shows_hidden_below_marker() {
+        let t = big_table(20);
+        // h=10 → body_budget = 6, no above marker, ~5 rows + below marker.
+        let lines = render_focus_canvas(80, 10, "big", Some(&t), &[], &[], 0, theme());
+        let d = dump(&lines);
+        assert!(d.contains("c00"), "first column visible");
+        assert!(d.contains("hidden below"), "below-marker present: {d}");
+    }
+
+    /// Scrolling into the middle of a tall table must surface BOTH
+    /// "hidden above" and "hidden below" markers and skip the first
+    /// `scroll` columns from the visible window.
+    #[test]
+    fn middle_scroll_shows_both_above_and_below_markers() {
+        let t = big_table(20);
+        let lines = render_focus_canvas(80, 10, "big", Some(&t), &[], &[], 5, theme());
+        let d = dump(&lines);
+        assert!(d.contains("hidden above"), "above marker present: {d}");
+        assert!(d.contains("hidden below"), "below marker present: {d}");
+        assert!(!d.contains("c00"), "scrolled past c00: {d}");
+        assert!(d.contains("c05") || d.contains("c06"), "shows middle: {d}");
+    }
 }

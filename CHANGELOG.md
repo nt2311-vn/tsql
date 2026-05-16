@@ -24,6 +24,14 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
   exit, so the rest of the TUI keeps terminal-native text
   selection. Left-drag pans the viewport (the cell under the cursor
   stays under the cursor); scroll wheel zooms in / out.
+- **No more 8-column cap in the focused ERD view.** `render_focus_canvas`
+  used to render at most 8 columns of the focused table and replace
+  the rest with `… (+N more)`. It now fills the centre card with
+  every column that fits the pane and emits `↑ N hidden above` /
+  `↓ N hidden below` indicators when the card body overflows.
+  `J` / `K` scroll the visible window through the column list;
+  selecting a different table resets the scroll back to the top.
+
 - **Sub-module `tsqlx-tui::erd`.** Pure-function ERD primitives
   moved out of the 4760-line `lib.rs` into `erd/primitives.rs`
   (cell grid, card / arrow drawers), with new

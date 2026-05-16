@@ -442,6 +442,7 @@ stateDiagram-v2
 | Browser     | `Y`             | Copy entire row (TSV) to system clipboard           |
 | Browser     | `:`             | Command palette (`:select`, `:w`, `:e`, `:help`, `:q`) |
 | ERD         | `j/k`           | Focus a different table (focused view)              |
+| ERD focused | `J` / `K`       | Scroll the centre card's column window              |
 | ERD         | `Enter` / `o`   | Open the focused table                              |
 | ERD         | `f`             | Toggle fullscreen schema map                        |
 | ERD         | `v`             | Toggle focused-card ↔ whole-schema canvas           |
