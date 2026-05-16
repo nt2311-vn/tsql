@@ -407,6 +407,10 @@ struct AppState {
     /// We toggle on entering `Canvas`, off on leaving — so the rest
     /// of the TUI keeps native terminal selection.
     erd_mouse_on: bool,
+    /// First column index rendered inside the centre card of the
+    /// focused ERD view. `J` / `K` scroll. Reset to 0 whenever the
+    /// selected table changes.
+    erd_focus_scroll: usize,
     editor: String,
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
@@ -514,6 +518,7 @@ impl AppState {
             erd_canvas_vp: ErdViewport::new(),
             erd_canvas_virt: std::cell::Cell::new((0, 0)),
             erd_mouse_on: false,
+            erd_focus_scroll: 0,
             editor: String::new(),
             editor_cursor: 0,
             editor_scroll: std::cell::Cell::new(0),
@@ -2039,13 +2044,34 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         {
             let len = erd_table_list(app).len();
             if len > 0 {
-                app.erd_selected = (app.erd_selected + 1).min(len - 1);
+                let new_sel = (app.erd_selected + 1).min(len - 1);
+                if new_sel != app.erd_selected {
+                    app.erd_selected = new_sel;
+                    app.erd_focus_scroll = 0;
+                }
             }
         }
         KeyCode::Char('k') | KeyCode::Up
             if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
         {
-            app.erd_selected = app.erd_selected.saturating_sub(1);
+            let new_sel = app.erd_selected.saturating_sub(1);
+            if new_sel != app.erd_selected {
+                app.erd_selected = new_sel;
+                app.erd_focus_scroll = 0;
+            }
+        }
+        // Scroll the focused centre card column window. Capital
+        // letters so they don't clash with the lowercase neighbour
+        // navigation above. Only meaningful in Focused mode.
+        KeyCode::Char('J')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
+            app.erd_focus_scroll = app.erd_focus_scroll.saturating_add(1);
+        }
+        KeyCode::Char('K')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
+            app.erd_focus_scroll = app.erd_focus_scroll.saturating_sub(1);
         }
         KeyCode::Enter if app.detail_tab == DetailTab::Erd => {
             open_erd_selected_table(app).await;
@@ -3432,6 +3458,7 @@ fn draw_erd_chart_pane(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         centre_info.as_ref(),
         &incoming,
         &outgoing,
+        app.erd_focus_scroll,
         th,
     );
     f.render_widget(
@@ -4284,6 +4311,7 @@ mod tests {
             Some(&orders),
             &incoming,
             &outgoing,
+            0,
             Theme::catppuccin_mocha(),
         );
         let dump: String = lines
@@ -4354,6 +4382,7 @@ mod tests {
             Some(&orders),
             &incoming,
             &outgoing,
+            0,
             Theme::catppuccin_mocha(),
         );
         let dump: String = lines
