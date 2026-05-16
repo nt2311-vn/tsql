@@ -1,6 +1,11 @@
+pub mod complete;
 pub mod format;
 pub mod highlight;
 
+pub use complete::{
+    context_at, prefix_at, rank_candidates, top_level_keywords, Candidate, CandidateKind,
+    CompletionContext,
+};
 pub use format::{format_sql, FormatOptions};
 pub use highlight::{classify_line, ClassifiedSpan, SpanClass};
 

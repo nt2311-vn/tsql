@@ -421,6 +421,61 @@ Syntax highlighting in the editor is driven by `sqlparser`'s tokenizer (not rege
 
 ---
 
+## Vim modal editing & autocomplete
+
+The SQL editor is **modal**. The current mode shows in the editor title chip: `[NORMAL]`, `[INSERT]`, `[VISUAL]`.
+
+| From | Press | Result |
+|---|---|---|
+| Browser | `e` | enter editor in **Normal** |
+| Browser | `i` | enter editor in **Insert** |
+| Browser | `:select` / `:insert` | prefill template, enter in **Insert** |
+
+### Normal mode
+
+| Key | Action |
+|---|---|
+| `h j k l` / arrows | move cursor |
+| `0` / `$` | line start / line end |
+| `w` / `b` | next word / previous word |
+| `gg` / `G` | buffer start / buffer end |
+| `i` / `a` | enter Insert at / after cursor |
+| `I` / `A` | enter Insert at line start / end |
+| `o` / `O` | open line below / above, enter Insert |
+| `x` | delete char under cursor |
+| `dd` / `yy` | delete / yank current line |
+| `p` | paste yank register |
+| `v` | enter Visual |
+| `:` | open command palette |
+| `Esc` | return to Browser |
+
+### Insert mode
+
+Typing inserts. `Esc` returns to Normal. **`Tab`** opens the autocomplete popup when there's an identifier prefix at the cursor; otherwise it inserts a 4-space soft-tab.
+
+### Visual mode
+
+`h j k l 0 $ w b` extend the selection. `y` yanks, `d` deletes (both return to Normal). `Esc` cancels.
+
+### Autocomplete popup
+
+The popup attaches just below the cursor (it flips above when there's no room, and slides left when it would overflow the pane). The candidate set depends on cursor context:
+
+| Context | Candidates |
+|---|---|
+| Start of statement / after `;` | top-level keywords (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `WITH`, …) |
+| After `FROM` / `JOIN` / `INTO` / `UPDATE` | tables in the active schema, qualified `schema.table` across schemas |
+| After `<qualifier>.` | if `qualifier` is a schema → its tables; if a cached table → its columns |
+| After `SELECT` projection / `WHERE` / `ON` / `GROUP BY` / `ORDER BY` | columns from the currently-loaded `TableInfo` and any pre-fetched neighbours |
+
+Ranking: prefix match > substring > fuzzy subsequence, capped at 12 visible. `Up` / `Down` cycle, `Tab` or `Enter` accepts (replaces the prefix span), `Esc` dismisses. The icons in the popup are `K` keyword, `T` table, `c` column, `S` schema.
+
+### First-run friendliness
+
+On a fresh install with no saved connections, the URL-entry screen accepts **both `Esc` and `q` to quit** when the input is empty — no more being trapped without a database to connect to.
+
+---
+
 ## Keyboard map
 
 ```mermaid
@@ -463,7 +518,18 @@ stateDiagram-v2
 | Editor      | `Ctrl+Enter`    | Run statement under cursor (also `Alt+Enter`)       |
 | Editor      | `Ctrl+S`        | Save buffer (`:w <path>` retargets)                 |
 | Editor      | `Ctrl+P/N`      | Persistent history                                  |
-| Editor      | `Esc`           | Back to browser                                     |
+| Editor      | `Esc`           | Insert→Normal · Normal→back to browser              |
+| Editor (NORMAL) | `i a I A o O` | enter Insert (variants per vim)                    |
+| Editor (NORMAL) | `h j k l 0 $ w b gg G` | movement                                  |
+| Editor (NORMAL) | `x dd yy p`   | delete char / line, yank line, paste              |
+| Editor (NORMAL) | `v`           | enter Visual                                       |
+| Editor (NORMAL) | `:`           | command palette                                    |
+| Editor (INSERT) | `Tab`         | autocomplete popup (or 4-space indent)             |
+| Editor (popup)  | `Up/Down`     | cycle suggestions                                  |
+| Editor (popup)  | `Tab/Enter`   | accept                                             |
+| Editor (popup)  | `Esc`         | dismiss                                            |
+| Editor (VISUAL) | `y d`         | yank / delete selection                            |
+| Connect picker  | `Esc/q`       | quit (no input needed)                             |
 
 ---
 
