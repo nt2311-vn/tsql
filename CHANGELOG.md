@@ -8,6 +8,35 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ### Added
 
+- **`Ni` insert-mode repeat.** Prefixing any Insert-mode entry key
+  (`i a I A o O`) with a count now records every keystroke typed
+  before `Esc` and replays the captured text `N - 1` more times on
+  exit. `5iabc<Esc>` produces `abcabcabcabcabc`. Backspaces during
+  the recording trim the replay buffer so what gets replayed is
+  exactly what survives to the end of the session.
+- **Named vim registers (`"a`–`"z`).** Type `"<letter>` before any
+  `yy` / `dd` / `dx` / `p` (etc.) to target a specific register
+  instead of the unnamed `"`. The unnamed register always mirrors
+  the most-recent write (vim's behaviour), so `"ayy` then `p`
+  still pastes the same content while keeping a longer-lived copy
+  in register `a` for later `"ap`. The selector survives across
+  the operator-pair gap (`"a3dd` works). Uppercase register names
+  are folded to lowercase for v1.
+- **Undo / redo (`u` and `U`).** `u` in Normal mode restores the
+  buffer + cursor to the snapshot taken at the start of the most
+  recent edit session; `U` redoes a previously-undone change.
+  Snapshots are taken on entry to Insert mode and before each
+  discrete Normal-mode mutation (`dd`, `dx`, `p`, `dD`, …), so an
+  entire Insert session collapses to a single undo step rather
+  than one step per keystroke. History is capped at 100 entries
+  per side; a fresh edit prunes the redo branch. **`U` is used
+  instead of vim's `Ctrl+R`** because `Ctrl+R` is reserved by tsqlx
+  for "run all queries".
+- **`Ngg` / `NG` jump to line N (1-based).** `5G` jumps to line 5,
+  `7gg` jumps to line 7. Without a count, `G` and `gg` keep their
+  buffer-end / buffer-start semantics. Lines past the end clamp
+  to the last byte.
+
 - **Vim repeat-count prefix in the editor.** Any digit sequence in
   Normal mode accumulates as a repeat count for the following
   motion / operator. `5j` moves down 5 lines, `10w` jumps 10 words

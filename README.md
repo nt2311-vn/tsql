@@ -449,6 +449,10 @@ The SQL editor is **modal**. The current mode shows in the editor title chip: `[
 | `:` | open command palette |
 | `Esc` | return to Browser (resets pending count) |
 | `1`–`9` then key | repeat the next motion / operator N times (e.g. `5j`, `10w`, `3dd`, `2x`, `3p`); counts cap at 9999 |
+| `5G` / `7gg` | jump to line N (1-based) |
+| `u` / `U` | undo / redo (snapshot taken per Insert session + per Normal mutation) |
+| `"<letter>` then `yy`/`dd`/`p`/… | target the named register (a–z); unnamed register `"` always mirrors the most recent write |
+| `5i abc<Esc>` | insert `abc` five times (`Ni` repeat) |
 
 ### Insert mode
 

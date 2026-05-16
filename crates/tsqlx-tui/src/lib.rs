@@ -5,6 +5,7 @@ use std::time::Duration;
 
 mod editor;
 mod export;
+mod undo;
 mod vim;
 use editor::{append_history, highlight_line, history_path, load_history, statement_range_at};
 
@@ -446,10 +447,29 @@ struct AppState {
     /// `editor_cursor`. The selection range is normalised
     /// (`min..max`) on use.
     vim_visual_anchor: Option<usize>,
-    /// Single unnamed register for `yy` / `dd` / `p`. Stores either
-    /// a full line (with trailing newline) or an arbitrary slice
-    /// depending on which command populated it.
-    vim_yank: String,
+    /// Named vim registers. Key `'"'` is the unnamed register that
+    /// every `yy` / `dd` / `dx` / `dD` etc. writes to. Keys
+    /// `'a'..='z'` hold what the user explicitly stashes with
+    /// `"<letter>yy`. A mutating yank into `'a'` also mirrors into
+    /// `'"'` so the unnamed register always reflects the most recent
+    /// write (vim's behaviour).
+    vim_registers: std::collections::HashMap<char, String>,
+    /// Set transiently by `RegisterOverride('x')` from the next
+    /// yank / delete / paste action. Cleared after that action
+    /// fires.
+    vim_register_override: Option<char>,
+    /// Insert-mode keystroke recording for the `Ni` repeat prefix.
+    /// `Some(buffer)` only while between `BeginInsertReplay` and
+    /// `EndInsertReplay`. Every `InsertChar` / `InsertNewline` /
+    /// `BackspaceInsert` action appends to (or trims) this buffer.
+    insert_recording: Option<String>,
+    /// How many additional times to replay `insert_recording` when
+    /// `EndInsertReplay` fires. `0` means no replay.
+    insert_replay_count: u32,
+    /// Editor undo/redo history. Snapshots are taken on EnterMode
+    /// (Insert) and before each discrete Normal-mode mutation
+    /// (`dd`, `dx`, `p`, …).
+    undo_stack: undo::UndoStack,
     /// Active autocomplete popup. `None` when no popup is open.
     completion: Option<CompletionUi>,
 }
@@ -529,7 +549,11 @@ impl AppState {
             vim_mode: vim::VimMode::Normal,
             vim_pending: vim::PendingOp::default(),
             vim_visual_anchor: None,
-            vim_yank: String::new(),
+            vim_registers: std::collections::HashMap::new(),
+            vim_register_override: None,
+            insert_recording: None,
+            insert_replay_count: 0,
+            undo_stack: undo::UndoStack::new(100),
             completion: None,
         }
     }
@@ -1833,13 +1857,60 @@ fn line_range_inclusive(s: &str, cursor: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// Snapshot the editor buffer + cursor onto the undo stack. Skips
+/// when the buffer hasn't changed since the last snapshot (the stack
+/// dedups on `Eq`).
+fn snapshot_for_undo(app: &mut AppState) {
+    let snap = undo::Snapshot::new(app.editor.clone(), app.editor_cursor);
+    app.undo_stack.push(snap);
+}
+
+/// Stash `content` into the active register (override or unnamed).
+/// Always mirrors into the unnamed `'"'` register — vim's
+/// "every write touches `\"`" rule.
+fn write_register(app: &mut AppState, content: String) {
+    let target = app.vim_register_override.take().unwrap_or('"');
+    app.vim_registers.insert(target, content.clone());
+    if target != '"' {
+        app.vim_registers.insert('"', content);
+    }
+}
+
+/// Read the contents of the source register (override or unnamed),
+/// clearing any override so the next paste falls back to unnamed.
+fn read_register(app: &mut AppState) -> String {
+    let source = app.vim_register_override.take().unwrap_or('"');
+    app.vim_registers.get(&source).cloned().unwrap_or_default()
+}
+
+/// Convert a 1-based vim line number into a byte offset, clamped to
+/// the buffer's last line.
+fn line_index_to_byte(s: &str, line_1based: u32) -> usize {
+    let target = line_1based.saturating_sub(1) as usize;
+    let mut cur_line = 0usize;
+    for (i, ch) in s.char_indices() {
+        if cur_line == target {
+            return i;
+        }
+        if ch == '\n' {
+            cur_line += 1;
+        }
+    }
+    s.len()
+}
+
 /// Apply a single `VimAction` to `app`. Mutations are surgical;
 /// no-ops are silent. Mode transitions are NOT applied here — the
 /// caller threads them through after the action loop.
 fn apply_vim_action(app: &mut AppState, action: vim::VimAction) {
     use vim::VimAction as A;
     match action {
-        A::EnterMode(_) => {} // handled by the caller
+        A::EnterMode(vim::VimMode::Insert) => {
+            // Snapshot once per Insert-mode session so `u` undoes
+            // the entire insertion as a unit.
+            snapshot_for_undo(app);
+        }
+        A::EnterMode(_) => {} // mode transition handled by the caller
         A::MoveLeft => {
             app.editor_cursor = prev_char_boundary(&app.editor, app.editor_cursor);
         }
@@ -1870,33 +1941,44 @@ fn apply_vim_action(app: &mut AppState, action: vim::VimAction) {
         A::MoveWordBackward => {
             app.editor_cursor = move_word_backward(&app.editor, app.editor_cursor);
         }
+        A::MoveToLine(n) => {
+            app.editor_cursor = line_index_to_byte(&app.editor, n);
+        }
         A::InsertChar(ch) => {
             let mut buf = [0u8; 4];
             let s = ch.encode_utf8(&mut buf);
             editor_insert_str(app, s);
+            if let Some(rec) = app.insert_recording.as_mut() {
+                rec.push(ch);
+            }
         }
-        A::InsertNewline => editor_insert_str(app, "\n"),
-        A::InsertLineBelow => {
-            // Cursor is at line end after the `o`-prefix move; just
-            // insert a newline + leave the cursor on the new line.
+        A::InsertNewline => {
             editor_insert_str(app, "\n");
+            if let Some(rec) = app.insert_recording.as_mut() {
+                rec.push('\n');
+            }
+        }
+        A::InsertLineBelow => {
+            editor_insert_str(app, "\n");
+            if let Some(rec) = app.insert_recording.as_mut() {
+                rec.push('\n');
+            }
         }
         A::InsertLineAbove => {
-            // Cursor is at line start after the `O`-prefix move; insert
-            // a newline, then step the cursor back to BEFORE that
-            // newline so the user is on the new (above) blank line.
             let here = app.editor_cursor;
             app.editor.insert(here, '\n');
-            // Cursor stays at `here`, which is now the start of the
-            // freshly inserted blank line above.
             app.history_idx = None;
+            if let Some(rec) = app.insert_recording.as_mut() {
+                rec.push('\n');
+            }
         }
         A::DeleteCharUnderCursor => {
+            snapshot_for_undo(app);
             if app.editor_cursor < app.editor.len() {
                 let next = next_char_boundary(&app.editor, app.editor_cursor);
                 let removed = app.editor[app.editor_cursor..next].to_owned();
                 app.editor.replace_range(app.editor_cursor..next, "");
-                app.vim_yank = removed;
+                write_register(app, removed);
                 app.history_idx = None;
             }
         }
@@ -1906,30 +1988,39 @@ fn apply_vim_action(app: &mut AppState, action: vim::VimAction) {
                 app.editor.replace_range(prev..app.editor_cursor, "");
                 app.editor_cursor = prev;
                 app.history_idx = None;
+                if let Some(rec) = app.insert_recording.as_mut() {
+                    rec.pop();
+                }
             }
         }
         A::DeleteLine => {
+            snapshot_for_undo(app);
             let (s, e) = line_range_inclusive(&app.editor, app.editor_cursor);
-            app.vim_yank = app.editor[s..e].to_owned();
+            let removed = app.editor[s..e].to_owned();
             app.editor.replace_range(s..e, "");
             app.editor_cursor = s.min(app.editor.len());
+            write_register(app, removed);
             app.history_idx = None;
         }
         A::YankLine => {
             let (s, e) = line_range_inclusive(&app.editor, app.editor_cursor);
-            app.vim_yank = app.editor[s..e].to_owned();
-            app.status = format!("yanked {} bytes", app.vim_yank.len());
+            let content = app.editor[s..e].to_owned();
+            let bytes = content.len();
+            write_register(app, content);
+            app.status = format!("yanked {bytes} bytes");
         }
         A::DeleteSelection => {
+            snapshot_for_undo(app);
             if let Some(anchor) = app.vim_visual_anchor.take() {
                 let (s, e) = if anchor <= app.editor_cursor {
                     (anchor, app.editor_cursor)
                 } else {
                     (app.editor_cursor, anchor)
                 };
-                app.vim_yank = app.editor[s..e].to_owned();
+                let removed = app.editor[s..e].to_owned();
                 app.editor.replace_range(s..e, "");
                 app.editor_cursor = s;
+                write_register(app, removed);
                 app.history_idx = None;
             }
         }
@@ -1940,18 +2031,67 @@ fn apply_vim_action(app: &mut AppState, action: vim::VimAction) {
                 } else {
                     (app.editor_cursor, anchor)
                 };
-                app.vim_yank = app.editor[s..e].to_owned();
-                app.status = format!("yanked {} bytes", app.vim_yank.len());
+                let content = app.editor[s..e].to_owned();
+                let bytes = content.len();
+                write_register(app, content);
+                app.status = format!("yanked {bytes} bytes");
             }
         }
         A::Paste => {
-            if !app.vim_yank.is_empty() {
-                let text = app.vim_yank.clone();
+            snapshot_for_undo(app);
+            let text = read_register(app);
+            if !text.is_empty() {
                 editor_insert_str(app, &text);
             }
         }
         A::StartCommandPalette => {
             app.command_input = Some(String::new());
+        }
+        A::RegisterOverride(ch) => {
+            app.vim_register_override = Some(ch);
+        }
+        A::BeginInsertReplay(replays) => {
+            app.insert_recording = Some(String::new());
+            app.insert_replay_count = replays;
+        }
+        A::EndInsertReplay => {
+            let buffer = app.insert_recording.take().unwrap_or_default();
+            let replays = std::mem::take(&mut app.insert_replay_count);
+            if replays > 0 && !buffer.is_empty() {
+                for _ in 0..replays {
+                    editor_insert_str(app, &buffer);
+                }
+            }
+        }
+        A::Undo => {
+            let current = undo::Snapshot::new(app.editor.clone(), app.editor_cursor);
+            if let Some(snap) = app.undo_stack.undo(current) {
+                app.editor = snap.text;
+                app.editor_cursor = snap.cursor.min(app.editor.len());
+                app.history_idx = None;
+                app.status = format!(
+                    "undo  (history={}, future={})",
+                    app.undo_stack.history_len(),
+                    app.undo_stack.future_len()
+                );
+            } else {
+                app.status = "already at oldest change".to_owned();
+            }
+        }
+        A::Redo => {
+            let current = undo::Snapshot::new(app.editor.clone(), app.editor_cursor);
+            if let Some(snap) = app.undo_stack.redo(current) {
+                app.editor = snap.text;
+                app.editor_cursor = snap.cursor.min(app.editor.len());
+                app.history_idx = None;
+                app.status = format!(
+                    "redo  (history={}, future={})",
+                    app.undo_stack.history_len(),
+                    app.undo_stack.future_len()
+                );
+            } else {
+                app.status = "already at newest change".to_owned();
+            }
         }
     }
 }
