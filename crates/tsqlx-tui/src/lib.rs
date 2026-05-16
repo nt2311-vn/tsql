@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 mod editor;
+mod export;
 use editor::{append_history, highlight_line, history_path, load_history, statement_range_at};
 
 use anyhow::Result;
@@ -1081,9 +1082,12 @@ async fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
                 open_editor_buffer(app, PathBuf::from(rest)).await;
             }
         }
+        "export" => run_export_command(app, rest).await,
+        "fmt" | "format" => format_editor_buffer(app),
         "help" | "h" | "?" => {
             app.status = ":select :insert :describe :indexes :keys :constraints :erd \
-                          :w [path] :e <path> :help :q"
+                          :export <csv|json|ndjson|sql> <path> [--table NAME] \
+                          :fmt :w [path] :e <path> :help :q"
                 .to_owned();
         }
         other => {
@@ -1512,6 +1516,121 @@ async fn run_editor_query(app: &mut AppState, scope: RunScope) {
 /// Save the editor buffer to disk. If `target` is `None`, write to the
 /// existing `editor_path`. If both are missing, surface an error so the
 /// user knows to use `:w <path>`.
+/// `:export <csv|json|ndjson|sql> <path> [--table NAME]`. Writes the
+/// active records grid to disk. SQL form needs a table name — falls
+/// back to `app.current_table` when `--table` is absent.
+async fn run_export_command(app: &mut AppState, rest: &str) {
+    let mut parts = rest.split_whitespace();
+    let Some(fmt) = parts.next() else {
+        app.last_error =
+            Some("usage: :export <csv|json|ndjson|sql> <path> [--table NAME]".to_owned());
+        app.status = ":export needs a format".to_owned();
+        return;
+    };
+    let Some(path) = parts.next() else {
+        app.last_error = Some("usage: :export <fmt> <path>".to_owned());
+        app.status = ":export needs a path".to_owned();
+        return;
+    };
+    let mut table_override: Option<String> = None;
+    for tok in parts {
+        if let Some(t) = tok.strip_prefix("--table=") {
+            table_override = Some(t.to_owned());
+        } else if tok == "--table" {
+            // next token would be the value but `parts` is consumed — we
+            // documented `--table=NAME` and accept `--table NAME` as
+            // best-effort only; require the `=` form for reliability.
+            app.last_error = Some("use --table=NAME (no space)".to_owned());
+            app.status = ":export bad flag".to_owned();
+            return;
+        }
+    }
+    let Some(rec) = app.records.clone() else {
+        app.last_error = Some("no records loaded — open a table first".to_owned());
+        app.status = ":export: no records".to_owned();
+        return;
+    };
+    let path = PathBuf::from(path);
+    let bytes_res: Result<Vec<u8>, export::ExportError> = match fmt {
+        "csv" => export::export_csv(&rec),
+        "json" => export::export_json(&rec, true),
+        "ndjson" => export::export_json(&rec, false),
+        "sql" => {
+            let table = table_override.or_else(|| {
+                if app.current_table.is_empty() {
+                    None
+                } else {
+                    Some(app.current_table.clone())
+                }
+            });
+            match table {
+                Some(t) => export::export_sql_insert(&rec, &t),
+                None => Err(export::ExportError::MissingTable),
+            }
+        }
+        other => {
+            app.last_error = Some(format!(
+                "unknown export format: {other} (csv|json|ndjson|sql)"
+            ));
+            app.status = format!(":export: unknown {other}");
+            return;
+        }
+    };
+    let bytes = match bytes_res {
+        Ok(b) => b,
+        Err(e) => {
+            app.last_error = Some(format!("export failed: {e}"));
+            app.status = format!(":export failed: {e}");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                app.last_error = Some(format!("could not create dir: {e}"));
+                app.status = format!(":export failed: {e}");
+                return;
+            }
+        }
+    }
+    match tokio::fs::write(&path, &bytes).await {
+        Ok(()) => {
+            app.status = format!(
+                "exported {} rows ({} bytes) → {}",
+                rec.rows.len(),
+                bytes.len(),
+                path.display()
+            );
+        }
+        Err(e) => {
+            app.last_error = Some(format!("write failed: {e}"));
+            app.status = format!(":export failed: {e}");
+        }
+    }
+}
+
+/// `:fmt` — autoformat the editor buffer in place. Cursor is clamped
+/// to the new buffer length (formatting can shift byte offsets) and
+/// snapped back to the nearest char boundary.
+fn format_editor_buffer(app: &mut AppState) {
+    if app.editor.is_empty() {
+        app.status = ":fmt: nothing to format".to_owned();
+        return;
+    }
+    let before = app.editor.len();
+    let formatted = tsqlx_sql::format_sql(&app.editor, tsqlx_sql::FormatOptions::default());
+    app.editor = formatted;
+    let cap = app.editor.len();
+    if app.editor_cursor > cap {
+        app.editor_cursor = cap;
+    }
+    while app.editor_cursor > 0 && !app.editor.is_char_boundary(app.editor_cursor) {
+        app.editor_cursor -= 1;
+    }
+    app.history_idx = None;
+    app.status = format!(":fmt {} → {} bytes", before, app.editor.len());
+}
+
 async fn save_editor_buffer(app: &mut AppState, target: Option<PathBuf>) {
     let path = target.or_else(|| app.editor_path.clone());
     let Some(path) = path else {

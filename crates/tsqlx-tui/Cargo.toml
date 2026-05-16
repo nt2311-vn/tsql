@@ -15,8 +15,12 @@ categories = ["command-line-utilities", "database"]
 arboard.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
+csv.workspace = true
 dirs.workspace = true
 ratatui.workspace = true
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "rt", "time"] }
 tsqlx-core = { path = "../tsqlx-core", version = "0.4.1" }
 tsqlx-db = { path = "../tsqlx-db", version = "0.4.1" }

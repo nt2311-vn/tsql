@@ -383,6 +383,44 @@ url = "mariadb://app:app@db:3306/legacy"
 
 ---
 
+## Result-set export and SQL autoformat
+
+Open a table, run a query, then drop into the command palette with `:`:
+
+```
+:export csv ./users.csv
+:export json ./users.json                          # pretty-printed array
+:export ndjson ./users.ndjson                      # one row per line
+:export sql ./seed.sql                             # INSERT INTO "<current_table>" (...) VALUES (...);
+:export sql ./seed.sql --table=public.users        # override the target name
+```
+
+CSV uses RFC-4180 quoting via the `csv` crate. JSON pretty mode emits an array of `{ column: value }` objects; NDJSON drops the array brackets and writes one object per line — pipe straight into `jq`. SQL INSERT double-quotes identifiers and single-quotes values, doubling embedded `'` characters. Parent directories are created on demand. The status bar reports row count + bytes.
+
+Inside the editor, `:fmt` (alias `:format`) autoformats the buffer in place via `sqlformat`:
+
+```sql
+-- before :fmt
+select id,name from users where active=1 order by name;
+
+-- after :fmt (defaults: 2-space indent, lowercase keywords)
+select
+  id,
+  name
+from
+  users
+where
+  active = 1
+order by
+  name;
+```
+
+Defaults are 2-space indent, **lowercase keywords** (set `[editor.format].uppercase_keywords = true` in `config.toml` if you want `SHOUTY CASE`), and one blank line between `;`-separated statements. The formatter is idempotent — running it twice produces the same output.
+
+Syntax highlighting in the editor is driven by `sqlparser`'s tokenizer (not regex). Dollar-quoted bodies, multi-line block comments, hex/national/double-quoted string literals, escaped single quotes, and dialect type keywords (`INT`, `TEXT`, `JSONB`, `TIMESTAMPTZ`, …) all classify correctly, in every bundled theme.
+
+---
+
 ## Keyboard map
 
 ```mermaid
@@ -417,7 +455,7 @@ stateDiagram-v2
 | Browser     | `e` or `i`      | Open SQL editor                                     |
 | Browser     | `y`             | Copy cell to system clipboard (ERD tab: `.mmd` export) |
 | Browser     | `Y`             | Copy entire row (TSV) to system clipboard           |
-| Browser     | `:`             | Command palette (`:select`, `:w`, `:e`, `:help`, `:q`) |
+| Browser     | `:`             | Command palette (`:select`, `:export`, `:fmt`, `:w`, `:e`, `:help`, `:q`) |
 | ERD         | `j/k`           | Focus a different table                             |
 | ERD         | `Enter` / `o`   | Open the focused table                              |
 | ERD         | `f`             | Toggle fullscreen schema map                        |

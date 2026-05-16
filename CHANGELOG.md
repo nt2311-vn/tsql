@@ -6,6 +6,53 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ## [Unreleased]
 
+### Added
+
+- **`:export <csv|json|ndjson|sql> <path> [--table=NAME]`.** Writes
+  the active records grid to disk in any of four formats:
+  - `csv` — RFC-4180 via the `csv` crate (header row from
+    `rec.columns`, comma separator, RFC-4180 quoting).
+  - `json` — pretty-printed array of `{ column: value }` objects.
+  - `ndjson` — one JSON object per line, no enclosing array, ideal
+    for `jq`/streaming sinks.
+  - `sql` — single `INSERT INTO "table" ("c1","c2") VALUES (…), (…);`
+    statement; identifiers double-quoted; values single-quoted with
+    inner single quotes doubled. Table name defaults to
+    `app.current_table` when `--table=NAME` is omitted.
+  Status bar reports `exported N rows (B bytes) → path`. Parent
+  directories are created on demand.
+- **`:fmt` / `:format`.** Autoformat the editor buffer in place via
+  `sqlformat`. Defaults: 2-space indent, lowercase keywords (`SHOUTY
+  CASE` is opt-in via config), one blank line between `;`-separated
+  statements. Idempotent (`fmt(fmt(x)) == fmt(x)`). The cursor is
+  re-clamped to the nearest UTF-8 boundary after formatting.
+- **Proper SQL syntax highlighting.** `editor::highlight_line` now
+  delegates to `tsqlx_sql::classify_line`, which wraps the
+  `sqlparser` tokenizer (`GenericDialect`, with
+  `tokenize_with_location`). Dollar-quoted bodies, multi-line block
+  comments (single-line range), national / hex / double-quoted
+  string literals, escaped single quotes, and dialect type
+  keywords (`INT`, `TEXT`, `JSONB`, `TIMESTAMPTZ`, …) all classify
+  correctly. Token classes (`Keyword`, `Type`, `Identifier`,
+  `StringLit`, `NumberLit`, `Comment`, `Operator`, `Punct`,
+  `Plain`) map to existing theme colours so every theme in the
+  registry just works without per-class palette additions.
+
+### Internal
+
+- New module `tsqlx-sql::highlight` (token classifier).
+- New module `tsqlx-sql::format` (sqlformat wrapper with
+  opinionated defaults).
+- New module `tsqlx-tui::export` (CSV / JSON / NDJSON / SQL INSERT
+  encoders).
+- Workspace deps: `csv = "1.4"`, `sqlparser = "0.62"`,
+  `sqlformat = "0.5"`, `serde_json = "1"`.
+- Removed the hand-rolled `SQL_KEYWORDS` table and ad-hoc lexer in
+  `editor.rs` — the sqlparser tokenizer handles every dialect we
+  care about, sized at ~400 KB extra binary.
+
+
+
 ## [0.4.1] - 2026-05-12
 
 ### Added

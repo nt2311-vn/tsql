@@ -12,6 +12,8 @@ keywords = ["sql", "database", "terminal", "tui"]
 categories = ["command-line-utilities", "database"]
 
 [dependencies]
+sqlparser.workspace = true
+sqlformat.workspace = true
 
 [lints]
 workspace = true
