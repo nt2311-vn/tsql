@@ -6,9 +6,42 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ## [Unreleased]
 
+### Fixed
+
+- **ERD whole-schema canvas glitches.** Four real bugs that made the
+  canvas hard to read on any non-trivial schema:
+  - Cards were painted before edges, so arrow legs that crossed
+    intermediate-rank tables visibly carved through their bodies.
+    The render order is now: edges → cards (mask) → arrowheads
+    (third pass on top so the destination card's left border
+    doesn't swallow the `▶` glyph).
+  - Lane allocation grouped edges by `gap_centre` (the natural
+    midpoint between parent and child columns). Multiple parents
+    fanning into the same destination ended up sharing one mid-x
+    and visibly overlapping into a single tangled bend. Edges are
+    now grouped **by destination card**; each incoming edge bends
+    in the gutter immediately left of its target, with per-edge
+    lane offsets so siblings stagger.
+  - Fan-in arrowheads collapsed into a single visible glyph on the
+    destination's mid-row. Arrowhead rows are now distributed
+    across the child card's full height (`card_top + i * card_h /
+    n`) so N incoming FKs show as N distinct `▶` markers stacked
+    on the card's left edge.
+  - Collapsed zoom barely shrunk the virtual canvas — `h_gap=6` /
+    `v_gap=2` were constants regardless of zoom level. Gap sizing
+    now scales per zoom (`Collapsed = 3/0`, `Compact = 5/1`,
+    `Full = 6/2`) and Collapsed cards cap their width at name+4
+    chars (with the name truncated to 10) so a single very long
+    table name can't bloat its rank's column width.
+
 ### Added
 
-<<<<<<< HEAD
+- **`f` (fit-to-overview) in the ERD canvas.** One keystroke drops
+  to `Collapsed` zoom and pans to top-left — the "let me see
+  everything" escape hatch when a deep schema scrolls off-screen.
+  Banner now reads `hjkl pan · +/- zoom · f fit · c reset · drag
+  · v focused`.
+
 - **`Ni` insert-mode repeat.** Prefixing any Insert-mode entry key
   (`i a I A o O`) with a count now records every keystroke typed
   before `Esc` and replays the captured text `N - 1` more times on

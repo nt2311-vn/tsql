@@ -49,7 +49,10 @@ pub struct CanvasOutput {
 pub fn card_size(name: &str, info: Option<&TableInfo>, zoom: Zoom) -> (u16, u16) {
     let name_w = name.chars().count() as u16;
     match zoom {
-        Zoom::Collapsed => (name_w.saturating_add(4).max(8), 3),
+        // Collapsed mode is the "fit the whole schema on screen"
+        // density: truncate long names to 10 chars so a single very
+        // wide table can't bloat the whole rank's column width.
+        Zoom::Collapsed => (name_w.min(10).saturating_add(4).max(8), 3),
         Zoom::Compact => compact_size(name, info, name_w),
         Zoom::Full => full_size(name, info, name_w),
     }
@@ -107,8 +110,15 @@ fn full_size(_name: &str, info: Option<&TableInfo>, name_w: u16) -> (u16, u16) {
 pub fn render_schema_canvas(inp: CanvasInput<'_>) -> CanvasOutput {
     let th = inp.theme;
     let zoom = inp.viewport.zoom;
-    let h_gap: u16 = 6;
-    let v_gap: u16 = 2;
+    // Gap sizing scales with zoom so Collapsed mode actually packs
+    // tighter rather than just shrinking cards by a few rows. Compact
+    // and Full both want breathing room for the FK column labels that
+    // ride on the horizontal legs.
+    let (h_gap, v_gap): (u16, u16) = match zoom {
+        Zoom::Collapsed => (3, 0),
+        Zoom::Compact => (5, 1),
+        Zoom::Full => (6, 2),
+    };
 
     // ── 1. Size every card ────────────────────────────────────────
     let sizes: HashMap<&str, (u16, u16)> = inp
@@ -140,6 +150,104 @@ pub fn render_schema_canvas(inp: CanvasInput<'_>) -> CanvasOutput {
         .map(|p| (p.name.as_str(), p))
         .collect();
 
+    // ── 4. Paint edges FIRST so the card boxes below cleanly mask
+    // any arrow leg that would otherwise carve through their bodies.
+    // Lane allocation groups by DESTINATION card: each incoming edge
+    // bends in the gutter immediately to the left of its target, with
+    // per-edge lane offsets so multiple parents fanning into the same
+    // child stagger instead of overlapping. Edges that span more than
+    // one rank fly horizontally across intermediate ranks at the
+    // source row — the mask-by-card-redraw step at (5) covers the
+    // crossings cleanly.
+    let mut edges_by_child: HashMap<&str, Vec<&RelationshipEdge>> = HashMap::new();
+    for e in inp.edges {
+        if e.from_table == e.to_table {
+            continue; // self-FKs not visualised in v1
+        }
+        let Some(parent) = by_name.get(e.to_table.as_str()) else {
+            continue;
+        };
+        let Some(child) = by_name.get(e.from_table.as_str()) else {
+            continue;
+        };
+        // Skip cycle-broken back-edges (parent isn't actually left
+        // of child in the layered output).
+        if parent.x + parent.w >= child.x {
+            continue;
+        }
+        edges_by_child
+            .entry(e.from_table.as_str())
+            .or_default()
+            .push(e);
+    }
+
+    // Collect arrowhead positions so we can paint them AFTER the
+    // card mask step — otherwise the destination card's left border
+    // would overwrite the `▶` glyph and the user sees a wall of
+    // truncated arrows.
+    let mut arrowheads: Vec<(u16, u16)> = Vec::new();
+
+    for (child_name, group) in &edges_by_child {
+        let child = by_name[child_name];
+        // Deterministic lane order: sort by parent name so the same
+        // schema always renders the same way (helps users build
+        // muscle memory and keeps tests stable).
+        let mut sorted: Vec<&&RelationshipEdge> = group.iter().collect();
+        sorted.sort_by(|a, b| a.to_table.cmp(&b.to_table));
+
+        // Distribute lane bends in the gutter just left of `child.x`.
+        // Lane 0 sits at child.x - 1; lane 1 at child.x - 2; …
+        // Cap at h_gap.saturating_sub(1) so we never bend left of the
+        // previous rank's right edge.
+        let max_lane = h_gap.saturating_sub(1).max(1) as usize;
+        // Distribute arrowhead rows across the child card's FULL
+        // height so multiple parents fanning into the same table
+        // show as distinct arrowheads stacked on the destination's
+        // left edge rather than collapsing into one. The third paint
+        // pass writes the `▶` glyph on top of any border cell it
+        // lands on, so reusing border rows is safe.
+        let card_top = child.y;
+        let card_bottom = child.y + child.h.saturating_sub(1);
+        let card_h = child.h.max(1);
+        let n = sorted.len().max(1) as u16;
+        for (i, edge) in sorted.iter().enumerate() {
+            let parent = by_name[edge.to_table.as_str()];
+            let src_x = parent.x + parent.w - 1;
+            let src_y = parent.y + parent.h / 2;
+            let dst_x = child.x;
+            // Spread arrowhead rows evenly across the card. With
+            // n incoming edges and a card of height card_h, lane i
+            // lands at row card_top + (i * card_h / n).
+            let row_offset = (i as u16).saturating_mul(card_h).saturating_div(n);
+            let dst_y = (card_top + row_offset).min(card_bottom);
+            let lane = i.min(max_lane.saturating_sub(1)) as u16;
+            let bend_x = dst_x.saturating_sub(1 + lane);
+            let bend_x = bend_x.max(src_x + 1);
+            draw_lane_arrow(
+                &mut grid, src_x, src_y, dst_x, dst_y, bend_x, th.accent2, th,
+            );
+            arrowheads.push((dst_x, dst_y));
+            // FK column label rides just above the source-side leg.
+            // Skip the label in Collapsed mode where pane budget is
+            // already tight and the label would clutter the gutter.
+            if zoom != Zoom::Collapsed && !edge.from_columns.is_empty() {
+                let lbl = edge.from_columns.join(",");
+                let lbl_y = src_y.saturating_sub(1);
+                let lbl_x = src_x.saturating_add(2);
+                put_text(
+                    &mut grid,
+                    lbl_x as usize,
+                    lbl_y as usize,
+                    &lbl,
+                    th.muted,
+                    false,
+                );
+            }
+        }
+    }
+
+    // ── 5. Paint cards on top of edges so a card boundary always
+    // wins visually over any arrow crossing it (mask step).
     for p in &layout_out.nodes {
         let info = inp.table_info.get(&p.name);
         let is_selected = inp.selected.map(|s| s == p.name).unwrap_or(false);
@@ -159,78 +267,21 @@ pub fn render_schema_canvas(inp: CanvasInput<'_>) -> CanvasOutput {
         );
     }
 
-    // ── 4. Paint edges. Group edges by their (src_col, dst_col) so
-    // we can stagger mid_x within the gap and reduce overlap.
-    // First, compute the gap-x where each edge will bend, then
-    // assign each edge a unique lane offset within the gap.
-    let mut gap_edges: HashMap<u16, Vec<(usize, &RelationshipEdge)>> = HashMap::new();
-    for (i, e) in inp.edges.iter().enumerate() {
-        if e.from_table == e.to_table {
-            continue;
-        }
-        let Some(parent) = by_name.get(e.to_table.as_str()) else {
-            continue;
-        };
-        let Some(child) = by_name.get(e.from_table.as_str()) else {
-            continue;
-        };
-        // Skip back-edges: layered layout puts parent left of child
-        // for forward edges. If parent's x >= child's x we hit a
-        // cycle-broken edge — skip in v1.
-        if parent.x + parent.w >= child.x {
-            continue;
-        }
-        let gap_centre = parent.x + parent.w + (child.x - (parent.x + parent.w)) / 2;
-        gap_edges.entry(gap_centre).or_default().push((i, e));
-    }
-
-    for (gap_centre, group) in &gap_edges {
-        for (lane, (_, edge)) in group.iter().enumerate() {
-            let parent = by_name[edge.to_table.as_str()];
-            let child = by_name[edge.from_table.as_str()];
-            // Anchor on the right edge of the parent + left edge of
-            // the child, at the rough mid-height of each card.
-            let src_x = parent.x + parent.w - 1;
-            let src_y = parent.y + parent.h / 2;
-            let dst_x = child.x;
-            let dst_y = child.y + child.h / 2;
-            // Lane stagger: ±lane cells around the natural mid_x.
-            let stagger = if lane == 0 {
-                0i32
-            } else if lane % 2 == 1 {
-                (lane as i32 + 1) / 2
-            } else {
-                -((lane as i32) / 2)
-            };
-            let lane_mid = (*gap_centre as i32 + stagger)
-                .clamp((src_x + 1) as i32, dst_x.saturating_sub(1) as i32)
-                as u16;
-            // Use a customised arrow that respects the lane mid-x.
-            draw_lane_arrow(
-                &mut grid, src_x, src_y, dst_x, dst_y, lane_mid, th.accent2, th,
-            );
-            // Tiny FK column label near the source.
-            let lbl = if edge.from_columns.is_empty() {
-                String::new()
-            } else {
-                edge.from_columns.join(",")
-            };
-            if !lbl.is_empty() {
-                let lbl_y = src_y.saturating_sub(1);
-                let lbl_x = src_x.saturating_add(2);
-                put_text(
-                    &mut grid,
-                    lbl_x as usize,
-                    lbl_y as usize,
-                    &lbl,
-                    th.muted,
-                    false,
-                );
+    // ── 5b. Paint arrowheads last so they survive the card mask.
+    // Each arrowhead lands ON the destination card's left border,
+    // breaking the `│` with a `▶` exactly at the row where the
+    // FK arrives. This is the conventional ERD look.
+    for (x, y) in arrowheads {
+        if let Some(row) = grid.get_mut(y as usize) {
+            if let Some(cell) = row.get_mut(x as usize) {
+                cell.ch = '▶';
+                cell.fg = th.accent2;
+                cell.bold = true;
             }
         }
     }
 
-    // ── 5. Slice the visible window ──────────────────────────────
+    // ── 6. Slice the visible window ──────────────────────────────
     let off_x = inp.viewport.offset_x.min(virt_w.saturating_sub(1)) as usize;
     let off_y = inp.viewport.offset_y.min(virt_h.saturating_sub(1)) as usize;
     let view_w = inp.view_w as usize;
@@ -605,6 +656,126 @@ mod tests {
         assert!(
             dump.matches('▶').count() >= 2,
             "two arrowheads — got\n{dump}"
+        );
+    }
+
+    /// Three parents (`a`, `b`, `c`) all reference the same child
+    /// (`d`). Each incoming edge must produce its own arrowhead;
+    /// the lane allocator should stagger their bend points so the
+    /// vertical legs don't overlap into a single visible line.
+    #[test]
+    fn fan_in_renders_three_distinct_arrowheads() {
+        let tables: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let mut info: HashMap<String, TableInfo> = HashMap::new();
+        for t in &tables {
+            info.insert(t.clone(), ti(t, &[("id", "int")], &["id"], &[]));
+        }
+        // Three parent→child edges all converging on `d`.
+        let edges = vec![
+            RelationshipEdge {
+                from_table: "d".into(),
+                from_columns: vec!["a_id".into()],
+                to_table: "a".into(),
+                to_columns: vec!["id".into()],
+            },
+            RelationshipEdge {
+                from_table: "d".into(),
+                from_columns: vec!["b_id".into()],
+                to_table: "b".into(),
+                to_columns: vec!["id".into()],
+            },
+            RelationshipEdge {
+                from_table: "d".into(),
+                from_columns: vec!["c_id".into()],
+                to_table: "c".into(),
+                to_columns: vec!["id".into()],
+            },
+        ];
+        let vp = Viewport::new();
+        let out = render_schema_canvas(CanvasInput {
+            tables: &tables,
+            table_info: &info,
+            edges: &edges,
+            selected: None,
+            viewport: &vp,
+            view_w: 200,
+            view_h: 30,
+            theme: theme(),
+        });
+        let dump = lines_to_string(&out.lines);
+        assert_eq!(
+            dump.matches('▶').count(),
+            3,
+            "three arrowheads expected (one per FK) — got\n{dump}"
+        );
+    }
+
+    /// Collapsed zoom must shrink the virtual canvas vs Compact for
+    /// the same schema — otherwise the "see everything" zoom level
+    /// isn't actually doing anything useful.
+    #[test]
+    fn collapsed_zoom_shrinks_virtual_canvas_vs_compact() {
+        let tables: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
+        let mut info: HashMap<String, TableInfo> = HashMap::new();
+        for t in &tables {
+            info.insert(
+                t.clone(),
+                ti(
+                    t,
+                    &[
+                        ("id", "int"),
+                        ("name", "text"),
+                        ("created_at", "timestamptz"),
+                        ("updated_at", "timestamptz"),
+                    ],
+                    &["id"],
+                    &[],
+                ),
+            );
+        }
+        // Linear FK chain so all 5 tables land in 5 different ranks.
+        let edges: Vec<RelationshipEdge> = (1..5)
+            .map(|i| RelationshipEdge {
+                from_table: format!("t{i}"),
+                from_columns: vec![format!("t{}_id", i - 1)],
+                to_table: format!("t{}", i - 1),
+                to_columns: vec!["id".into()],
+            })
+            .collect();
+        let mut vp_compact = Viewport::new(); // default Compact
+        let out_compact = render_schema_canvas(CanvasInput {
+            tables: &tables,
+            table_info: &info,
+            edges: &edges,
+            selected: None,
+            viewport: &vp_compact,
+            view_w: 60,
+            view_h: 20,
+            theme: theme(),
+        });
+        vp_compact.zoom = Zoom::Collapsed;
+        let out_collapsed = render_schema_canvas(CanvasInput {
+            tables: &tables,
+            table_info: &info,
+            edges: &edges,
+            selected: None,
+            viewport: &vp_compact,
+            view_w: 60,
+            view_h: 20,
+            theme: theme(),
+        });
+        assert!(
+            out_collapsed.virtual_w < out_compact.virtual_w,
+            "Collapsed should pack tighter horizontally: \
+             collapsed={} compact={}",
+            out_collapsed.virtual_w,
+            out_compact.virtual_w,
+        );
+        assert!(
+            out_collapsed.virtual_h <= out_compact.virtual_h,
+            "Collapsed should not be taller: collapsed={} compact={}",
+            out_collapsed.virtual_h,
+            out_compact.virtual_h,
         );
     }
 }

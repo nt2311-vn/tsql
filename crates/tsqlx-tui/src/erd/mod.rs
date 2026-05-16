@@ -12,4 +12,4 @@ pub mod viewport;
 
 pub use canvas::render_schema_canvas;
 pub use primitives::render_focus_canvas;
-pub use viewport::Viewport;
+pub use viewport::{Viewport, Zoom};

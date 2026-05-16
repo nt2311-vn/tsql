@@ -2701,12 +2701,21 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
             // every draw, so just reset the offset to 0 — the next
             // render will clamp against the fresh virtual size and
             // we hand back to clamp on draw via erd_canvas_virt.
-            // For a true centre-on, we'd need the placement here,
-            // which is only known mid-render. Cheap good-enough: jump
-            // to top-left and let `g` (future) do precise centring.
             app.erd_canvas_vp.offset_x = 0;
             app.erd_canvas_vp.offset_y = 0;
             app.status = "ERD canvas: reset to top-left".to_owned();
+        }
+        // `f` (fit) — drop to Collapsed zoom + jump to (0, 0) so the
+        // user gets the maximum-overview view in one keystroke.
+        // Useful as a "see everything" escape hatch when a deep
+        // schema has scrolled off-screen.
+        KeyCode::Char('f')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.zoom = erd::Zoom::Collapsed;
+            app.erd_canvas_vp.offset_x = 0;
+            app.erd_canvas_vp.offset_y = 0;
+            app.status = "ERD canvas: fit to overview (Collapsed, top-left)".to_owned();
         }
         KeyCode::Char('v') if app.detail_tab == DetailTab::Erd => {
             app.erd_view = match app.erd_view {
@@ -3959,7 +3968,7 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
             ),
             Span::styled(
                 format!(
-                    "  {} table(s)  {} edge(s)  zoom={:?}  hjkl pan · +/- zoom · drag · v focused  ",
+                    "  {} table(s)  {} edge(s)  zoom={:?}  hjkl pan · +/- zoom · f fit · c reset · drag · v focused  ",
                     tables.len(),
                     app.relationships.len(),
                     app.erd_canvas_vp.zoom,
