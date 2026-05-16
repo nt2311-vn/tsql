@@ -71,12 +71,17 @@ pub struct PendingOp {
     pub op: Option<char>,
     /// First `g` of `gg` was typed.
     pub g_pending: bool,
+    /// Accumulated numeric prefix (vim's `5j`, `3dd`). Survives across
+    /// keystrokes until an operator/motion consumes it or a non-count
+    /// key resets it.
+    pub count: Option<u32>,
 }
 
 impl PendingOp {
     pub fn reset(&mut self) {
         self.op = None;
         self.g_pending = false;
+        self.count = None;
     }
 }
 
@@ -100,30 +105,79 @@ fn handle_normal(pending: &mut PendingOp, key: KeyEvent) -> (VimMode, Vec<VimAct
         return (VimMode::Normal, vec![VimAction::MoveBufferStart]);
     }
     if pending.op == Some('d') && matches!(key.code, KeyCode::Char('d')) {
+        let n = pending.count.take().unwrap_or(1).max(1);
         pending.reset();
-        return (VimMode::Normal, vec![VimAction::DeleteLine]);
+        return (VimMode::Normal, repeat_action(VimAction::DeleteLine, n));
     }
     if pending.op == Some('y') && matches!(key.code, KeyCode::Char('y')) {
+        let n = pending.count.take().unwrap_or(1).max(1);
         pending.reset();
-        return (VimMode::Normal, vec![VimAction::YankLine]);
+        return (VimMode::Normal, repeat_action(VimAction::YankLine, n));
     }
-    pending.reset();
+
+    if let KeyCode::Char(c) = key.code {
+        if c.is_ascii_digit() && !(c == '0' && pending.count.is_none()) {
+            let digit = c.to_digit(10).unwrap_or(0);
+            let next = pending
+                .count
+                .unwrap_or(0)
+                .saturating_mul(10)
+                .saturating_add(digit)
+                .min(9_999);
+            pending.count = Some(next);
+            return (VimMode::Normal, vec![]);
+        }
+    }
+
+    // Operator starters preserve any accumulated count so that
+    // `3dd`/`3yy`/`3gg` can consume it on the second keystroke.
+    match key.code {
+        KeyCode::Char('d') => {
+            pending.op = Some('d');
+            pending.g_pending = false;
+            return (VimMode::Normal, vec![]);
+        }
+        KeyCode::Char('y') => {
+            pending.op = Some('y');
+            pending.g_pending = false;
+            return (VimMode::Normal, vec![]);
+        }
+        KeyCode::Char('g') => {
+            pending.op = None;
+            pending.g_pending = true;
+            return (VimMode::Normal, vec![]);
+        }
+        _ => {}
+    }
+
+    let n = pending.count.take().unwrap_or(1).max(1);
+    pending.op = None;
+    pending.g_pending = false;
 
     match key.code {
         KeyCode::Esc => (VimMode::Normal, vec![]),
-        KeyCode::Char('h') | KeyCode::Left => (VimMode::Normal, vec![VimAction::MoveLeft]),
-        KeyCode::Char('j') | KeyCode::Down => (VimMode::Normal, vec![VimAction::MoveDown]),
-        KeyCode::Char('k') | KeyCode::Up => (VimMode::Normal, vec![VimAction::MoveUp]),
-        KeyCode::Char('l') | KeyCode::Right => (VimMode::Normal, vec![VimAction::MoveRight]),
+        KeyCode::Char('h') | KeyCode::Left => {
+            (VimMode::Normal, repeat_action(VimAction::MoveLeft, n))
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            (VimMode::Normal, repeat_action(VimAction::MoveDown, n))
+        }
+        KeyCode::Char('k') | KeyCode::Up => (VimMode::Normal, repeat_action(VimAction::MoveUp, n)),
+        KeyCode::Char('l') | KeyCode::Right => {
+            (VimMode::Normal, repeat_action(VimAction::MoveRight, n))
+        }
         KeyCode::Char('0') => (VimMode::Normal, vec![VimAction::MoveLineStart]),
         KeyCode::Char('$') => (VimMode::Normal, vec![VimAction::MoveLineEnd]),
-        KeyCode::Char('w') => (VimMode::Normal, vec![VimAction::MoveWordForward]),
-        KeyCode::Char('b') => (VimMode::Normal, vec![VimAction::MoveWordBackward]),
+        KeyCode::Char('w') => (
+            VimMode::Normal,
+            repeat_action(VimAction::MoveWordForward, n),
+        ),
+        KeyCode::Char('b') => (
+            VimMode::Normal,
+            repeat_action(VimAction::MoveWordBackward, n),
+        ),
+        // `NG` should jump to line N; v1 emits MoveBufferEnd once and drops the count.
         KeyCode::Char('G') => (VimMode::Normal, vec![VimAction::MoveBufferEnd]),
-        KeyCode::Char('g') => {
-            pending.g_pending = true;
-            (VimMode::Normal, vec![])
-        }
         KeyCode::Char('i') => (VimMode::Insert, vec![VimAction::EnterMode(VimMode::Insert)]),
         KeyCode::Char('a') => (
             VimMode::Insert,
@@ -159,20 +213,19 @@ fn handle_normal(pending: &mut PendingOp, key: KeyEvent) -> (VimMode, Vec<VimAct
                 VimAction::EnterMode(VimMode::Insert),
             ],
         ),
-        KeyCode::Char('x') => (VimMode::Normal, vec![VimAction::DeleteCharUnderCursor]),
-        KeyCode::Char('d') => {
-            pending.op = Some('d');
-            (VimMode::Normal, vec![])
-        }
-        KeyCode::Char('y') => {
-            pending.op = Some('y');
-            (VimMode::Normal, vec![])
-        }
-        KeyCode::Char('p') => (VimMode::Normal, vec![VimAction::Paste]),
+        KeyCode::Char('x') => (
+            VimMode::Normal,
+            repeat_action(VimAction::DeleteCharUnderCursor, n),
+        ),
+        KeyCode::Char('p') => (VimMode::Normal, repeat_action(VimAction::Paste, n)),
         KeyCode::Char('v') => (VimMode::Visual, vec![VimAction::EnterMode(VimMode::Visual)]),
         KeyCode::Char(':') => (VimMode::Normal, vec![VimAction::StartCommandPalette]),
         _ => (VimMode::Normal, vec![]),
     }
+}
+
+fn repeat_action(action: VimAction, n: u32) -> Vec<VimAction> {
+    vec![action; n as usize]
 }
 
 fn handle_insert(key: KeyEvent) -> (VimMode, Vec<VimAction>) {
@@ -509,5 +562,169 @@ mod tests {
         let (_, a2) = handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('j')));
         assert_eq!(a2, vec![VimAction::MoveDown]);
         assert_eq!(p.op, None);
+    }
+
+    fn feed(p: &mut PendingOp, mode: VimMode, keys: &[KeyCode]) -> (VimMode, Vec<VimAction>) {
+        let mut last_mode = mode;
+        let mut last_actions = vec![];
+        for k in keys {
+            let (m, a) = handle_key(last_mode, p, key(*k));
+            last_mode = m;
+            last_actions = a;
+        }
+        (last_mode, last_actions)
+    }
+
+    #[test]
+    fn count_5j_repeats_movedown() {
+        let mut p = PendingOp::default();
+        let (_, a1) = handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('5')));
+        assert!(a1.is_empty());
+        assert_eq!(p.count, Some(5));
+        let (_, a2) = handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('j')));
+        assert_eq!(a2, vec![VimAction::MoveDown; 5]);
+        assert_eq!(p.count, None);
+    }
+
+    #[test]
+    fn count_10w_accumulates_digits() {
+        let mut p = PendingOp::default();
+        handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('1')));
+        handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('0')));
+        assert_eq!(p.count, Some(10));
+        let (_, a) = handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('w')));
+        assert_eq!(a, vec![VimAction::MoveWordForward; 10]);
+    }
+
+    #[test]
+    fn count_2x_repeats_delete_char() {
+        let mut p = PendingOp::default();
+        let (_, a) = feed(
+            &mut p,
+            VimMode::Normal,
+            &[KeyCode::Char('2'), KeyCode::Char('x')],
+        );
+        assert_eq!(a, vec![VimAction::DeleteCharUnderCursor; 2]);
+    }
+
+    #[test]
+    fn count_3dd_repeats_delete_line() {
+        let mut p = PendingOp::default();
+        handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('3')));
+        assert_eq!(p.count, Some(3));
+        handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('d')));
+        assert_eq!(p.op, Some('d'));
+        assert_eq!(p.count, Some(3));
+        let (_, a) = handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('d')));
+        assert_eq!(a, vec![VimAction::DeleteLine; 3]);
+        assert_eq!(p, PendingOp::default());
+    }
+
+    #[test]
+    fn count_3yy_repeats_yank_line() {
+        let mut p = PendingOp::default();
+        let (_, a) = feed(
+            &mut p,
+            VimMode::Normal,
+            &[KeyCode::Char('3'), KeyCode::Char('y'), KeyCode::Char('y')],
+        );
+        assert_eq!(a, vec![VimAction::YankLine; 3]);
+        assert_eq!(p, PendingOp::default());
+    }
+
+    #[test]
+    fn count_zero_alone_is_line_start() {
+        let mut p = PendingOp::default();
+        let (_, a) = handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('0')));
+        assert_eq!(a, vec![VimAction::MoveLineStart]);
+        assert_eq!(p.count, None);
+    }
+
+    #[test]
+    fn count_30j_compound_digits() {
+        let mut p = PendingOp::default();
+        let (_, a) = feed(
+            &mut p,
+            VimMode::Normal,
+            &[KeyCode::Char('3'), KeyCode::Char('0'), KeyCode::Char('j')],
+        );
+        assert_eq!(a, vec![VimAction::MoveDown; 30]);
+    }
+
+    #[test]
+    fn count_5i_discards_count_enters_insert() {
+        let mut p = PendingOp::default();
+        let (m, a) = feed(
+            &mut p,
+            VimMode::Normal,
+            &[KeyCode::Char('5'), KeyCode::Char('i')],
+        );
+        assert_eq!(m, VimMode::Insert);
+        assert_eq!(a, vec![VimAction::EnterMode(VimMode::Insert)]);
+        assert_eq!(p.count, None);
+    }
+
+    #[test]
+    fn count_5v_discards_count_enters_visual() {
+        let mut p = PendingOp::default();
+        let (m, a) = feed(
+            &mut p,
+            VimMode::Normal,
+            &[KeyCode::Char('5'), KeyCode::Char('v')],
+        );
+        assert_eq!(m, VimMode::Visual);
+        assert_eq!(a, vec![VimAction::EnterMode(VimMode::Visual)]);
+        assert_eq!(p.count, None);
+    }
+
+    #[test]
+    fn count_then_esc_resets() {
+        let mut p = PendingOp::default();
+        handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('3')));
+        assert_eq!(p.count, Some(3));
+        let (m, a) = handle_key(VimMode::Normal, &mut p, key(KeyCode::Esc));
+        assert_eq!(m, VimMode::Normal);
+        assert!(a.is_empty());
+        assert_eq!(p, PendingOp::default());
+    }
+
+    #[test]
+    fn count_caps_at_9999() {
+        let mut p = PendingOp::default();
+        for _ in 0..8 {
+            handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('9')));
+        }
+        assert_eq!(p.count, Some(9_999));
+        let (_, a) = handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('j')));
+        assert_eq!(a.len(), 9_999);
+    }
+
+    #[test]
+    fn count_unrecognised_key_resets() {
+        let mut p = PendingOp::default();
+        handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('5')));
+        assert_eq!(p.count, Some(5));
+        let (_, a) = handle_key(VimMode::Normal, &mut p, key(KeyCode::F(1)));
+        assert!(a.is_empty());
+        assert_eq!(p.count, None);
+        let (_, a2) = handle_key(VimMode::Normal, &mut p, key(KeyCode::Char('j')));
+        assert_eq!(a2, vec![VimAction::MoveDown]);
+    }
+
+    #[test]
+    fn count_3p_repeats_paste() {
+        let mut p = PendingOp::default();
+        let (_, a) = feed(
+            &mut p,
+            VimMode::Normal,
+            &[KeyCode::Char('3'), KeyCode::Char('p')],
+        );
+        assert_eq!(a, vec![VimAction::Paste; 3]);
+    }
+
+    #[test]
+    fn insert_digit_inserts_char() {
+        let (_, a) = run(VimMode::Insert, key(KeyCode::Char('5')));
+        assert_eq!(a, vec![VimAction::InsertChar('5')]);
     }
 }

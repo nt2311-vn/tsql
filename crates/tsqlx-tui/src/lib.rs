@@ -4648,6 +4648,23 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         app.editor_scroll.set(scroll);
     }
 
+    // Active visual-mode selection, in global byte coordinates of
+    // `app.editor`. Normalised so `s <= e`. Used to repaint cells
+    // inside the range with the theme's selection background as we
+    // render each line below.
+    let selection: Option<(usize, usize)> =
+        if app.vim_mode == vim::VimMode::Visual && app.completion.is_none() {
+            app.vim_visual_anchor.map(|anchor| {
+                if anchor <= app.editor_cursor {
+                    (anchor, app.editor_cursor)
+                } else {
+                    (app.editor_cursor, anchor)
+                }
+            })
+        } else {
+            None
+        };
+
     let mut byte_offset = 0usize;
     let mut gutter_lines: Vec<Line> = Vec::new();
     let mut text_lines: Vec<Line> = Vec::new();
@@ -4690,7 +4707,13 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         if spans.is_empty() {
             spans.push(Span::styled(" ", Style::default().bg(line_bg)));
         }
-        text_lines.push(Line::from(spans));
+        // Paint the visual selection on top of the syntax spans. The
+        // selection range may cover only part of this line; we slice
+        // the affected spans into (pre, selected, post) sub-spans and
+        // apply `th.sel_bg` to the middle.
+        let owned_spans: Vec<Span<'static>> =
+            apply_selection_to_spans(spans, line_start, selection, th.sel_bg);
+        text_lines.push(Line::from(owned_spans));
     }
 
     f.render_widget(
@@ -4759,6 +4782,76 @@ fn draw_status(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Overlay the visual-mode selection background on a line's already-
+/// classified spans. Splits any span that straddles the selection
+/// boundary into up to three sub-spans (`pre`, `selected`, `post`)
+/// so the highlight is byte-accurate within the line.
+///
+/// Returns owned `Span<'static>` because splitting forces an
+/// allocation per affected span; the unaffected ones are reformed
+/// into owned strings too so the result has a uniform lifetime
+/// (the editor's line collection requires that).
+fn apply_selection_to_spans(
+    spans: Vec<Span<'_>>,
+    line_start_byte: usize,
+    sel: Option<(usize, usize)>,
+    sel_bg: Color,
+) -> Vec<Span<'static>> {
+    let to_owned = |s: Span<'_>| Span::styled(s.content.into_owned(), s.style);
+    let Some((sel_s, sel_e)) = sel else {
+        return spans.into_iter().map(to_owned).collect();
+    };
+    let line_byte_len: usize = spans.iter().map(|s| s.content.as_ref().len()).sum();
+    let line_end_byte = line_start_byte + line_byte_len;
+    if sel_e <= line_start_byte || sel_s >= line_end_byte {
+        return spans.into_iter().map(to_owned).collect();
+    }
+    let local_s = sel_s.saturating_sub(line_start_byte);
+    let local_e = sel_e.saturating_sub(line_start_byte).min(line_byte_len);
+
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len() + 2);
+    let mut cursor = 0usize;
+    for span in spans {
+        let txt: &str = span.content.as_ref();
+        let len = txt.len();
+        let span_start = cursor;
+        let span_end = cursor + len;
+        cursor = span_end;
+        if span_end <= local_s || span_start >= local_e {
+            out.push(Span::styled(txt.to_owned(), span.style));
+            continue;
+        }
+        let split_a = local_s.saturating_sub(span_start);
+        let split_b = local_e.saturating_sub(span_start).min(len);
+        // Snap to UTF-8 boundaries — the classifier should never
+        // hand us mid-codepoint offsets, but cheap insurance.
+        let split_a = nearest_boundary_le(txt, split_a);
+        let split_b = nearest_boundary_le(txt, split_b);
+        if split_a > 0 {
+            out.push(Span::styled(txt[..split_a].to_owned(), span.style));
+        }
+        if split_b > split_a {
+            let mut sel_style = span.style;
+            sel_style.bg = Some(sel_bg);
+            out.push(Span::styled(txt[split_a..split_b].to_owned(), sel_style));
+        }
+        if split_b < len {
+            out.push(Span::styled(txt[split_b..].to_owned(), span.style));
+        }
+    }
+    out
+}
+
+fn nearest_boundary_le(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
 
 /// Render the autocomplete popup attached just below the cursor.
 /// Capped at 8 visible rows; the selected row is highlighted with
@@ -4874,11 +4967,14 @@ fn restore_terminal(
 #[cfg(test)]
 mod tests {
     use super::{
-        close_current_table, handle_paste, line_col, line_end, line_start, move_cursor_vertical,
+        apply_selection_to_spans, close_current_table, handle_paste, line_col, line_end,
+        line_start, move_cursor_vertical, move_word_backward, move_word_forward,
         next_char_boundary, prev_char_boundary, rebuild_sidebar, short_hash, truncate_for_status,
         unique_connection_name, yank_to_clipboard, AppMode, AppState, ConnectionConfig, DetailTab,
         DriverKind, SidebarEntry, StatementOutput, Theme, ALL_TABS,
     };
+    use ratatui::style::{Color, Style};
+    use ratatui::text::Span;
 
     #[test]
     fn catppuccin_mocha_name() {
@@ -5396,5 +5492,100 @@ mod tests {
         }
         assert_eq!(t.name, "catppuccin-mocha", "cycle returns to start");
         assert_eq!(seen.len(), Theme::all().len(), "every theme visited once");
+    }
+
+    fn span(s: &str) -> Span<'static> {
+        Span::styled(s.to_owned(), Style::default().fg(Color::White))
+    }
+
+    fn collect(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn selection_overlay_passes_through_when_no_selection() {
+        let in_spans = vec![span("hello "), span("world")];
+        let out = apply_selection_to_spans(in_spans, 0, None, Color::Red);
+        assert_eq!(out.len(), 2);
+        assert_eq!(collect(&out), "hello world");
+        assert!(out.iter().all(|s| s.style.bg.is_none()));
+    }
+
+    #[test]
+    fn selection_overlay_skips_lines_outside_selection() {
+        // Line starts at byte 100; selection covers 0..10. No overlap.
+        let in_spans = vec![span("aaa"), span("bbb")];
+        let out = apply_selection_to_spans(in_spans, 100, Some((0, 10)), Color::Red);
+        assert!(out.iter().all(|s| s.style.bg.is_none()));
+        assert_eq!(collect(&out), "aaabbb");
+    }
+
+    #[test]
+    fn selection_overlay_paints_only_overlapping_bytes_within_a_single_span() {
+        // Single span "abcdef", line starts at byte 0, selection covers
+        // global bytes 2..5 ("cde"). Expect three sub-spans: "ab", "cde"
+        // (with sel bg), "f".
+        let in_spans = vec![span("abcdef")];
+        let out = apply_selection_to_spans(in_spans, 0, Some((2, 5)), Color::Blue);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].content.as_ref(), "ab");
+        assert_eq!(out[0].style.bg, None);
+        assert_eq!(out[1].content.as_ref(), "cde");
+        assert_eq!(out[1].style.bg, Some(Color::Blue));
+        assert_eq!(out[2].content.as_ref(), "f");
+        assert_eq!(out[2].style.bg, None);
+    }
+
+    #[test]
+    fn selection_overlay_spans_multiple_input_spans() {
+        // Two input spans "hello"(0..5) + " world"(5..11). Selection
+        // covers 3..8 → ends of first + starts of second.
+        let in_spans = vec![span("hello"), span(" world")];
+        let out = apply_selection_to_spans(in_spans, 0, Some((3, 8)), Color::Yellow);
+        let total: String = collect(&out);
+        assert_eq!(total, "hello world", "no chars lost");
+        let selected: String = out
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Yellow))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(selected, "lo wo");
+    }
+
+    #[test]
+    fn selection_overlay_handles_selection_starting_inside_line_extending_past_end() {
+        // Line "abcdef" at bytes 0..6, selection 4..100 (well past end).
+        let in_spans = vec![span("abcdef")];
+        let out = apply_selection_to_spans(in_spans, 0, Some((4, 100)), Color::Magenta);
+        let selected: String = out
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Magenta))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(selected, "ef");
+    }
+
+    #[test]
+    fn move_word_forward_advances_through_word_then_gap() {
+        let s = "select foo from bar";
+        // From the start of "select" (idx 0) → start of "foo" (idx 7).
+        assert_eq!(move_word_forward(s, 0), 7);
+        // From the start of "foo" (idx 7) → start of "from" (idx 11).
+        assert_eq!(move_word_forward(s, 7), 11);
+        // From middle of "from" (idx 12) → start of "bar" (idx 16).
+        assert_eq!(move_word_forward(s, 12), 16);
+        // At end → stays at end.
+        assert_eq!(move_word_forward(s, s.len()), s.len());
+    }
+
+    #[test]
+    fn move_word_backward_lands_on_word_start() {
+        let s = "select foo from bar";
+        // From end-of-buffer → "bar" start.
+        assert_eq!(move_word_backward(s, s.len()), 16);
+        // From "bar" start → "from" start.
+        assert_eq!(move_word_backward(s, 16), 11);
+        // From idx 0 → 0.
+        assert_eq!(move_word_backward(s, 0), 0);
     }
 }

@@ -8,6 +8,27 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ### Added
 
+- **Vim repeat-count prefix in the editor.** Any digit sequence in
+  Normal mode accumulates as a repeat count for the following
+  motion / operator. `5j` moves down 5 lines, `10w` jumps 10 words
+  forward, `3dd` deletes 3 lines, `3yy` yanks 3 lines, `2x` deletes
+  2 chars, `3p` pastes the register 3 times. `0` alone is still the
+  line-start motion; `30j` works because the second digit follows
+  an already-accumulating count. Counts cap at 9999. `Esc` resets
+  any pending count. Mode-entry keys (`i a I A o O v :`) consume
+  and discard the count silently — `5i…<Esc>` does *not* yet
+  replay the inserted text 5 times (vim's `Ni` semantics are out
+  of scope for v1; called out in `vim.rs`).
+- **Visual-mode selection highlight in the editor.** When `vim_mode`
+  is `Visual`, the editor pane now paints the theme's selection
+  background on every cell inside the active selection range, with
+  byte-accurate boundaries: any syntax-highlight span that straddles
+  the selection edge is split into `(pre, selected, post)` sub-spans
+  so the highlight starts and ends exactly where the user expects.
+  Multi-line selections are handled by checking the line's global
+  byte range against the (normalised, anchor↔cursor) selection
+  range on each rendered line.
+
 - **Vim-style modal editing in the SQL editor.** Three modes —
   `NORMAL` (default), `INSERT`, `VISUAL` — surfaced in the editor
   title chip. Implemented keys:

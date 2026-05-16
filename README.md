@@ -447,7 +447,8 @@ The SQL editor is **modal**. The current mode shows in the editor title chip: `[
 | `p` | paste yank register |
 | `v` | enter Visual |
 | `:` | open command palette |
-| `Esc` | return to Browser |
+| `Esc` | return to Browser (resets pending count) |
+| `1`–`9` then key | repeat the next motion / operator N times (e.g. `5j`, `10w`, `3dd`, `2x`, `3p`); counts cap at 9999 |
 
 ### Insert mode
 
@@ -455,7 +456,7 @@ Typing inserts. `Esc` returns to Normal. **`Tab`** opens the autocomplete popup 
 
 ### Visual mode
 
-`h j k l 0 $ w b` extend the selection. `y` yanks, `d` deletes (both return to Normal). `Esc` cancels.
+`h j k l 0 $ w b` extend the selection — the editor pane paints the theme's selection background on every cell inside the range so the user can see exactly what will be yanked or deleted. `y` yanks, `d` deletes (both return to Normal). `Esc` cancels.
 
 ### Autocomplete popup
 
