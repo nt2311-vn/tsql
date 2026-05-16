@@ -143,170 +143,63 @@ enum ScanState {
 }
 
 /// Tokenize a single line of SQL into styled `Span`s for display.
-/// Keywords come back bold-accent, string literals in `theme.success`,
-/// numbers in `theme.warning`, and `--` line comments in muted italics.
-/// Anything else falls through as default-styled text.
+/// Delegates to `tsqlx_sql::classify_line` which uses the `sqlparser`
+/// tokenizer — so dollar-quoted strings, block comments, escaped
+/// quotes, hex/national string literals, and dialect type keywords
+/// all classify correctly instead of leaking out as default text.
+///
+/// Token classes map to existing theme colours so every theme in the
+/// registry just works without per-class palette extensions.
 #[must_use]
 pub fn highlight_line<'a>(line: &'a str, th: Theme) -> Vec<Span<'a>> {
-    let bytes = line.as_bytes();
-    let mut spans: Vec<Span<'a>> = Vec::new();
-    let mut tail_start = 0usize;
-    let mut i = 0usize;
+    use tsqlx_sql::SpanClass;
 
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
-        if ch == '\'' {
-            flush(&mut spans, line, tail_start, i, th);
-            let start = i;
-            i += 1;
-            while i < bytes.len() {
-                let here = bytes[i];
-                i += 1;
-                if here == b'\'' {
-                    break;
-                }
-            }
-            spans.push(Span::styled(
-                &line[start..i],
-                Style::default().fg(th.success),
-            ));
-            tail_start = i;
-            continue;
-        }
-        if ch == '-' && bytes.get(i + 1).copied() == Some(b'-') {
-            flush(&mut spans, line, tail_start, i, th);
-            spans.push(Span::styled(
-                &line[i..],
-                Style::default().fg(th.muted).add_modifier(Modifier::ITALIC),
-            ));
-            tail_start = bytes.len();
-            break;
-        }
-        if ch.is_ascii_alphabetic() || ch == '_' {
-            flush(&mut spans, line, tail_start, i, th);
-            let start = i;
-            while i < bytes.len() {
-                let c = bytes[i] as char;
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            let word = &line[start..i];
-            let upper = word.to_ascii_uppercase();
-            let style = if SQL_KEYWORDS.binary_search(&upper.as_str()).is_ok() {
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(th.fg)
-            };
-            spans.push(Span::styled(word, style));
-            tail_start = i;
-            continue;
-        }
-        if ch.is_ascii_digit() {
-            flush(&mut spans, line, tail_start, i, th);
-            let start = i;
-            while i < bytes.len() {
-                let c = bytes[i] as char;
-                if c.is_ascii_digit() || c == '.' {
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            spans.push(Span::styled(
-                &line[start..i],
-                Style::default().fg(th.warning),
-            ));
-            tail_start = i;
-            continue;
-        }
-        i += 1;
+    let spans_in = tsqlx_sql::classify_line(line);
+    if spans_in.is_empty() {
+        return if line.is_empty() {
+            Vec::new()
+        } else {
+            vec![Span::styled(line, Style::default().fg(th.fg))]
+        };
     }
-    flush(&mut spans, line, tail_start, bytes.len(), th);
-    spans
+
+    let mut out: Vec<Span<'a>> = Vec::with_capacity(spans_in.len() * 2);
+    let mut cursor = 0usize;
+    for s in &spans_in {
+        if s.start > cursor && line.is_char_boundary(cursor) && line.is_char_boundary(s.start) {
+            out.push(Span::styled(
+                &line[cursor..s.start],
+                Style::default().fg(th.fg),
+            ));
+        }
+        if !(line.is_char_boundary(s.start) && line.is_char_boundary(s.end)) {
+            // Bail out of styling if the classifier returned a non-
+            // boundary range (shouldn't happen on ASCII SQL, but the
+            // sqlparser location → byte conversion is best-effort for
+            // multi-byte input). Fall back to a single plain span.
+            return vec![Span::styled(line, Style::default().fg(th.fg))];
+        }
+        let slice = &line[s.start..s.end];
+        let style = match s.class {
+            SpanClass::Keyword => Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            SpanClass::Type => Style::default().fg(th.accent2),
+            SpanClass::Identifier => Style::default().fg(th.fg),
+            SpanClass::StringLit => Style::default().fg(th.success),
+            SpanClass::NumberLit => Style::default().fg(th.warning),
+            SpanClass::Comment => Style::default().fg(th.muted).add_modifier(Modifier::ITALIC),
+            SpanClass::Operator => Style::default().fg(th.accent2),
+            SpanClass::Punct => Style::default().fg(th.muted),
+            SpanClass::Plain => Style::default().fg(th.fg),
+        };
+        out.push(Span::styled(slice, style));
+        cursor = s.end;
+    }
+    if cursor < line.len() && line.is_char_boundary(cursor) {
+        out.push(Span::styled(&line[cursor..], Style::default().fg(th.fg)));
+    }
+    out
 }
 
-fn flush<'a>(spans: &mut Vec<Span<'a>>, line: &'a str, from: usize, to: usize, th: Theme) {
-    if from < to {
-        spans.push(Span::styled(&line[from..to], Style::default().fg(th.fg)));
-    }
-}
-
-/// Curated SQL keyword list, sorted ASCII-uppercase for binary search.
-const SQL_KEYWORDS: &[&str] = &[
-    "ALL",
-    "ALTER",
-    "AND",
-    "AS",
-    "ASC",
-    "BEGIN",
-    "BETWEEN",
-    "BY",
-    "CASCADE",
-    "CASE",
-    "CHECK",
-    "COMMIT",
-    "CONSTRAINT",
-    "CREATE",
-    "CROSS",
-    "DATABASE",
-    "DEFAULT",
-    "DELETE",
-    "DESC",
-    "DISTINCT",
-    "DROP",
-    "ELSE",
-    "END",
-    "EXISTS",
-    "FALSE",
-    "FOREIGN",
-    "FROM",
-    "FULL",
-    "GROUP",
-    "HAVING",
-    "IF",
-    "IN",
-    "INDEX",
-    "INNER",
-    "INSERT",
-    "INTO",
-    "IS",
-    "JOIN",
-    "KEY",
-    "LEFT",
-    "LIKE",
-    "LIMIT",
-    "NOT",
-    "NULL",
-    "OFFSET",
-    "ON",
-    "OR",
-    "ORDER",
-    "OUTER",
-    "PRIMARY",
-    "REFERENCES",
-    "RETURNING",
-    "RIGHT",
-    "ROLLBACK",
-    "SELECT",
-    "SET",
-    "TABLE",
-    "THEN",
-    "TRUE",
-    "UNION",
-    "UNIQUE",
-    "UPDATE",
-    "USING",
-    "VALUES",
-    "VIEW",
-    "WHEN",
-    "WHERE",
-    "WITH",
-];
-
-/// Path under which we persist a connection's query history. The
 /// `connection_label` is sanitised — anything outside `[A-Za-z0-9_-]`
 /// is replaced with `_`.
 #[must_use]

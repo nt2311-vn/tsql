@@ -40,3 +40,6 @@ toml = "1"
 toml_edit = "0.22"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 tempfile = "3.10"
+csv = "1.4"
+sqlparser = "0.62"
+sqlformat = "0.5"

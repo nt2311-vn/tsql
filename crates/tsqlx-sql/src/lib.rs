@@ -1,3 +1,9 @@
+pub mod format;
+pub mod highlight;
+
+pub use format::{format_sql, FormatOptions};
+pub use highlight::{classify_line, ClassifiedSpan, SpanClass};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlDocument {
     text: String,
