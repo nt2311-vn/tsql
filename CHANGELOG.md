@@ -8,6 +8,64 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ### Added
 
+- **Vim-style modal editing in the SQL editor.** Three modes —
+  `NORMAL` (default), `INSERT`, `VISUAL` — surfaced in the editor
+  title chip. Implemented keys:
+  - Normal: `h j k l` move; `0` / `$` line start/end; `w` / `b`
+    word forward/backward; `gg` buffer start, `G` buffer end;
+    `i` / `a` / `I` / `A` / `o` / `O` enter Insert (with the
+    appropriate cursor adjustment); `x` delete char under cursor;
+    `dd` delete line; `yy` yank line; `p` paste; `v` enter Visual;
+    `:` open command palette; any unrecognised key resets pending
+    operator state.
+  - Insert: types into the buffer; `Esc` returns to Normal; `Tab`
+    opens the autocomplete popup when an identifier prefix is
+    present, otherwise inserts the conventional 4-space soft-tab.
+  - Visual: `h j k l` (and `0 $ w b`) extend selection; `y` yanks
+    and returns to Normal; `d` deletes and returns to Normal;
+    `Esc` returns to Normal.
+  - All Ctrl- shortcuts (`Ctrl+R`, `Ctrl+Enter`, `Ctrl+S`,
+    `Ctrl+P/N`) work in every mode.
+  - `e` from Browser enters editor in `NORMAL`; `i` and the
+    palette prefills (`:select`, `:insert`) enter in `INSERT`.
+- **SQL autocomplete popup.** Pressing `Tab` in Insert mode opens a
+  popup attached just below the cursor when an identifier prefix is
+  present. Cursor-context detection (via the existing `sqlparser`
+  tokenizer from PR #31) classifies the position as:
+  - `Statement` → top-level keywords (SELECT, INSERT, UPDATE, …)
+  - `AfterFrom` / `AfterJoin` / `AfterInto` / `AfterUpdate` →
+    table names (qualified `schema.table` when across schemas)
+  - `AfterDot("qual")` → if `qual` is a schema, its tables; if a
+    cached table, its columns
+  - `AfterSelectProjection` / `AfterWhere` / `AfterOn` /
+    `AfterGroupBy` / `AfterOrderBy` → column names from cached
+    `TableInfo`
+  Candidates are ranked: prefix match (1000) → substring (500) →
+  fuzzy subsequence (100), capped at 12 visible. `Up` / `Down`
+  cycle, `Tab` or `Enter` accepts (replaces the prefix span),
+  `Esc` dismisses. Empty popups never appear — the candidate
+  source falls back to top-level keywords.
+- **`Esc` and `q` quit from the first-run connection screen.** When
+  there are no saved connections and the URL input is empty, both
+  keys exit the app cleanly instead of trapping the user. The
+  picker view's `Esc` always quits (mirroring `q`).
+
+### Internal
+
+- New module `tsqlx-sql::complete` (cursor-context detector +
+  candidate ranker, pure).
+- New module `tsqlx-tui::vim` (modal keymap router, pure — takes a
+  `KeyEvent` plus pending operator state, returns the new
+  `VimMode` plus a `Vec<VimAction>`).
+- Editor key dispatch (`handle_editor_key`) routes every non-Ctrl
+  key through `vim::handle_key`; a small in-lib `apply_vim_action`
+  function translates each action into editor-buffer mutations.
+- `editor::highlight_line` (already on the sqlparser tokenizer
+  after PR #31) is unchanged here; the tokenizer is reused by the
+  new autocomplete context detector with zero additional deps.
+
+### Added
+
 - **`:export <csv|json|ndjson|sql> <path> [--table=NAME]`.** Writes
   the active records grid to disk in any of four formats:
   - `csv` — RFC-4180 via the `csv` crate (header row from

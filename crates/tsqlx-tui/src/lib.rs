@@ -5,6 +5,7 @@ use std::time::Duration;
 
 mod editor;
 mod export;
+mod vim;
 use editor::{append_history, highlight_line, history_path, load_history, statement_range_at};
 
 use anyhow::Result;
@@ -19,8 +20,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState,
-    Tabs, Wrap,
+    Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table,
+    TableState, Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -435,6 +436,33 @@ struct AppState {
     /// reached — usually an SSH session with no DISPLAY. In that case
     /// yanks fall back to a status-bar preview.
     clipboard: Option<arboard::Clipboard>,
+    /// Current vim editing mode. The editor starts in `Normal`; `i`
+    /// enters Insert, `Esc` returns to Normal, `v` enters Visual.
+    vim_mode: vim::VimMode,
+    /// Two-key-operator carryover state (`dd`, `yy`, `gg`).
+    vim_pending: vim::PendingOp,
+    /// Anchor byte for the active visual selection. `Some(start)`
+    /// only while `vim_mode == Visual`; the other end is
+    /// `editor_cursor`. The selection range is normalised
+    /// (`min..max`) on use.
+    vim_visual_anchor: Option<usize>,
+    /// Single unnamed register for `yy` / `dd` / `p`. Stores either
+    /// a full line (with trailing newline) or an arbitrary slice
+    /// depending on which command populated it.
+    vim_yank: String,
+    /// Active autocomplete popup. `None` when no popup is open.
+    completion: Option<CompletionUi>,
+}
+
+/// State backing the editor's autocomplete popup overlay.
+#[derive(Debug, Clone)]
+struct CompletionUi {
+    items: Vec<tsqlx_sql::Candidate>,
+    selected: usize,
+    /// Byte offset at which the partial identifier the user is
+    /// completing starts in `editor`. Accepting a candidate replaces
+    /// `editor[prefix_start..editor_cursor]` with the candidate text.
+    prefix_start: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,6 +526,11 @@ impl AppState {
             // Init lazily on first yank so tests / headless runs don't
             // pay the cost of opening the X11 / Wayland connection.
             clipboard: None,
+            vim_mode: vim::VimMode::Normal,
+            vim_pending: vim::PendingOp::default(),
+            vim_visual_anchor: None,
+            vim_yank: String::new(),
+            completion: None,
         }
     }
 
@@ -654,10 +687,11 @@ pub async fn run_connect_with_options(
     app.connect_input = String::new();
     if app.saved_connections.is_empty() {
         app.connect_focus = ConnectFocus::NewUrl;
-        app.status = "Paste connection URL  Tab toggle driver  Enter connect  q quit".to_owned();
+        app.status =
+            "Paste connection URL  Tab toggle driver  Enter connect  Esc/q (empty) quit".to_owned();
     } else {
         app.connect_focus = ConnectFocus::Picker;
-        app.status = "j/k navigate  Enter connect  n new connection  q quit".to_owned();
+        app.status = "j/k navigate  Enter connect  n new connection  Esc/q quit".to_owned();
     }
     let result = run_loop(&mut terminal, &mut app, rx).await;
     restore_terminal(&mut terminal)?;
@@ -1098,12 +1132,6 @@ async fn run_command(app: &mut AppState, command: &str) -> Result<bool> {
     Ok(false)
 }
 
-fn editor_hint() -> String {
-    "Ctrl+R run all  Ctrl+Enter run current  Ctrl+S save  Ctrl+O open  \
-     Ctrl+P/N history  Esc browser"
-        .to_owned()
-}
-
 /// Clear the active table selection so the detail pane returns to its
 /// empty placeholder. Triggered by Shift+X in Browser mode.
 fn close_current_table(app: &mut AppState) {
@@ -1142,7 +1170,10 @@ fn prefill_editor_with_select(app: &mut AppState) {
     app.editor_cursor = app.editor.len();
     app.history_idx = None;
     app.mode = AppMode::Editor;
-    app.status = "editor: Ctrl+R run  Esc browser".to_owned();
+    app.vim_mode = vim::VimMode::Insert;
+    app.vim_pending.reset();
+    app.vim_visual_anchor = None;
+    app.status = "editor (INSERT) — Ctrl+R run  Esc normal".to_owned();
 }
 
 fn prefill_editor_with_insert(app: &mut AppState) {
@@ -1170,7 +1201,10 @@ fn prefill_editor_with_insert(app: &mut AppState) {
     app.editor_cursor = app.editor.len();
     app.history_idx = None;
     app.mode = AppMode::Editor;
-    app.status = "editor: replace placeholders, Ctrl+R run".to_owned();
+    app.vim_mode = vim::VimMode::Insert;
+    app.vim_pending.reset();
+    app.vim_visual_anchor = None;
+    app.status = "editor (INSERT) — replace placeholders, Ctrl+R run".to_owned();
 }
 
 /// Build a driver-appropriate qualified identifier. Sqlite has no schemas
@@ -1197,6 +1231,11 @@ async fn handle_connect_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 
 async fn handle_picker_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     match key.code {
+        // Esc also quits from the picker so first-time users (with
+        // no saved connections to pick from) have an obvious exit
+        // beyond `q` — matches the hint shown by `nav_hint`-style
+        // status text.
+        KeyCode::Esc => return Ok(true),
         KeyCode::Char('j') | KeyCode::Down => {
             let max = app.saved_connections.len().saturating_sub(1);
             app.connect_idx = (app.connect_idx + 1).min(max);
@@ -1207,7 +1246,8 @@ async fn handle_picker_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
         KeyCode::Char('n') => {
             app.connect_focus = ConnectFocus::NewUrl;
             app.connect_input.clear();
-            app.status = "Paste URL  Tab toggle driver  Enter connect  Esc back to list".to_owned();
+            app.status =
+                "Paste URL  Tab toggle driver  Enter connect  Esc/q (empty) quit".to_owned();
         }
         KeyCode::Enter => {
             if let Some((_, conn)) = app.saved_connections.get(app.connect_idx).cloned() {
@@ -1222,9 +1262,18 @@ async fn handle_picker_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 
 async fn handle_new_url_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
     match key.code {
+        // First-run friendliness: when the URL field is empty AND
+        // there's no saved-connection list to fall back to, Esc/q
+        // quit the app cleanly instead of trapping the user.
+        KeyCode::Esc if app.saved_connections.is_empty() && app.connect_input.is_empty() => {
+            return Ok(true);
+        }
+        KeyCode::Char('q') if app.saved_connections.is_empty() && app.connect_input.is_empty() => {
+            return Ok(true);
+        }
         KeyCode::Esc if !app.saved_connections.is_empty() => {
             app.connect_focus = ConnectFocus::Picker;
-            app.status = "j/k navigate  Enter connect  n new connection  q quit".to_owned();
+            app.status = "j/k navigate  Enter connect  n new connection  Esc/q quit".to_owned();
         }
         KeyCode::Tab => {
             // Cycle Postgres → SQLite → MySQL → MSSQL → Oracle → Postgres
@@ -1403,66 +1452,111 @@ async fn open_pool_and_overview(app: &mut AppState) -> Result<DatabaseOverview, 
 }
 
 async fn handle_editor_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
-    match (key.code, key.modifiers) {
-        (KeyCode::Esc, _) => {
-            app.mode = AppMode::Browser;
-            app.status = nav_hint();
+    // ── Completion popup intercept ────────────────────────────────
+    // When the popup is open it owns navigation + accept keys.
+    if app.completion.is_some() {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                app.completion = None;
+                return Ok(false);
+            }
+            (KeyCode::Up, _) => {
+                if let Some(c) = app.completion.as_mut() {
+                    c.selected = c.selected.saturating_sub(1);
+                }
+                return Ok(false);
+            }
+            (KeyCode::Down, _) => {
+                if let Some(c) = app.completion.as_mut() {
+                    let max = c.items.len().saturating_sub(1);
+                    c.selected = (c.selected + 1).min(max);
+                }
+                return Ok(false);
+            }
+            (KeyCode::Tab, _) | (KeyCode::Enter, KeyModifiers::NONE) => {
+                accept_completion(app);
+                return Ok(false);
+            }
+            (KeyCode::Backspace, _) => {
+                // Let backspace fall through to the editor below and
+                // refresh the popup against the new (shorter) prefix.
+                app.completion = None;
+            }
+            _ => {
+                // Any printable key dismisses the popup, but the key
+                // also falls through to be processed normally so the
+                // user keeps typing.
+                app.completion = None;
+            }
         }
+    }
+
+    // ── Global editor shortcuts (mode-independent) ────────────────
+    match (key.code, key.modifiers) {
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
             run_editor_query(app, RunScope::All).await;
+            return Ok(false);
         }
-        // Ctrl+Enter (and Alt+Enter as a fallback for terminals that
-        // don't deliver Ctrl+Enter distinctly) runs only the statement
-        // under the cursor.
         (KeyCode::Enter, KeyModifiers::CONTROL) | (KeyCode::Enter, KeyModifiers::ALT) => {
             run_editor_query(app, RunScope::Current).await;
+            return Ok(false);
         }
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
             save_editor_buffer(app, None).await;
+            return Ok(false);
         }
-        // History recall (Ctrl+P / Ctrl+N). Up/Down stay free for line
-        // navigation within multi-line queries.
-        (KeyCode::Char('p'), KeyModifiers::CONTROL) => history_prev(app),
-        (KeyCode::Char('n'), KeyModifiers::CONTROL) => history_next(app),
-        // Cursor movement
-        (KeyCode::Left, _) => {
-            app.editor_cursor = prev_char_boundary(&app.editor, app.editor_cursor);
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            history_prev(app);
+            return Ok(false);
         }
-        (KeyCode::Right, _) => {
-            app.editor_cursor = next_char_boundary(&app.editor, app.editor_cursor);
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            history_next(app);
+            return Ok(false);
         }
-        (KeyCode::Up, _) => {
-            app.editor_cursor = move_cursor_vertical(&app.editor, app.editor_cursor, -1);
+        // Esc from Insert returns to Normal; Esc from Normal/Visual
+        // leaves the editor entirely (vim handles the Insert→Normal
+        // transition below).
+        (KeyCode::Esc, _)
+            if matches!(app.vim_mode, vim::VimMode::Normal) && app.completion.is_none() =>
+        {
+            app.mode = AppMode::Browser;
+            app.status = nav_hint();
+            return Ok(false);
         }
-        (KeyCode::Down, _) => {
-            app.editor_cursor = move_cursor_vertical(&app.editor, app.editor_cursor, 1);
-        }
-        (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-            app.editor_cursor = line_start(&app.editor, app.editor_cursor);
-        }
-        (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-            app.editor_cursor = line_end(&app.editor, app.editor_cursor);
-        }
-        // Edits
-        (KeyCode::Backspace, _) if app.editor_cursor > 0 => {
-            let prev = prev_char_boundary(&app.editor, app.editor_cursor);
-            app.editor.replace_range(prev..app.editor_cursor, "");
-            app.editor_cursor = prev;
-            app.history_idx = None;
-        }
-        (KeyCode::Delete, _) if app.editor_cursor < app.editor.len() => {
-            let next = next_char_boundary(&app.editor, app.editor_cursor);
-            app.editor.replace_range(app.editor_cursor..next, "");
-            app.history_idx = None;
-        }
-        (KeyCode::Enter, _) => editor_insert_str(app, "\n"),
-        (KeyCode::Tab, _) => editor_insert_str(app, "    "),
-        (KeyCode::Char(ch), m) if !m.contains(KeyModifiers::CONTROL) => {
-            let mut buf = [0u8; 4];
-            let s = ch.encode_utf8(&mut buf);
-            editor_insert_str(app, s);
+        // Tab in Insert mode (no Ctrl) opens the completion popup
+        // when there's an identifier prefix at the cursor; otherwise
+        // it inserts the conventional 4-space soft-tab.
+        (KeyCode::Tab, KeyModifiers::NONE) if app.vim_mode == vim::VimMode::Insert => {
+            let (prefix, _) = tsqlx_sql::prefix_at(&app.editor, app.editor_cursor);
+            if !prefix.is_empty() {
+                open_or_refresh_completion(app);
+                return Ok(false);
+            }
+            editor_insert_str(app, "    ");
+            return Ok(false);
         }
         _ => {}
+    }
+
+    // ── Route everything else through the vim mode router ────────
+    let prev_mode = app.vim_mode;
+    let (new_mode, actions) = vim::handle_key(prev_mode, &mut app.vim_pending, key);
+    for action in actions {
+        apply_vim_action(app, action);
+    }
+    if new_mode != prev_mode {
+        app.vim_mode = new_mode;
+        match new_mode {
+            vim::VimMode::Normal => {
+                app.vim_visual_anchor = None;
+            }
+            vim::VimMode::Visual => {
+                app.vim_visual_anchor = Some(app.editor_cursor);
+            }
+            vim::VimMode::Insert => {}
+        }
+        // Surface the active mode so the user can tell at a glance.
+        app.status = format!("-- {} --", new_mode.label());
     }
     Ok(false)
 }
@@ -1684,6 +1778,331 @@ fn editor_insert_str(app: &mut AppState, s: &str) {
     app.history_idx = None;
 }
 
+/// Walk forward to the start of the next word. Word boundary is the
+/// standard vim definition: any run of ASCII alnum / `_`, then a run
+/// of non-word chars, then the next word start.
+fn move_word_forward(s: &str, mut idx: usize) -> usize {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    if idx >= n {
+        return n;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let starts_in_word = is_word(bytes[idx]);
+    if starts_in_word {
+        while idx < n && is_word(bytes[idx]) {
+            idx += 1;
+        }
+    }
+    while idx < n && !is_word(bytes[idx]) {
+        idx += 1;
+    }
+    idx
+}
+
+/// Walk backward to the start of the previous word.
+fn move_word_backward(s: &str, mut idx: usize) -> usize {
+    let bytes = s.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    if idx == 0 {
+        return 0;
+    }
+    idx -= 1;
+    while idx > 0 && !is_word(bytes[idx]) {
+        idx -= 1;
+    }
+    while idx > 0 && is_word(bytes[idx - 1]) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Range of the line containing `cursor`, INCLUDING the trailing
+/// newline (or to buffer end if the line is the last one and has no
+/// trailing newline). Used by `yy` / `dd`.
+fn line_range_inclusive(s: &str, cursor: usize) -> (usize, usize) {
+    let start = line_start(s, cursor);
+    let bytes = s.as_bytes();
+    let mut end = cursor.min(bytes.len());
+    while end < bytes.len() && bytes[end] != b'\n' {
+        end += 1;
+    }
+    if end < bytes.len() {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// Apply a single `VimAction` to `app`. Mutations are surgical;
+/// no-ops are silent. Mode transitions are NOT applied here — the
+/// caller threads them through after the action loop.
+fn apply_vim_action(app: &mut AppState, action: vim::VimAction) {
+    use vim::VimAction as A;
+    match action {
+        A::EnterMode(_) => {} // handled by the caller
+        A::MoveLeft => {
+            app.editor_cursor = prev_char_boundary(&app.editor, app.editor_cursor);
+        }
+        A::MoveRight => {
+            app.editor_cursor = next_char_boundary(&app.editor, app.editor_cursor);
+        }
+        A::MoveUp => {
+            app.editor_cursor = move_cursor_vertical(&app.editor, app.editor_cursor, -1);
+        }
+        A::MoveDown => {
+            app.editor_cursor = move_cursor_vertical(&app.editor, app.editor_cursor, 1);
+        }
+        A::MoveLineStart => {
+            app.editor_cursor = line_start(&app.editor, app.editor_cursor);
+        }
+        A::MoveLineEnd => {
+            app.editor_cursor = line_end(&app.editor, app.editor_cursor);
+        }
+        A::MoveBufferStart => {
+            app.editor_cursor = 0;
+        }
+        A::MoveBufferEnd => {
+            app.editor_cursor = app.editor.len();
+        }
+        A::MoveWordForward => {
+            app.editor_cursor = move_word_forward(&app.editor, app.editor_cursor);
+        }
+        A::MoveWordBackward => {
+            app.editor_cursor = move_word_backward(&app.editor, app.editor_cursor);
+        }
+        A::InsertChar(ch) => {
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            editor_insert_str(app, s);
+        }
+        A::InsertNewline => editor_insert_str(app, "\n"),
+        A::InsertLineBelow => {
+            // Cursor is at line end after the `o`-prefix move; just
+            // insert a newline + leave the cursor on the new line.
+            editor_insert_str(app, "\n");
+        }
+        A::InsertLineAbove => {
+            // Cursor is at line start after the `O`-prefix move; insert
+            // a newline, then step the cursor back to BEFORE that
+            // newline so the user is on the new (above) blank line.
+            let here = app.editor_cursor;
+            app.editor.insert(here, '\n');
+            // Cursor stays at `here`, which is now the start of the
+            // freshly inserted blank line above.
+            app.history_idx = None;
+        }
+        A::DeleteCharUnderCursor => {
+            if app.editor_cursor < app.editor.len() {
+                let next = next_char_boundary(&app.editor, app.editor_cursor);
+                let removed = app.editor[app.editor_cursor..next].to_owned();
+                app.editor.replace_range(app.editor_cursor..next, "");
+                app.vim_yank = removed;
+                app.history_idx = None;
+            }
+        }
+        A::DeleteCharBeforeCursor | A::BackspaceInsert => {
+            if app.editor_cursor > 0 {
+                let prev = prev_char_boundary(&app.editor, app.editor_cursor);
+                app.editor.replace_range(prev..app.editor_cursor, "");
+                app.editor_cursor = prev;
+                app.history_idx = None;
+            }
+        }
+        A::DeleteLine => {
+            let (s, e) = line_range_inclusive(&app.editor, app.editor_cursor);
+            app.vim_yank = app.editor[s..e].to_owned();
+            app.editor.replace_range(s..e, "");
+            app.editor_cursor = s.min(app.editor.len());
+            app.history_idx = None;
+        }
+        A::YankLine => {
+            let (s, e) = line_range_inclusive(&app.editor, app.editor_cursor);
+            app.vim_yank = app.editor[s..e].to_owned();
+            app.status = format!("yanked {} bytes", app.vim_yank.len());
+        }
+        A::DeleteSelection => {
+            if let Some(anchor) = app.vim_visual_anchor.take() {
+                let (s, e) = if anchor <= app.editor_cursor {
+                    (anchor, app.editor_cursor)
+                } else {
+                    (app.editor_cursor, anchor)
+                };
+                app.vim_yank = app.editor[s..e].to_owned();
+                app.editor.replace_range(s..e, "");
+                app.editor_cursor = s;
+                app.history_idx = None;
+            }
+        }
+        A::YankSelection => {
+            if let Some(anchor) = app.vim_visual_anchor {
+                let (s, e) = if anchor <= app.editor_cursor {
+                    (anchor, app.editor_cursor)
+                } else {
+                    (app.editor_cursor, anchor)
+                };
+                app.vim_yank = app.editor[s..e].to_owned();
+                app.status = format!("yanked {} bytes", app.vim_yank.len());
+            }
+        }
+        A::Paste => {
+            if !app.vim_yank.is_empty() {
+                let text = app.vim_yank.clone();
+                editor_insert_str(app, &text);
+            }
+        }
+        A::StartCommandPalette => {
+            app.command_input = Some(String::new());
+        }
+    }
+}
+
+/// Build the list of completion candidates for the editor cursor.
+/// `(items, prefix_start)` where `prefix_start` is the byte offset
+/// at which the suggested replacement would begin.
+fn build_completion_candidates(app: &AppState) -> (Vec<tsqlx_sql::Candidate>, usize) {
+    use tsqlx_sql::{
+        context_at, prefix_at, rank_candidates, top_level_keywords, Candidate, CandidateKind,
+        CompletionContext,
+    };
+    let buffer = &app.editor;
+    let cursor = app.editor_cursor;
+    let ctx = context_at(buffer, cursor);
+    let (prefix, prefix_start) = prefix_at(buffer, cursor);
+
+    let mut candidates: Vec<Candidate> = match ctx {
+        CompletionContext::Statement => top_level_keywords(),
+        CompletionContext::AfterFrom
+        | CompletionContext::AfterJoin
+        | CompletionContext::AfterInto
+        | CompletionContext::AfterUpdate => collect_table_candidates(app),
+        CompletionContext::AfterDot(qual) => {
+            // Schema qualifier? -> its tables. Table-name qualifier? -> its columns.
+            collect_dotted_candidates(app, &qual)
+        }
+        CompletionContext::AfterSelectProjection
+        | CompletionContext::AfterWhere
+        | CompletionContext::AfterOn
+        | CompletionContext::AfterGroupBy
+        | CompletionContext::AfterOrderBy => collect_column_candidates(app),
+        CompletionContext::Other => Vec::new(),
+    };
+    // Always offer top-level SQL keywords as a low-relevance fallback
+    // so the user never sees an empty popup just because we couldn't
+    // classify the context.
+    if candidates.is_empty() {
+        candidates.extend(top_level_keywords());
+    }
+    // Belt-and-braces: drop trivial duplicates that two sources could
+    // both produce (e.g. a column named SELECT).
+    candidates.sort_by(|a, b| a.text.cmp(&b.text).then(a.kind_cmp(b)));
+    candidates.dedup_by(|a, b| a.text == b.text);
+    let _ = CandidateKind::Keyword; // keep import referenced
+    (rank_candidates(&prefix, candidates, 12), prefix_start)
+}
+
+trait CandidateKindCmp {
+    fn kind_cmp(&self, other: &Self) -> std::cmp::Ordering;
+}
+impl CandidateKindCmp for tsqlx_sql::Candidate {
+    fn kind_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.kind as u8).cmp(&(other.kind as u8))
+    }
+}
+
+fn collect_table_candidates(app: &AppState) -> Vec<tsqlx_sql::Candidate> {
+    use tsqlx_sql::{Candidate, CandidateKind};
+    let mut out: Vec<Candidate> = Vec::new();
+    if let Some(ov) = app.overview.as_ref() {
+        for sch in &ov.schemas {
+            for t in &sch.tables {
+                let text = if sch.name == app.current_schema {
+                    t.clone()
+                } else {
+                    format!("{}.{}", sch.name, t)
+                };
+                out.push(Candidate::new(text, CandidateKind::Table));
+            }
+            out.push(Candidate::new(sch.name.clone(), CandidateKind::Schema));
+        }
+    }
+    out
+}
+
+fn collect_dotted_candidates(app: &AppState, qual: &str) -> Vec<tsqlx_sql::Candidate> {
+    use tsqlx_sql::{Candidate, CandidateKind};
+    let mut out: Vec<Candidate> = Vec::new();
+    if let Some(ov) = app.overview.as_ref() {
+        if let Some(sch) = ov.schemas.iter().find(|s| s.name == qual) {
+            for t in &sch.tables {
+                out.push(Candidate::new(t.clone(), CandidateKind::Table));
+            }
+            return out;
+        }
+    }
+    // Treat qualifier as a table name and surface its columns when we
+    // have its TableInfo cached.
+    if let Some(info) = app.erd_table_info.get(qual) {
+        for c in &info.columns {
+            out.push(Candidate::new(c.name.clone(), CandidateKind::Column));
+        }
+    } else if let Some(info) = app.table_info.as_ref() {
+        if info.name == qual {
+            for c in &info.columns {
+                out.push(Candidate::new(c.name.clone(), CandidateKind::Column));
+            }
+        }
+    }
+    out
+}
+
+fn collect_column_candidates(app: &AppState) -> Vec<tsqlx_sql::Candidate> {
+    use tsqlx_sql::{Candidate, CandidateKind};
+    let mut out: Vec<Candidate> = Vec::new();
+    if let Some(info) = app.table_info.as_ref() {
+        for c in &info.columns {
+            out.push(Candidate::new(c.name.clone(), CandidateKind::Column));
+        }
+    }
+    for info in app.erd_table_info.values() {
+        for c in &info.columns {
+            out.push(Candidate::new(c.name.clone(), CandidateKind::Column));
+        }
+    }
+    out
+}
+
+/// Open the completion popup at the current cursor position (or
+/// refresh it if already open).
+fn open_or_refresh_completion(app: &mut AppState) {
+    let (items, prefix_start) = build_completion_candidates(app);
+    if items.is_empty() {
+        app.completion = None;
+        return;
+    }
+    app.completion = Some(CompletionUi {
+        items,
+        selected: 0,
+        prefix_start,
+    });
+}
+
+/// Accept the currently-selected candidate: replace the prefix span
+/// with the candidate text, advance the cursor past it, close popup.
+fn accept_completion(app: &mut AppState) {
+    let Some(c) = app.completion.take() else {
+        return;
+    };
+    if let Some(cand) = c.items.get(c.selected).cloned() {
+        let start = c.prefix_start.min(app.editor.len());
+        let end = app.editor_cursor.min(app.editor.len());
+        if start <= end {
+            app.editor.replace_range(start..end, &cand.text);
+            app.editor_cursor = start + cand.text.len();
+            app.history_idx = None;
+        }
+    }
+}
+
 const MAX_HISTORY: usize = 500;
 
 fn push_history(app: &mut AppState, entry: String) {
@@ -1850,9 +2269,22 @@ async fn handle_browser_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 app.filter_input = Some((target, seed));
             }
         }
-        (KeyCode::Char('e'), _) | (KeyCode::Char('i'), _) => {
+        // `i` enters the editor in INSERT mode so users coming from
+        // muscle memory can type immediately; `e` enters in NORMAL
+        // mode so vim users land where they expect.
+        (KeyCode::Char('e'), _) => {
             app.mode = AppMode::Editor;
-            app.status = editor_hint();
+            app.vim_mode = vim::VimMode::Normal;
+            app.vim_pending.reset();
+            app.vim_visual_anchor = None;
+            app.status = "editor (NORMAL) — i insert  v visual  Ctrl+R run  Esc browser".to_owned();
+        }
+        (KeyCode::Char('i'), _) => {
+            app.mode = AppMode::Editor;
+            app.vim_mode = vim::VimMode::Insert;
+            app.vim_pending.reset();
+            app.vim_visual_anchor = None;
+            app.status = "editor (INSERT) — Esc normal  Tab complete  Ctrl+R run".to_owned();
         }
         // Shift+X closes the active table and returns the user to the
         // empty-detail placeholder so they can pick another table without
@@ -4153,6 +4585,7 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 
     let title = {
         let mut t = String::from("  SQL Editor  ");
+        t.push_str(&format!("[{}]  ", app.vim_mode.label()));
         if let Some(p) = &app.editor_path {
             t.push_str(&p.display().to_string());
             t.push_str("  ");
@@ -4164,7 +4597,7 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         if !app.history.is_empty() {
             t.push_str(&format!("Ctrl+P/N hist ({})  ", app.history.len()));
         }
-        t.push_str("Esc browser  ");
+        t.push_str("Esc normal/browser  ");
         t
     };
 
@@ -4277,6 +4710,11 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let cy = text_area.y + (visible_row as u16).min(text_area.height.saturating_sub(1));
     f.set_cursor_position((cx, cy));
 
+    // ── Completion popup overlay ──
+    if let Some(c) = &app.completion {
+        draw_completion_popup(f, c, th, cx, cy, text_area);
+    }
+
     // ── Results pane: same grid as the Records tab ──
     let results_block = Block::default()
         .title(Span::styled("  Results  ", Style::default().fg(th.muted)))
@@ -4321,6 +4759,89 @@ fn draw_status(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Render the autocomplete popup attached just below the cursor.
+/// Capped at 8 visible rows; the selected row is highlighted with
+/// the theme's selection background.
+fn draw_completion_popup(
+    f: &mut Frame<'_>,
+    c: &CompletionUi,
+    th: Theme,
+    cursor_x: u16,
+    cursor_y: u16,
+    text_area: Rect,
+) {
+    let visible_rows = c.items.len().min(8) as u16;
+    if visible_rows == 0 {
+        return;
+    }
+    let width: u16 = c
+        .items
+        .iter()
+        .take(8)
+        .map(|cand| (cand.text.chars().count() + 4) as u16)
+        .max()
+        .unwrap_or(20)
+        .clamp(16, 48);
+    let pane_right = text_area.x + text_area.width;
+    let pane_bottom = text_area.y + text_area.height;
+    let mut x = cursor_x;
+    let mut y = cursor_y.saturating_add(1);
+    // Slide left if the popup would overflow the right edge.
+    if x + width > pane_right {
+        x = pane_right.saturating_sub(width);
+    }
+    // Flip above the cursor if there's no room below.
+    let height = visible_rows + 2;
+    if y + height > pane_bottom {
+        y = cursor_y.saturating_sub(height);
+    }
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let items: Vec<ListItem> = c
+        .items
+        .iter()
+        .take(8)
+        .enumerate()
+        .map(|(i, cand)| {
+            let icon = match cand.kind {
+                tsqlx_sql::CandidateKind::Keyword => 'K',
+                tsqlx_sql::CandidateKind::Table => 'T',
+                tsqlx_sql::CandidateKind::Column => 'c',
+                tsqlx_sql::CandidateKind::Schema => 'S',
+            };
+            let line = Line::from(vec![
+                Span::styled(format!(" {icon} "), Style::default().fg(th.accent2)),
+                Span::styled(
+                    cand.text.clone(),
+                    if i == c.selected {
+                        Style::default().fg(th.sel_fg).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th.fg)
+                    },
+                ),
+            ]);
+            let style = if i == c.selected {
+                Style::default().bg(th.sel_bg)
+            } else {
+                Style::default().bg(th.bg)
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.accent))
+        .style(Style::default().bg(th.bg));
+    let list = List::new(items).block(block);
+    f.render_widget(Clear, rect);
+    f.render_widget(list, rect);
+}
 
 fn muted_para<'a>(text: &'a str, th: Theme) -> Paragraph<'a> {
     Paragraph::new(Span::styled(text, Style::default().fg(th.muted)))
