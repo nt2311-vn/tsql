@@ -4,14 +4,20 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 mod editor;
+mod erd;
 mod export;
 mod undo;
 mod vim;
 use editor::{append_history, highlight_line, history_path, load_history, statement_range_at};
+use erd::{
+    canvas::CanvasInput as ErdCanvasInput, mouse as erd_mouse, render_focus_canvas,
+    render_schema_canvas, Viewport as ErdViewport,
+};
 
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -389,6 +395,25 @@ struct AppState {
     /// banner stays, but the table list + per-table inspector hide.
     /// Toggled with `f` while on the ERD tab.
     erd_chart_fullscreen: bool,
+    /// ERD sub-mode: focused-card view vs whole-schema canvas.
+    /// Toggled with `v`.
+    erd_view: ErdView,
+    /// Viewport over the whole-schema canvas (offset + zoom). Only
+    /// meaningful when `erd_view == Canvas`.
+    erd_canvas_vp: ErdViewport,
+    /// Last computed virtual canvas size, written by the immutable
+    /// draw path so the next event-handler tick clamps against an
+    /// up-to-date virtual bound. `Cell` because `draw_*` only takes
+    /// `&AppState`.
+    erd_canvas_virt: std::cell::Cell<(u16, u16)>,
+    /// True while the canvas has terminal mouse capture enabled.
+    /// We toggle on entering `Canvas`, off on leaving — so the rest
+    /// of the TUI keeps native terminal selection.
+    erd_mouse_on: bool,
+    /// First column index rendered inside the centre card of the
+    /// focused ERD view. `J` / `K` scroll. Reset to 0 whenever the
+    /// selected table changes.
+    erd_focus_scroll: usize,
     editor: String,
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
@@ -491,6 +516,16 @@ enum FilterTarget {
     Records,
 }
 
+/// Sub-mode of the ERD tab. `Focused` keeps the legacy centre-card +
+/// neighbour-cards layout; `Canvas` swaps to the whole-schema layered
+/// canvas with pan / zoom / drag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ErdView {
+    #[default]
+    Focused,
+    Canvas,
+}
+
 impl AppState {
     fn new(driver: DriverKind, url: String) -> Self {
         let mut ls = ListState::default();
@@ -528,6 +563,11 @@ impl AppState {
             erd_selected: 0,
             erd_table_info: HashMap::new(),
             erd_chart_fullscreen: false,
+            erd_view: ErdView::default(),
+            erd_canvas_vp: ErdViewport::new(),
+            erd_canvas_virt: std::cell::Cell::new((0, 0)),
+            erd_mouse_on: false,
+            erd_focus_scroll: 0,
             editor: String::new(),
             editor_cursor: 0,
             editor_scroll: std::cell::Cell::new(0),
@@ -751,6 +791,7 @@ async fn run_loop(
         match event::read()? {
             Event::Key(key) if handle_key(app, key).await? => break,
             Event::Paste(text) => handle_paste(app, &text),
+            Event::Mouse(mev) => handle_mouse(app, mev),
             _ => {}
         }
     }
@@ -791,6 +832,34 @@ fn handle_paste(app: &mut AppState, text: &str) {
                 sync_filter(app, t);
             }
         }
+    }
+}
+
+/// Mouse-event router. Only the ERD canvas view consumes mouse
+/// events today; everywhere else we ignore them so terminal-native
+/// text selection stays unaffected (we never call `EnableMouseCapture`
+/// outside of canvas mode anyway, but defence in depth is cheap).
+fn handle_mouse(app: &mut AppState, mev: MouseEvent) {
+    if app.detail_tab != DetailTab::Erd || app.erd_view != ErdView::Canvas {
+        return;
+    }
+    match mev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.erd_canvas_vp.drag_begin(mev.column, mev.row);
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            app.erd_canvas_vp.drag_update(mev.column, mev.row);
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.erd_canvas_vp.drag_end();
+        }
+        MouseEventKind::ScrollUp => {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_in();
+        }
+        MouseEventKind::ScrollDown => {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_out();
+        }
+        _ => {}
     }
 }
 
@@ -2533,8 +2602,11 @@ async fn sidebar_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 }
 
 async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    let in_erd_canvas = app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas;
     match key.code {
-        KeyCode::Char('l') | KeyCode::Right => {
+        // Tab navigation. Suppressed inside the ERD canvas so hjkl
+        // can pan the viewport instead of switching tabs.
+        KeyCode::Char('l') | KeyCode::Right if !in_erd_canvas => {
             app.detail_tab = app.detail_tab.next();
             if app.detail_tab == DetailTab::Erd
                 && app.relationships.is_empty()
@@ -2548,7 +2620,7 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 spawn_erd_prefetch(app);
             }
         }
-        KeyCode::Char('h') | KeyCode::Left => {
+        KeyCode::Char('h') | KeyCode::Left if !in_erd_canvas => {
             app.detail_tab = app.detail_tab.prev();
         }
         KeyCode::Char('j') | KeyCode::Down if app.detail_tab == DetailTab::Records => {
@@ -2577,15 +2649,120 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 load_records_page(app, &s, &t);
             }
         }
-        // ERD navigation: move the highlight through the table list.
-        KeyCode::Char('j') | KeyCode::Down if app.detail_tab == DetailTab::Erd => {
-            let len = erd_table_list(app).len();
-            if len > 0 {
-                app.erd_selected = (app.erd_selected + 1).min(len - 1);
+        // ── Whole-schema canvas pan / zoom (Canvas sub-mode) ────
+        // These match BEFORE the focused-view j/k handlers so canvas
+        // mode steals them. View toggle `v` is below.
+        KeyCode::Char('h') | KeyCode::Left
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(-3, 0);
+        }
+        KeyCode::Char('l') | KeyCode::Right
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(3, 0);
+        }
+        KeyCode::Char('j') | KeyCode::Down
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(0, 2);
+        }
+        KeyCode::Char('k') | KeyCode::Up
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(0, -2);
+        }
+        KeyCode::Char('H')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(-30, 0);
+        }
+        KeyCode::Char('L')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(30, 0);
+        }
+        KeyCode::Char('+') | KeyCode::Char('=')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_in();
+            app.status = format!("ERD canvas zoom: {:?}", app.erd_canvas_vp.zoom);
+        }
+        KeyCode::Char('-') | KeyCode::Char('_')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_out();
+            app.status = format!("ERD canvas zoom: {:?}", app.erd_canvas_vp.zoom);
+        }
+        KeyCode::Char('c')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            // Recentre on the selected card. Layout is recomputed
+            // every draw, so just reset the offset to 0 — the next
+            // render will clamp against the fresh virtual size and
+            // we hand back to clamp on draw via erd_canvas_virt.
+            // For a true centre-on, we'd need the placement here,
+            // which is only known mid-render. Cheap good-enough: jump
+            // to top-left and let `g` (future) do precise centring.
+            app.erd_canvas_vp.offset_x = 0;
+            app.erd_canvas_vp.offset_y = 0;
+            app.status = "ERD canvas: reset to top-left".to_owned();
+        }
+        KeyCode::Char('v') if app.detail_tab == DetailTab::Erd => {
+            app.erd_view = match app.erd_view {
+                ErdView::Focused => ErdView::Canvas,
+                ErdView::Canvas => ErdView::Focused,
+            };
+            if app.erd_view == ErdView::Canvas {
+                if !app.erd_mouse_on && erd_mouse::enable().is_ok() {
+                    app.erd_mouse_on = true;
+                }
+                spawn_erd_prefetch(app);
+                app.status = "ERD canvas: hjkl pan · +/- zoom · drag pan · v focused".to_owned();
+            } else {
+                if app.erd_mouse_on {
+                    let _ = erd_mouse::disable();
+                    app.erd_mouse_on = false;
+                }
+                app.status = "ERD focused view".to_owned();
             }
         }
-        KeyCode::Char('k') | KeyCode::Up if app.detail_tab == DetailTab::Erd => {
-            app.erd_selected = app.erd_selected.saturating_sub(1);
+        // ERD focused-view navigation: move the highlight through the
+        // table list. Gated on Focused mode so the keys above can
+        // claim them in Canvas mode.
+        KeyCode::Char('j') | KeyCode::Down
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
+            let len = erd_table_list(app).len();
+            if len > 0 {
+                let new_sel = (app.erd_selected + 1).min(len - 1);
+                if new_sel != app.erd_selected {
+                    app.erd_selected = new_sel;
+                    app.erd_focus_scroll = 0;
+                }
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
+            let new_sel = app.erd_selected.saturating_sub(1);
+            if new_sel != app.erd_selected {
+                app.erd_selected = new_sel;
+                app.erd_focus_scroll = 0;
+            }
+        }
+        // Scroll the focused centre card column window. Capital
+        // letters so they don't clash with the lowercase neighbour
+        // navigation above. Only meaningful in Focused mode.
+        KeyCode::Char('J')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
+            app.erd_focus_scroll = app.erd_focus_scroll.saturating_add(1);
+        }
+        KeyCode::Char('K')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
+            app.erd_focus_scroll = app.erd_focus_scroll.saturating_sub(1);
         }
         KeyCode::Enter if app.detail_tab == DetailTab::Erd => {
             open_erd_selected_table(app).await;
@@ -3766,6 +3943,38 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
+    // ── Whole-schema canvas view ────────────────────────────────
+    if app.erd_view == ErdView::Canvas {
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(0)])
+            .split(area);
+        let banner = vec![Line::from(vec![
+            Span::styled(
+                format!("  ERD ▸ canvas  schema: {schema}  "),
+                Style::default()
+                    .fg(th.bg)
+                    .bg(th.accent2)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  {} table(s)  {} edge(s)  zoom={:?}  hjkl pan · +/- zoom · drag · v focused  ",
+                    tables.len(),
+                    app.relationships.len(),
+                    app.erd_canvas_vp.zoom,
+                ),
+                Style::default().fg(th.muted),
+            ),
+        ])];
+        f.render_widget(
+            Paragraph::new(banner).style(Style::default().bg(th.bg)),
+            layout[0],
+        );
+        draw_erd_schema_canvas(f, app, layout[1]);
+        return;
+    }
+
     // Vertical split. Fullscreen mode (`f`) gives the chart the
     // entire body so the user can actually read box labels; default
     // mode keeps the table list + per-table inspector below.
@@ -3796,7 +4005,7 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         ),
         Span::styled(
             format!(
-                "  {} table(s), {} edge(s)  j/k focus  Enter open  f fullscreen  y export .mmd  ",
+                "  {} table(s), {} edge(s)  j/k focus · Enter open · f fullscreen · v canvas · y .mmd  ",
                 tables.len(),
                 app.relationships.len(),
             ),
@@ -3822,6 +4031,56 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let selected = app.erd_selected.min(tables.len() - 1);
     draw_erd_table_list(f, app, &tables, selected, body[0]);
     draw_erd_inspector(f, app, &tables, selected, body[1]);
+}
+
+/// Paint the whole-schema canvas inside `area`. Frames it, clamps
+/// the viewport against the freshly computed virtual size, runs
+/// layout + render, and pushes the visible lines into the pane.
+fn draw_erd_schema_canvas(f: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let th = app.theme;
+    let block = Block::default()
+        .title(Span::styled(
+            "  Whole-schema canvas  (drag to pan · +/- zoom)  ",
+            Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .style(Style::default().bg(th.bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width < 16 || inner.height < 6 {
+        f.render_widget(muted_para("  pane too small for canvas", th), inner);
+        return;
+    }
+
+    let tables = erd_table_list(app);
+    let selected_name = tables.get(app.erd_selected).cloned();
+
+    // Clamp the viewport *before* rendering using the previous
+    // virtual size as a cheap proxy. Render output also updates the
+    // size so subsequent frames clamp tighter.
+    let (prev_w, prev_h) = app.erd_canvas_virt.get();
+    let mut vp = app.erd_canvas_vp;
+    vp.clamp(prev_w, prev_h, inner.width, inner.height);
+
+    let out = render_schema_canvas(ErdCanvasInput {
+        tables: &tables,
+        table_info: &app.erd_table_info,
+        edges: &app.relationships,
+        selected: selected_name.as_deref(),
+        viewport: &vp,
+        view_w: inner.width,
+        view_h: inner.height,
+        theme: th,
+    });
+    app.erd_canvas_virt.set((out.virtual_w, out.virtual_h));
+
+    f.render_widget(
+        Paragraph::new(out.lines).style(Style::default().bg(th.bg)),
+        inner,
+    );
 }
 
 /// Render a focused, pure-Rust schema graph centred on the selected
@@ -3890,463 +4149,13 @@ fn draw_erd_chart_pane(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         centre_info.as_ref(),
         &incoming,
         &outgoing,
+        app.erd_focus_scroll,
         th,
     );
     f.render_widget(
         Paragraph::new(canvas).style(Style::default().bg(th.bg)),
         inner,
     );
-}
-
-/// Single canvas cell. `bold` is the only modifier we need so far —
-/// we keep the type tiny so the grid stays cache-friendly.
-#[derive(Clone, Copy)]
-struct Cell2 {
-    ch: char,
-    fg: Color,
-    bold: bool,
-}
-
-impl Cell2 {
-    fn space(th: Theme) -> Self {
-        Self {
-            ch: ' ',
-            fg: th.fg,
-            bold: false,
-        }
-    }
-}
-
-/// Build the focused-graph canvas. Returns one styled `Line` per row.
-#[allow(clippy::too_many_arguments)]
-fn render_focus_canvas(
-    width: u16,
-    height: u16,
-    centre_name: &str,
-    centre_info: Option<&TableInfo>,
-    incoming: &[&RelationshipEdge],
-    outgoing: &[&RelationshipEdge],
-    th: Theme,
-) -> Vec<Line<'static>> {
-    let w = width as usize;
-    let h = height as usize;
-    let mut grid: Vec<Vec<Cell2>> = vec![vec![Cell2::space(th); w]; h];
-
-    // ── centre card ────────────────────────────────────────────────
-    // Build rows: header (table name) + horizontal rule + columns.
-    let mut centre_rows: Vec<(String, Color, bool)> = Vec::new();
-    centre_rows.push((centre_name.to_owned(), th.accent, true));
-    if let Some(info) = centre_info {
-        let pk_set: HashSet<&str> = info
-            .primary_key
-            .as_ref()
-            .map(|pk| pk.column_names.iter().map(String::as_str).collect())
-            .unwrap_or_default();
-        let fk_set: HashSet<&str> = info
-            .foreign_keys
-            .iter()
-            .flat_map(|fk| fk.column_names.iter().map(String::as_str))
-            .collect();
-        let name_w = info.columns.iter().map(|c| c.name.len()).max().unwrap_or(4);
-        for c in info.columns.iter().take(8) {
-            let (marker, color) = if pk_set.contains(c.name.as_str()) {
-                ('★', th.warning)
-            } else if fk_set.contains(c.name.as_str()) {
-                ('⚷', th.accent2)
-            } else {
-                (' ', th.fg)
-            };
-            let label = format!("{marker} {:<w$}  {}", c.name, c.data_type, w = name_w);
-            centre_rows.push((label, color, false));
-        }
-        if info.columns.len() > 8 {
-            centre_rows.push((
-                format!("… (+{} more)", info.columns.len() - 8),
-                th.muted,
-                false,
-            ));
-        }
-    } else {
-        centre_rows.push(("(loading…)".to_owned(), th.muted, false));
-    }
-
-    // Side card width scales with available width. We never go below
-    // 14 (room for ~10 chars of table name) since otherwise the box
-    // truncates short table names like `customers` mid-word.
-    let side_box_w: usize = if w < 80 {
-        14
-    } else if w < 110 {
-        16
-    } else {
-        18
-    };
-    let side_box_h: usize = 3;
-    let arrow_pad: usize = 4;
-
-    // Box width = max content + 2 padding. Cap so neighbours fit if at
-    // all possible — at narrow widths we'd rather truncate the centre
-    // card body than push neighbour cards off-screen.
-    let max_centre_w = centre_rows
-        .iter()
-        .map(|(s, _, _)| s.chars().count())
-        .max()
-        .unwrap_or(8);
-    // Reserve enough room for at least one side + arrow when w >= 50.
-    let reserved = if w >= 50 {
-        side_box_w + arrow_pad + 2
-    } else {
-        4
-    };
-    let centre_box_w = (max_centre_w + 4)
-        .min(w.saturating_sub(reserved))
-        .max(centre_name.chars().count() + 4);
-    let centre_box_h = (centre_rows.len() + 2).min(h);
-
-    // Decide how many neighbours we can show vertically with 1-row gap.
-    let stack_capacity = (h.saturating_sub(1) / (side_box_h + 1)).max(1);
-    let lefts: Vec<&&RelationshipEdge> = incoming.iter().take(stack_capacity).collect();
-    let rights: Vec<&&RelationshipEdge> = outgoing.iter().take(stack_capacity).collect();
-
-    // Lay out columns horizontally. If the pane is too narrow drop
-    // neighbours first; centre always renders.
-    let needed_w_both = side_box_w + arrow_pad + centre_box_w + arrow_pad + side_box_w;
-    let needed_w_one = side_box_w + arrow_pad + centre_box_w;
-    let (show_left, show_right) = if w >= needed_w_both {
-        (!lefts.is_empty(), !rights.is_empty())
-    } else if w >= needed_w_one {
-        // Only one side fits — prefer outgoing (what the table depends on).
-        if !rights.is_empty() {
-            (false, true)
-        } else {
-            (!lefts.is_empty(), false)
-        }
-    } else {
-        (false, false)
-    };
-
-    let centre_x = (w.saturating_sub(centre_box_w)) / 2;
-    let centre_y = (h.saturating_sub(centre_box_h)) / 2;
-    let left_x = 0usize;
-    let right_x = w.saturating_sub(side_box_w);
-
-    // Draw centre card.
-    draw_card(
-        &mut grid,
-        centre_x,
-        centre_y,
-        centre_box_w,
-        centre_box_h,
-        &centre_rows,
-        th.accent,
-        th.accent,
-        true,
-        th,
-    );
-
-    // Helper: distribute n boxes evenly across the available height.
-    let distribute = |n: usize| -> Vec<usize> {
-        if n == 0 {
-            return Vec::new();
-        }
-        let total_h = n * side_box_h + n.saturating_sub(1);
-        if total_h >= h {
-            (0..n).map(|i| i * (side_box_h + 1)).collect()
-        } else {
-            let start = (h - total_h) / 2;
-            (0..n).map(|i| start + i * (side_box_h + 1)).collect()
-        }
-    };
-
-    // Left side: incoming FKs ("X.fk_col → centre.pk").
-    if show_left {
-        let ys = distribute(lefts.len());
-        for (i, edge) in lefts.iter().enumerate() {
-            let y = ys[i];
-            let rows = vec![
-                (edge.from_table.clone(), th.accent, true),
-                (
-                    edge.from_columns
-                        .join(",")
-                        .chars()
-                        .take(side_box_w - 4)
-                        .collect::<String>(),
-                    th.accent2,
-                    false,
-                ),
-            ];
-            draw_card(
-                &mut grid, left_x, y, side_box_w, side_box_h, &rows, th.border, th.fg, false, th,
-            );
-            // Arrow from right edge of left box → left edge of centre,
-            // anchored to the vertical mid of the source box and the
-            // matching column row of the centre (or its header if we
-            // can't find one).
-            let src_y = y + side_box_h / 2;
-            let dst_y = centre_y + 1 + locate_centre_row(&centre_rows, &edge.to_columns);
-            let label = edge.from_columns.join(",");
-            draw_arrow(
-                &mut grid,
-                left_x + side_box_w - 1,
-                src_y,
-                centre_x,
-                dst_y,
-                &label,
-                th.accent2,
-                false, // ► points right
-                th,
-            );
-        }
-    }
-
-    // Right side: outgoing FKs ("centre.fk_col → Y.pk").
-    if show_right {
-        let ys = distribute(rights.len());
-        for (i, edge) in rights.iter().enumerate() {
-            let y = ys[i];
-            let rows = vec![
-                (edge.to_table.clone(), th.accent, true),
-                (
-                    edge.to_columns
-                        .join(",")
-                        .chars()
-                        .take(side_box_w - 4)
-                        .collect::<String>(),
-                    th.warning,
-                    false,
-                ),
-            ];
-            draw_card(
-                &mut grid, right_x, y, side_box_w, side_box_h, &rows, th.border, th.fg, false, th,
-            );
-            let src_y = centre_y + 1 + locate_centre_row(&centre_rows, &edge.from_columns);
-            let dst_y = y + side_box_h / 2;
-            let label = edge.from_columns.join(",");
-            draw_arrow(
-                &mut grid,
-                centre_x + centre_box_w - 1,
-                src_y,
-                right_x,
-                dst_y,
-                &label,
-                th.accent,
-                false,
-                th,
-            );
-        }
-    }
-
-    // ── footer hint ───────────────────────────────────────────────
-    let hint_y = h.saturating_sub(1);
-    let stats = format!(
-        "  ←{} incoming   {} outgoing→   {} neighbours hidden",
-        incoming.len(),
-        outgoing.len(),
-        incoming.len().saturating_sub(lefts.len()) + outgoing.len().saturating_sub(rights.len()),
-    );
-    put_text(&mut grid, 0, hint_y, &stats, th.muted, false);
-
-    // ── convert grid → ratatui Lines ──────────────────────────────
-    grid_to_lines(&grid, th)
-}
-
-/// Find the row offset in the centre card that matches the first
-/// referenced column name, so the connecting arrow lands on it. Falls
-/// back to the header row when no match is found.
-fn locate_centre_row(rows: &[(String, Color, bool)], cols: &[String]) -> usize {
-    if cols.is_empty() {
-        return 0;
-    }
-    let target = &cols[0];
-    for (i, (label, _, _)) in rows.iter().enumerate().skip(1) {
-        // Centre rows look like "★ name  type". Match on whitespace-
-        // delimited second token.
-        let mut parts = label.split_whitespace();
-        let _marker = parts.next();
-        if let Some(name) = parts.next() {
-            if name == target {
-                return i;
-            }
-        }
-    }
-    0
-}
-
-/// Draw a rounded card with a header row + body lines. `header_color`
-/// styles the title and (when `emphasise` is set) the border.
-#[allow(clippy::too_many_arguments)]
-fn draw_card(
-    grid: &mut [Vec<Cell2>],
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    rows: &[(String, Color, bool)],
-    border: Color,
-    _body_color: Color,
-    emphasise: bool,
-    th: Theme,
-) {
-    if w < 4 || h < 3 {
-        return;
-    }
-    let h_max = grid.len();
-    let w_max = grid.first().map(Vec::len).unwrap_or(0);
-    if y >= h_max || x >= w_max {
-        return;
-    }
-    let h = h.min(h_max - y);
-    let w = w.min(w_max - x);
-
-    let (tl, tr, bl, br, hch, vch) = if emphasise {
-        ('╭', '╮', '╰', '╯', '─', '│')
-    } else {
-        ('┌', '┐', '└', '┘', '─', '│')
-    };
-    // Top + bottom borders.
-    put(grid, x, y, tl, border, false);
-    put(grid, x + w - 1, y, tr, border, false);
-    put(grid, x, y + h - 1, bl, border, false);
-    put(grid, x + w - 1, y + h - 1, br, border, false);
-    for i in 1..w - 1 {
-        put(grid, x + i, y, hch, border, false);
-        put(grid, x + i, y + h - 1, hch, border, false);
-    }
-    for j in 1..h - 1 {
-        put(grid, x, y + j, vch, border, false);
-        put(grid, x + w - 1, y + j, vch, border, false);
-    }
-
-    // Inner rows.
-    for (i, (text, color, bold)) in rows.iter().enumerate() {
-        let row_y = y + 1 + i;
-        if row_y >= y + h - 1 {
-            break;
-        }
-        let inner_w = w - 2;
-        let truncated: String = text.chars().take(inner_w.saturating_sub(2)).collect();
-        put_text(grid, x + 2, row_y, &truncated, *color, *bold);
-        // Insert a horizontal rule under the header.
-        if i == 0 && rows.len() > 1 && row_y + 1 < y + h - 1 {
-            for k in 1..w - 1 {
-                put(grid, x + k, row_y + 1, '─', th.muted, false);
-            }
-        }
-    }
-}
-
-/// Draw a one-cell-thick orthogonal arrow from (x1,y1) to (x2,y2) with
-/// a centred label. Uses box-drawing chars so it composites cleanly
-/// over existing cells. `back_arrow` swaps the arrowhead direction.
-#[allow(clippy::too_many_arguments)]
-fn draw_arrow(
-    grid: &mut [Vec<Cell2>],
-    x1: usize,
-    y1: usize,
-    x2: usize,
-    y2: usize,
-    label: &str,
-    color: Color,
-    back_arrow: bool,
-    _th: Theme,
-) {
-    if x2 <= x1 || grid.is_empty() {
-        return;
-    }
-    let mid_x = x1 + (x2 - x1) / 2;
-    // First leg: horizontal from x1 to mid_x at y1.
-    for x in x1..=mid_x {
-        put(grid, x, y1, '─', color, false);
-    }
-    // Vertical: y1 -> y2 at mid_x.
-    if y1 != y2 {
-        let (lo, hi) = if y1 < y2 { (y1, y2) } else { (y2, y1) };
-        for y in lo..=hi {
-            // Don't overwrite the corners we'll set below.
-            if y != y1 && y != y2 {
-                put(grid, mid_x, y, '│', color, false);
-            }
-        }
-        // Corners.
-        let c1 = if y1 < y2 { '╮' } else { '╯' };
-        let c2 = if y1 < y2 { '╰' } else { '╭' };
-        put(grid, mid_x, y1, c1, color, false);
-        put(grid, mid_x, y2, c2, color, false);
-    }
-    // Second leg: horizontal from mid_x to x2 at y2.
-    for x in mid_x..=x2 {
-        put(grid, x, y2, '─', color, false);
-    }
-    // Arrowhead.
-    let head_x = if back_arrow { x1 } else { x2 };
-    let head_y = if back_arrow { y1 } else { y2 };
-    let head_ch = if back_arrow { '◀' } else { '▶' };
-    put(grid, head_x, head_y, head_ch, color, true);
-
-    // Label sits one row above the horizontal leg with the longest run.
-    if !label.is_empty() {
-        let label_chars: Vec<char> = label.chars().collect();
-        let lbl_y = if y1 == y2 {
-            y1.saturating_sub(1)
-        } else {
-            // Centre on the longer leg; pick the source leg.
-            y1.saturating_sub(1)
-        };
-        let lbl_x = x1 + 1;
-        for (i, ch) in label_chars.iter().enumerate() {
-            if lbl_x + i >= x2 {
-                break;
-            }
-            put(grid, lbl_x + i, lbl_y, *ch, color, false);
-        }
-    }
-}
-
-#[inline]
-fn put(grid: &mut [Vec<Cell2>], x: usize, y: usize, ch: char, fg: Color, bold: bool) {
-    if let Some(row) = grid.get_mut(y) {
-        if let Some(cell) = row.get_mut(x) {
-            *cell = Cell2 { ch, fg, bold };
-        }
-    }
-}
-
-fn put_text(grid: &mut [Vec<Cell2>], x: usize, y: usize, text: &str, fg: Color, bold: bool) {
-    for (i, ch) in text.chars().enumerate() {
-        put(grid, x + i, y, ch, fg, bold);
-    }
-}
-
-fn grid_to_lines(grid: &[Vec<Cell2>], th: Theme) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(grid.len());
-    for row in grid {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut buf = String::new();
-        let mut cur_fg = th.fg;
-        let mut cur_bold = false;
-        for cell in row {
-            if cell.fg != cur_fg || cell.bold != cur_bold {
-                if !buf.is_empty() {
-                    let mut style = Style::default().fg(cur_fg).bg(th.bg);
-                    if cur_bold {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    spans.push(Span::styled(std::mem::take(&mut buf), style));
-                }
-                cur_fg = cell.fg;
-                cur_bold = cell.bold;
-            }
-            buf.push(cell.ch);
-        }
-        if !buf.is_empty() {
-            let mut style = Style::default().fg(cur_fg).bg(th.bg);
-            if cur_bold {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            spans.push(Span::styled(buf, style));
-        }
-        out.push(Line::from(spans));
-    }
-    out
 }
 
 /// Alphabetical list of tables in the active schema. Sourced from the
@@ -5095,6 +4904,10 @@ fn restore_terminal(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     disable_raw_mode()?;
+    // Defence in depth: if the user quit while the ERD canvas had
+    // mouse capture enabled, disabling it here keeps the parent
+    // shell from seeing escape-sequence noise.
+    let _ = erd_mouse::disable();
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
@@ -5374,6 +5187,7 @@ mod tests {
             Some(&orders),
             &incoming,
             &outgoing,
+            0,
             Theme::catppuccin_mocha(),
         );
         let dump: String = lines
@@ -5444,6 +5258,7 @@ mod tests {
             Some(&orders),
             &incoming,
             &outgoing,
+            0,
             Theme::catppuccin_mocha(),
         );
         let dump: String = lines

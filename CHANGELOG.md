@@ -8,6 +8,7 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ### Added
 
+<<<<<<< HEAD
 - **`Ni` insert-mode repeat.** Prefixing any Insert-mode entry key
   (`i a I A o O`) with a count now records every keystroke typed
   before `Esc` and replays the captured text `N - 1` more times on
@@ -172,6 +173,37 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 - **`LICENSE-MIT` and `LICENSE-APACHE`** at the repo root so the
   `MIT OR Apache-2.0` metadata declared by every crate is backed
   by real files in both the repo and the published tarballs.
+- **Whole-schema ERD canvas.** Press `v` on the ERD tab to swap the
+  focused-card view for a layered (Sugiyama-style) layout that lays
+  out every table in the schema as connected cards on a virtual
+  canvas larger than the terminal. Parents (referenced tables) flow
+  on the left, dependants on the right; within each rank cards are
+  ordered by barycentre so edges cross as little as possible.
+- **Pan + zoom.** Inside the canvas: `h` `j` `k` `l` (or arrows) pan
+  one card-step at a time, `H` / `L` jump 30 cells, and `+` / `-`
+  cycle three zoom levels — `Collapsed` (table name only), `Compact`
+  (PK + FK columns), `Full` (every column with its type). The
+  banner shows the current zoom level.
+- **Mouse drag pan + scroll-wheel zoom (ERD canvas only).** Mouse
+  capture is enabled when entering canvas mode and disabled on
+  exit, so the rest of the TUI keeps terminal-native text
+  selection. Left-drag pans the viewport (the cell under the cursor
+  stays under the cursor); scroll wheel zooms in / out.
+- **No more 8-column cap in the focused ERD view.** `render_focus_canvas`
+  used to render at most 8 columns of the focused table and replace
+  the rest with `… (+N more)`. It now fills the centre card with
+  every column that fits the pane and emits `↑ N hidden above` /
+  `↓ N hidden below` indicators when the card body overflows.
+  `J` / `K` scroll the visible window through the column list;
+  selecting a different table resets the scroll back to the top.
+
+- **Sub-module `tsqlx-tui::erd`.** Pure-function ERD primitives
+  moved out of the 4760-line `lib.rs` into `erd/primitives.rs`
+  (cell grid, card / arrow drawers), with new
+  `erd/layout.rs` (longest-path layering + barycentre ordering,
+  cycle-tolerant), `erd/viewport.rs` (offset + zoom + drag-anchor
+  state), `erd/canvas.rs` (whole-schema render with per-edge lane
+  allocation), and `erd/mouse.rs` (capture toggle).
 
 ## [0.4.0] - 2026-05-11
 
