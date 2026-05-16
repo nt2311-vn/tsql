@@ -321,6 +321,29 @@ The ERD tab gives you a **focused schema map** centred on whichever table you're
 - Arrow labels are FK column names. Arrows route orthogonally with box-drawing characters.
 - Press `f` to fullscreen the chart, `j/k` to focus a different table, `Enter` to drill into it, `y` to dump a Mermaid `erDiagram` to `./<schema>.mmd`.
 
+### Whole-schema canvas (`v`)
+
+Press `v` on the ERD tab to swap the focused-card view for a **whole-schema canvas** that lays out every table in the active schema on a virtual surface larger than your terminal — think GitHub's fullscreen Mermaid viewer, but inside ratatui:
+
+```
+┌─ Whole-schema canvas  (drag to pan · +/- zoom) ───────────────────────────────┐
+│                                                                               │
+│  ╭ customers ───╮          ╭ orders ──────╮          ╭ shipments ───╮         │
+│  │ ★ id          │── ─────▶│ ★ id          │── ─────▶│ ★ id          │         │
+│  │   name        │         │ ⚷ customer_id │         │ ⚷ order_id    │         │
+│  │   email       │         │   amount      │         │   tracking_id │         │
+│  ╰───────────────╯         ╰───────────────╯         ╰───────────────╯         │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Layered (Sugiyama-style) layout.** Parents (referenced tables) flow on the left, dependants on the right. Within each rank, cards are ordered by the barycentre of their neighbours' positions so edges cross as little as possible. Cycles (self-references, mutually-recursive tables) are broken deterministically.
+- **Three zoom levels.** `+` / `-` cycle `Collapsed` (table name only) → `Compact` (PK + FK columns, the default) → `Full` (every column with its data type).
+- **Pan with the keyboard.** `h` / `j` / `k` / `l` (or arrow keys) pan one card-step; `H` / `L` jump 30 cells.
+- **Pan with the mouse.** Left-drag the canvas — the cell under the cursor stays under the cursor. Scroll wheel zooms in / out. Mouse capture is enabled **only** in the canvas view, so the rest of the TUI keeps native terminal text selection.
+- **`v` returns** to the focused-card view; mouse capture is disabled on exit.
+- **`y`** still exports the schema as a Mermaid `erDiagram` to `./<schema>.mmd`.
+
 ```mermaid
 %%{init: {"theme": "dark"}}%%
 flowchart LR
@@ -447,7 +470,12 @@ The SQL editor is **modal**. The current mode shows in the editor title chip: `[
 | `p` | paste yank register |
 | `v` | enter Visual |
 | `:` | open command palette |
-| `Esc` | return to Browser |
+| `Esc` | return to Browser (resets pending count) |
+| `1`–`9` then key | repeat the next motion / operator N times (e.g. `5j`, `10w`, `3dd`, `2x`, `3p`); counts cap at 9999 |
+| `5G` / `7gg` | jump to line N (1-based) |
+| `u` / `U` | undo / redo (snapshot taken per Insert session + per Normal mutation) |
+| `"<letter>` then `yy`/`dd`/`p`/… | target the named register (a–z); unnamed register `"` always mirrors the most recent write |
+| `5i abc<Esc>` | insert `abc` five times (`Ni` repeat) |
 
 ### Insert mode
 
@@ -455,7 +483,7 @@ Typing inserts. `Esc` returns to Normal. **`Tab`** opens the autocomplete popup 
 
 ### Visual mode
 
-`h j k l 0 $ w b` extend the selection. `y` yanks, `d` deletes (both return to Normal). `Esc` cancels.
+`h j k l 0 $ w b` extend the selection — the editor pane paints the theme's selection background on every cell inside the range so the user can see exactly what will be yanked or deleted. `y` yanks, `d` deletes (both return to Normal). `Esc` cancels.
 
 ### Autocomplete popup
 
@@ -511,9 +539,17 @@ stateDiagram-v2
 | Browser     | `y`             | Copy cell to system clipboard (ERD tab: `.mmd` export) |
 | Browser     | `Y`             | Copy entire row (TSV) to system clipboard           |
 | Browser     | `:`             | Command palette (`:select`, `:export`, `:fmt`, `:w`, `:e`, `:help`, `:q`) |
-| ERD         | `j/k`           | Focus a different table                             |
+| ERD         | `j/k`           | Focus a different table (focused view)              |
+| ERD focused | `J` / `K`       | Scroll the centre card's column window              |
 | ERD         | `Enter` / `o`   | Open the focused table                              |
 | ERD         | `f`             | Toggle fullscreen schema map                        |
+| ERD         | `v`             | Toggle focused-card ↔ whole-schema canvas           |
+| ERD canvas  | `h/j/k/l` / ←↑↓→ | Pan the viewport                                  |
+| ERD canvas  | `H` / `L`       | Pan left / right by 30 cells                        |
+| ERD canvas  | `+` / `-`       | Zoom in / out (Collapsed → Compact → Full)          |
+| ERD canvas  | mouse drag      | Pan; cell under cursor stays under cursor           |
+| ERD canvas  | scroll wheel    | Zoom in / out                                       |
+| ERD canvas  | `c`             | Reset viewport to top-left                          |
 | Editor      | `Ctrl+R`        | Run all statements                                  |
 | Editor      | `Ctrl+Enter`    | Run statement under cursor (also `Alt+Enter`)       |
 | Editor      | `Ctrl+S`        | Save buffer (`:w <path>` retargets)                 |

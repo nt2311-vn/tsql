@@ -6,7 +6,91 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 
 ## [Unreleased]
 
+### Fixed
+
+- **ERD whole-schema canvas glitches.** Four real bugs that made the
+  canvas hard to read on any non-trivial schema:
+  - Cards were painted before edges, so arrow legs that crossed
+    intermediate-rank tables visibly carved through their bodies.
+    The render order is now: edges → cards (mask) → arrowheads
+    (third pass on top so the destination card's left border
+    doesn't swallow the `▶` glyph).
+  - Lane allocation grouped edges by `gap_centre` (the natural
+    midpoint between parent and child columns). Multiple parents
+    fanning into the same destination ended up sharing one mid-x
+    and visibly overlapping into a single tangled bend. Edges are
+    now grouped **by destination card**; each incoming edge bends
+    in the gutter immediately left of its target, with per-edge
+    lane offsets so siblings stagger.
+  - Fan-in arrowheads collapsed into a single visible glyph on the
+    destination's mid-row. Arrowhead rows are now distributed
+    across the child card's full height (`card_top + i * card_h /
+    n`) so N incoming FKs show as N distinct `▶` markers stacked
+    on the card's left edge.
+  - Collapsed zoom barely shrunk the virtual canvas — `h_gap=6` /
+    `v_gap=2` were constants regardless of zoom level. Gap sizing
+    now scales per zoom (`Collapsed = 3/0`, `Compact = 5/1`,
+    `Full = 6/2`) and Collapsed cards cap their width at name+4
+    chars (with the name truncated to 10) so a single very long
+    table name can't bloat its rank's column width.
+
 ### Added
+
+- **`f` (fit-to-overview) in the ERD canvas.** One keystroke drops
+  to `Collapsed` zoom and pans to top-left — the "let me see
+  everything" escape hatch when a deep schema scrolls off-screen.
+  Banner now reads `hjkl pan · +/- zoom · f fit · c reset · drag
+  · v focused`.
+
+- **`Ni` insert-mode repeat.** Prefixing any Insert-mode entry key
+  (`i a I A o O`) with a count now records every keystroke typed
+  before `Esc` and replays the captured text `N - 1` more times on
+  exit. `5iabc<Esc>` produces `abcabcabcabcabc`. Backspaces during
+  the recording trim the replay buffer so what gets replayed is
+  exactly what survives to the end of the session.
+- **Named vim registers (`"a`–`"z`).** Type `"<letter>` before any
+  `yy` / `dd` / `dx` / `p` (etc.) to target a specific register
+  instead of the unnamed `"`. The unnamed register always mirrors
+  the most-recent write (vim's behaviour), so `"ayy` then `p`
+  still pastes the same content while keeping a longer-lived copy
+  in register `a` for later `"ap`. The selector survives across
+  the operator-pair gap (`"a3dd` works). Uppercase register names
+  are folded to lowercase for v1.
+- **Undo / redo (`u` and `U`).** `u` in Normal mode restores the
+  buffer + cursor to the snapshot taken at the start of the most
+  recent edit session; `U` redoes a previously-undone change.
+  Snapshots are taken on entry to Insert mode and before each
+  discrete Normal-mode mutation (`dd`, `dx`, `p`, `dD`, …), so an
+  entire Insert session collapses to a single undo step rather
+  than one step per keystroke. History is capped at 100 entries
+  per side; a fresh edit prunes the redo branch. **`U` is used
+  instead of vim's `Ctrl+R`** because `Ctrl+R` is reserved by tsqlx
+  for "run all queries".
+- **`Ngg` / `NG` jump to line N (1-based).** `5G` jumps to line 5,
+  `7gg` jumps to line 7. Without a count, `G` and `gg` keep their
+  buffer-end / buffer-start semantics. Lines past the end clamp
+  to the last byte.
+
+- **Vim repeat-count prefix in the editor.** Any digit sequence in
+  Normal mode accumulates as a repeat count for the following
+  motion / operator. `5j` moves down 5 lines, `10w` jumps 10 words
+  forward, `3dd` deletes 3 lines, `3yy` yanks 3 lines, `2x` deletes
+  2 chars, `3p` pastes the register 3 times. `0` alone is still the
+  line-start motion; `30j` works because the second digit follows
+  an already-accumulating count. Counts cap at 9999. `Esc` resets
+  any pending count. Mode-entry keys (`i a I A o O v :`) consume
+  and discard the count silently — `5i…<Esc>` does *not* yet
+  replay the inserted text 5 times (vim's `Ni` semantics are out
+  of scope for v1; called out in `vim.rs`).
+- **Visual-mode selection highlight in the editor.** When `vim_mode`
+  is `Visual`, the editor pane now paints the theme's selection
+  background on every cell inside the active selection range, with
+  byte-accurate boundaries: any syntax-highlight span that straddles
+  the selection edge is split into `(pre, selected, post)` sub-spans
+  so the highlight starts and ends exactly where the user expects.
+  Multi-line selections are handled by checking the line's global
+  byte range against the (normalised, anchor↔cursor) selection
+  range on each rendered line.
 
 - **Vim-style modal editing in the SQL editor.** Three modes —
   `NORMAL` (default), `INSERT`, `VISUAL` — surfaced in the editor
@@ -122,6 +206,37 @@ This project intends to follow Semantic Versioning and the Keep a Changelog form
 - **`LICENSE-MIT` and `LICENSE-APACHE`** at the repo root so the
   `MIT OR Apache-2.0` metadata declared by every crate is backed
   by real files in both the repo and the published tarballs.
+- **Whole-schema ERD canvas.** Press `v` on the ERD tab to swap the
+  focused-card view for a layered (Sugiyama-style) layout that lays
+  out every table in the schema as connected cards on a virtual
+  canvas larger than the terminal. Parents (referenced tables) flow
+  on the left, dependants on the right; within each rank cards are
+  ordered by barycentre so edges cross as little as possible.
+- **Pan + zoom.** Inside the canvas: `h` `j` `k` `l` (or arrows) pan
+  one card-step at a time, `H` / `L` jump 30 cells, and `+` / `-`
+  cycle three zoom levels — `Collapsed` (table name only), `Compact`
+  (PK + FK columns), `Full` (every column with its type). The
+  banner shows the current zoom level.
+- **Mouse drag pan + scroll-wheel zoom (ERD canvas only).** Mouse
+  capture is enabled when entering canvas mode and disabled on
+  exit, so the rest of the TUI keeps terminal-native text
+  selection. Left-drag pans the viewport (the cell under the cursor
+  stays under the cursor); scroll wheel zooms in / out.
+- **No more 8-column cap in the focused ERD view.** `render_focus_canvas`
+  used to render at most 8 columns of the focused table and replace
+  the rest with `… (+N more)`. It now fills the centre card with
+  every column that fits the pane and emits `↑ N hidden above` /
+  `↓ N hidden below` indicators when the card body overflows.
+  `J` / `K` scroll the visible window through the column list;
+  selecting a different table resets the scroll back to the top.
+
+- **Sub-module `tsqlx-tui::erd`.** Pure-function ERD primitives
+  moved out of the 4760-line `lib.rs` into `erd/primitives.rs`
+  (cell grid, card / arrow drawers), with new
+  `erd/layout.rs` (longest-path layering + barycentre ordering,
+  cycle-tolerant), `erd/viewport.rs` (offset + zoom + drag-anchor
+  state), `erd/canvas.rs` (whole-schema render with per-edge lane
+  allocation), and `erd/mouse.rs` (capture toggle).
 
 ## [0.4.0] - 2026-05-11
 

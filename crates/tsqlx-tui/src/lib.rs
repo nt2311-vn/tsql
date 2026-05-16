@@ -4,13 +4,20 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 mod editor;
+mod erd;
 mod export;
+mod undo;
 mod vim;
 use editor::{append_history, highlight_line, history_path, load_history, statement_range_at};
+use erd::{
+    canvas::CanvasInput as ErdCanvasInput, mouse as erd_mouse, render_focus_canvas,
+    render_schema_canvas, Viewport as ErdViewport,
+};
 
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -388,6 +395,25 @@ struct AppState {
     /// banner stays, but the table list + per-table inspector hide.
     /// Toggled with `f` while on the ERD tab.
     erd_chart_fullscreen: bool,
+    /// ERD sub-mode: focused-card view vs whole-schema canvas.
+    /// Toggled with `v`.
+    erd_view: ErdView,
+    /// Viewport over the whole-schema canvas (offset + zoom). Only
+    /// meaningful when `erd_view == Canvas`.
+    erd_canvas_vp: ErdViewport,
+    /// Last computed virtual canvas size, written by the immutable
+    /// draw path so the next event-handler tick clamps against an
+    /// up-to-date virtual bound. `Cell` because `draw_*` only takes
+    /// `&AppState`.
+    erd_canvas_virt: std::cell::Cell<(u16, u16)>,
+    /// True while the canvas has terminal mouse capture enabled.
+    /// We toggle on entering `Canvas`, off on leaving — so the rest
+    /// of the TUI keeps native terminal selection.
+    erd_mouse_on: bool,
+    /// First column index rendered inside the centre card of the
+    /// focused ERD view. `J` / `K` scroll. Reset to 0 whenever the
+    /// selected table changes.
+    erd_focus_scroll: usize,
     editor: String,
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
@@ -446,10 +472,29 @@ struct AppState {
     /// `editor_cursor`. The selection range is normalised
     /// (`min..max`) on use.
     vim_visual_anchor: Option<usize>,
-    /// Single unnamed register for `yy` / `dd` / `p`. Stores either
-    /// a full line (with trailing newline) or an arbitrary slice
-    /// depending on which command populated it.
-    vim_yank: String,
+    /// Named vim registers. Key `'"'` is the unnamed register that
+    /// every `yy` / `dd` / `dx` / `dD` etc. writes to. Keys
+    /// `'a'..='z'` hold what the user explicitly stashes with
+    /// `"<letter>yy`. A mutating yank into `'a'` also mirrors into
+    /// `'"'` so the unnamed register always reflects the most recent
+    /// write (vim's behaviour).
+    vim_registers: std::collections::HashMap<char, String>,
+    /// Set transiently by `RegisterOverride('x')` from the next
+    /// yank / delete / paste action. Cleared after that action
+    /// fires.
+    vim_register_override: Option<char>,
+    /// Insert-mode keystroke recording for the `Ni` repeat prefix.
+    /// `Some(buffer)` only while between `BeginInsertReplay` and
+    /// `EndInsertReplay`. Every `InsertChar` / `InsertNewline` /
+    /// `BackspaceInsert` action appends to (or trims) this buffer.
+    insert_recording: Option<String>,
+    /// How many additional times to replay `insert_recording` when
+    /// `EndInsertReplay` fires. `0` means no replay.
+    insert_replay_count: u32,
+    /// Editor undo/redo history. Snapshots are taken on EnterMode
+    /// (Insert) and before each discrete Normal-mode mutation
+    /// (`dd`, `dx`, `p`, …).
+    undo_stack: undo::UndoStack,
     /// Active autocomplete popup. `None` when no popup is open.
     completion: Option<CompletionUi>,
 }
@@ -469,6 +514,16 @@ struct CompletionUi {
 enum FilterTarget {
     Sidebar,
     Records,
+}
+
+/// Sub-mode of the ERD tab. `Focused` keeps the legacy centre-card +
+/// neighbour-cards layout; `Canvas` swaps to the whole-schema layered
+/// canvas with pan / zoom / drag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ErdView {
+    #[default]
+    Focused,
+    Canvas,
 }
 
 impl AppState {
@@ -508,6 +563,11 @@ impl AppState {
             erd_selected: 0,
             erd_table_info: HashMap::new(),
             erd_chart_fullscreen: false,
+            erd_view: ErdView::default(),
+            erd_canvas_vp: ErdViewport::new(),
+            erd_canvas_virt: std::cell::Cell::new((0, 0)),
+            erd_mouse_on: false,
+            erd_focus_scroll: 0,
             editor: String::new(),
             editor_cursor: 0,
             editor_scroll: std::cell::Cell::new(0),
@@ -529,7 +589,11 @@ impl AppState {
             vim_mode: vim::VimMode::Normal,
             vim_pending: vim::PendingOp::default(),
             vim_visual_anchor: None,
-            vim_yank: String::new(),
+            vim_registers: std::collections::HashMap::new(),
+            vim_register_override: None,
+            insert_recording: None,
+            insert_replay_count: 0,
+            undo_stack: undo::UndoStack::new(100),
             completion: None,
         }
     }
@@ -727,6 +791,7 @@ async fn run_loop(
         match event::read()? {
             Event::Key(key) if handle_key(app, key).await? => break,
             Event::Paste(text) => handle_paste(app, &text),
+            Event::Mouse(mev) => handle_mouse(app, mev),
             _ => {}
         }
     }
@@ -767,6 +832,34 @@ fn handle_paste(app: &mut AppState, text: &str) {
                 sync_filter(app, t);
             }
         }
+    }
+}
+
+/// Mouse-event router. Only the ERD canvas view consumes mouse
+/// events today; everywhere else we ignore them so terminal-native
+/// text selection stays unaffected (we never call `EnableMouseCapture`
+/// outside of canvas mode anyway, but defence in depth is cheap).
+fn handle_mouse(app: &mut AppState, mev: MouseEvent) {
+    if app.detail_tab != DetailTab::Erd || app.erd_view != ErdView::Canvas {
+        return;
+    }
+    match mev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.erd_canvas_vp.drag_begin(mev.column, mev.row);
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            app.erd_canvas_vp.drag_update(mev.column, mev.row);
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.erd_canvas_vp.drag_end();
+        }
+        MouseEventKind::ScrollUp => {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_in();
+        }
+        MouseEventKind::ScrollDown => {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_out();
+        }
+        _ => {}
     }
 }
 
@@ -1833,13 +1926,60 @@ fn line_range_inclusive(s: &str, cursor: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// Snapshot the editor buffer + cursor onto the undo stack. Skips
+/// when the buffer hasn't changed since the last snapshot (the stack
+/// dedups on `Eq`).
+fn snapshot_for_undo(app: &mut AppState) {
+    let snap = undo::Snapshot::new(app.editor.clone(), app.editor_cursor);
+    app.undo_stack.push(snap);
+}
+
+/// Stash `content` into the active register (override or unnamed).
+/// Always mirrors into the unnamed `'"'` register — vim's
+/// "every write touches `\"`" rule.
+fn write_register(app: &mut AppState, content: String) {
+    let target = app.vim_register_override.take().unwrap_or('"');
+    app.vim_registers.insert(target, content.clone());
+    if target != '"' {
+        app.vim_registers.insert('"', content);
+    }
+}
+
+/// Read the contents of the source register (override or unnamed),
+/// clearing any override so the next paste falls back to unnamed.
+fn read_register(app: &mut AppState) -> String {
+    let source = app.vim_register_override.take().unwrap_or('"');
+    app.vim_registers.get(&source).cloned().unwrap_or_default()
+}
+
+/// Convert a 1-based vim line number into a byte offset, clamped to
+/// the buffer's last line.
+fn line_index_to_byte(s: &str, line_1based: u32) -> usize {
+    let target = line_1based.saturating_sub(1) as usize;
+    let mut cur_line = 0usize;
+    for (i, ch) in s.char_indices() {
+        if cur_line == target {
+            return i;
+        }
+        if ch == '\n' {
+            cur_line += 1;
+        }
+    }
+    s.len()
+}
+
 /// Apply a single `VimAction` to `app`. Mutations are surgical;
 /// no-ops are silent. Mode transitions are NOT applied here — the
 /// caller threads them through after the action loop.
 fn apply_vim_action(app: &mut AppState, action: vim::VimAction) {
     use vim::VimAction as A;
     match action {
-        A::EnterMode(_) => {} // handled by the caller
+        A::EnterMode(vim::VimMode::Insert) => {
+            // Snapshot once per Insert-mode session so `u` undoes
+            // the entire insertion as a unit.
+            snapshot_for_undo(app);
+        }
+        A::EnterMode(_) => {} // mode transition handled by the caller
         A::MoveLeft => {
             app.editor_cursor = prev_char_boundary(&app.editor, app.editor_cursor);
         }
@@ -1870,33 +2010,44 @@ fn apply_vim_action(app: &mut AppState, action: vim::VimAction) {
         A::MoveWordBackward => {
             app.editor_cursor = move_word_backward(&app.editor, app.editor_cursor);
         }
+        A::MoveToLine(n) => {
+            app.editor_cursor = line_index_to_byte(&app.editor, n);
+        }
         A::InsertChar(ch) => {
             let mut buf = [0u8; 4];
             let s = ch.encode_utf8(&mut buf);
             editor_insert_str(app, s);
+            if let Some(rec) = app.insert_recording.as_mut() {
+                rec.push(ch);
+            }
         }
-        A::InsertNewline => editor_insert_str(app, "\n"),
-        A::InsertLineBelow => {
-            // Cursor is at line end after the `o`-prefix move; just
-            // insert a newline + leave the cursor on the new line.
+        A::InsertNewline => {
             editor_insert_str(app, "\n");
+            if let Some(rec) = app.insert_recording.as_mut() {
+                rec.push('\n');
+            }
+        }
+        A::InsertLineBelow => {
+            editor_insert_str(app, "\n");
+            if let Some(rec) = app.insert_recording.as_mut() {
+                rec.push('\n');
+            }
         }
         A::InsertLineAbove => {
-            // Cursor is at line start after the `O`-prefix move; insert
-            // a newline, then step the cursor back to BEFORE that
-            // newline so the user is on the new (above) blank line.
             let here = app.editor_cursor;
             app.editor.insert(here, '\n');
-            // Cursor stays at `here`, which is now the start of the
-            // freshly inserted blank line above.
             app.history_idx = None;
+            if let Some(rec) = app.insert_recording.as_mut() {
+                rec.push('\n');
+            }
         }
         A::DeleteCharUnderCursor => {
+            snapshot_for_undo(app);
             if app.editor_cursor < app.editor.len() {
                 let next = next_char_boundary(&app.editor, app.editor_cursor);
                 let removed = app.editor[app.editor_cursor..next].to_owned();
                 app.editor.replace_range(app.editor_cursor..next, "");
-                app.vim_yank = removed;
+                write_register(app, removed);
                 app.history_idx = None;
             }
         }
@@ -1906,30 +2057,39 @@ fn apply_vim_action(app: &mut AppState, action: vim::VimAction) {
                 app.editor.replace_range(prev..app.editor_cursor, "");
                 app.editor_cursor = prev;
                 app.history_idx = None;
+                if let Some(rec) = app.insert_recording.as_mut() {
+                    rec.pop();
+                }
             }
         }
         A::DeleteLine => {
+            snapshot_for_undo(app);
             let (s, e) = line_range_inclusive(&app.editor, app.editor_cursor);
-            app.vim_yank = app.editor[s..e].to_owned();
+            let removed = app.editor[s..e].to_owned();
             app.editor.replace_range(s..e, "");
             app.editor_cursor = s.min(app.editor.len());
+            write_register(app, removed);
             app.history_idx = None;
         }
         A::YankLine => {
             let (s, e) = line_range_inclusive(&app.editor, app.editor_cursor);
-            app.vim_yank = app.editor[s..e].to_owned();
-            app.status = format!("yanked {} bytes", app.vim_yank.len());
+            let content = app.editor[s..e].to_owned();
+            let bytes = content.len();
+            write_register(app, content);
+            app.status = format!("yanked {bytes} bytes");
         }
         A::DeleteSelection => {
+            snapshot_for_undo(app);
             if let Some(anchor) = app.vim_visual_anchor.take() {
                 let (s, e) = if anchor <= app.editor_cursor {
                     (anchor, app.editor_cursor)
                 } else {
                     (app.editor_cursor, anchor)
                 };
-                app.vim_yank = app.editor[s..e].to_owned();
+                let removed = app.editor[s..e].to_owned();
                 app.editor.replace_range(s..e, "");
                 app.editor_cursor = s;
+                write_register(app, removed);
                 app.history_idx = None;
             }
         }
@@ -1940,18 +2100,67 @@ fn apply_vim_action(app: &mut AppState, action: vim::VimAction) {
                 } else {
                     (app.editor_cursor, anchor)
                 };
-                app.vim_yank = app.editor[s..e].to_owned();
-                app.status = format!("yanked {} bytes", app.vim_yank.len());
+                let content = app.editor[s..e].to_owned();
+                let bytes = content.len();
+                write_register(app, content);
+                app.status = format!("yanked {bytes} bytes");
             }
         }
         A::Paste => {
-            if !app.vim_yank.is_empty() {
-                let text = app.vim_yank.clone();
+            snapshot_for_undo(app);
+            let text = read_register(app);
+            if !text.is_empty() {
                 editor_insert_str(app, &text);
             }
         }
         A::StartCommandPalette => {
             app.command_input = Some(String::new());
+        }
+        A::RegisterOverride(ch) => {
+            app.vim_register_override = Some(ch);
+        }
+        A::BeginInsertReplay(replays) => {
+            app.insert_recording = Some(String::new());
+            app.insert_replay_count = replays;
+        }
+        A::EndInsertReplay => {
+            let buffer = app.insert_recording.take().unwrap_or_default();
+            let replays = std::mem::take(&mut app.insert_replay_count);
+            if replays > 0 && !buffer.is_empty() {
+                for _ in 0..replays {
+                    editor_insert_str(app, &buffer);
+                }
+            }
+        }
+        A::Undo => {
+            let current = undo::Snapshot::new(app.editor.clone(), app.editor_cursor);
+            if let Some(snap) = app.undo_stack.undo(current) {
+                app.editor = snap.text;
+                app.editor_cursor = snap.cursor.min(app.editor.len());
+                app.history_idx = None;
+                app.status = format!(
+                    "undo  (history={}, future={})",
+                    app.undo_stack.history_len(),
+                    app.undo_stack.future_len()
+                );
+            } else {
+                app.status = "already at oldest change".to_owned();
+            }
+        }
+        A::Redo => {
+            let current = undo::Snapshot::new(app.editor.clone(), app.editor_cursor);
+            if let Some(snap) = app.undo_stack.redo(current) {
+                app.editor = snap.text;
+                app.editor_cursor = snap.cursor.min(app.editor.len());
+                app.history_idx = None;
+                app.status = format!(
+                    "redo  (history={}, future={})",
+                    app.undo_stack.history_len(),
+                    app.undo_stack.future_len()
+                );
+            } else {
+                app.status = "already at newest change".to_owned();
+            }
         }
     }
 }
@@ -2393,8 +2602,11 @@ async fn sidebar_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 }
 
 async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    let in_erd_canvas = app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas;
     match key.code {
-        KeyCode::Char('l') | KeyCode::Right => {
+        // Tab navigation. Suppressed inside the ERD canvas so hjkl
+        // can pan the viewport instead of switching tabs.
+        KeyCode::Char('l') | KeyCode::Right if !in_erd_canvas => {
             app.detail_tab = app.detail_tab.next();
             if app.detail_tab == DetailTab::Erd
                 && app.relationships.is_empty()
@@ -2408,7 +2620,7 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 spawn_erd_prefetch(app);
             }
         }
-        KeyCode::Char('h') | KeyCode::Left => {
+        KeyCode::Char('h') | KeyCode::Left if !in_erd_canvas => {
             app.detail_tab = app.detail_tab.prev();
         }
         KeyCode::Char('j') | KeyCode::Down if app.detail_tab == DetailTab::Records => {
@@ -2437,15 +2649,129 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 load_records_page(app, &s, &t);
             }
         }
-        // ERD navigation: move the highlight through the table list.
-        KeyCode::Char('j') | KeyCode::Down if app.detail_tab == DetailTab::Erd => {
-            let len = erd_table_list(app).len();
-            if len > 0 {
-                app.erd_selected = (app.erd_selected + 1).min(len - 1);
+        // ── Whole-schema canvas pan / zoom (Canvas sub-mode) ────
+        // These match BEFORE the focused-view j/k handlers so canvas
+        // mode steals them. View toggle `v` is below.
+        KeyCode::Char('h') | KeyCode::Left
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(-3, 0);
+        }
+        KeyCode::Char('l') | KeyCode::Right
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(3, 0);
+        }
+        KeyCode::Char('j') | KeyCode::Down
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(0, 2);
+        }
+        KeyCode::Char('k') | KeyCode::Up
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(0, -2);
+        }
+        KeyCode::Char('H')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(-30, 0);
+        }
+        KeyCode::Char('L')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(30, 0);
+        }
+        KeyCode::Char('+') | KeyCode::Char('=')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_in();
+            app.status = format!("ERD canvas zoom: {:?}", app.erd_canvas_vp.zoom);
+        }
+        KeyCode::Char('-') | KeyCode::Char('_')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_out();
+            app.status = format!("ERD canvas zoom: {:?}", app.erd_canvas_vp.zoom);
+        }
+        KeyCode::Char('c')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            // Recentre on the selected card. Layout is recomputed
+            // every draw, so just reset the offset to 0 — the next
+            // render will clamp against the fresh virtual size and
+            // we hand back to clamp on draw via erd_canvas_virt.
+            app.erd_canvas_vp.offset_x = 0;
+            app.erd_canvas_vp.offset_y = 0;
+            app.status = "ERD canvas: reset to top-left".to_owned();
+        }
+        // `f` (fit) — drop to Collapsed zoom + jump to (0, 0) so the
+        // user gets the maximum-overview view in one keystroke.
+        // Useful as a "see everything" escape hatch when a deep
+        // schema has scrolled off-screen.
+        KeyCode::Char('f')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.zoom = erd::Zoom::Collapsed;
+            app.erd_canvas_vp.offset_x = 0;
+            app.erd_canvas_vp.offset_y = 0;
+            app.status = "ERD canvas: fit to overview (Collapsed, top-left)".to_owned();
+        }
+        KeyCode::Char('v') if app.detail_tab == DetailTab::Erd => {
+            app.erd_view = match app.erd_view {
+                ErdView::Focused => ErdView::Canvas,
+                ErdView::Canvas => ErdView::Focused,
+            };
+            if app.erd_view == ErdView::Canvas {
+                if !app.erd_mouse_on && erd_mouse::enable().is_ok() {
+                    app.erd_mouse_on = true;
+                }
+                spawn_erd_prefetch(app);
+                app.status = "ERD canvas: hjkl pan · +/- zoom · drag pan · v focused".to_owned();
+            } else {
+                if app.erd_mouse_on {
+                    let _ = erd_mouse::disable();
+                    app.erd_mouse_on = false;
+                }
+                app.status = "ERD focused view".to_owned();
             }
         }
-        KeyCode::Char('k') | KeyCode::Up if app.detail_tab == DetailTab::Erd => {
-            app.erd_selected = app.erd_selected.saturating_sub(1);
+        // ERD focused-view navigation: move the highlight through the
+        // table list. Gated on Focused mode so the keys above can
+        // claim them in Canvas mode.
+        KeyCode::Char('j') | KeyCode::Down
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
+            let len = erd_table_list(app).len();
+            if len > 0 {
+                let new_sel = (app.erd_selected + 1).min(len - 1);
+                if new_sel != app.erd_selected {
+                    app.erd_selected = new_sel;
+                    app.erd_focus_scroll = 0;
+                }
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
+            let new_sel = app.erd_selected.saturating_sub(1);
+            if new_sel != app.erd_selected {
+                app.erd_selected = new_sel;
+                app.erd_focus_scroll = 0;
+            }
+        }
+        // Scroll the focused centre card column window. Capital
+        // letters so they don't clash with the lowercase neighbour
+        // navigation above. Only meaningful in Focused mode.
+        KeyCode::Char('J')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
+            app.erd_focus_scroll = app.erd_focus_scroll.saturating_add(1);
+        }
+        KeyCode::Char('K')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
+            app.erd_focus_scroll = app.erd_focus_scroll.saturating_sub(1);
         }
         KeyCode::Enter if app.detail_tab == DetailTab::Erd => {
             open_erd_selected_table(app).await;
@@ -3626,6 +3952,38 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
+    // ── Whole-schema canvas view ────────────────────────────────
+    if app.erd_view == ErdView::Canvas {
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(0)])
+            .split(area);
+        let banner = vec![Line::from(vec![
+            Span::styled(
+                format!("  ERD ▸ canvas  schema: {schema}  "),
+                Style::default()
+                    .fg(th.bg)
+                    .bg(th.accent2)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  {} table(s)  {} edge(s)  zoom={:?}  hjkl pan · +/- zoom · f fit · c reset · drag · v focused  ",
+                    tables.len(),
+                    app.relationships.len(),
+                    app.erd_canvas_vp.zoom,
+                ),
+                Style::default().fg(th.muted),
+            ),
+        ])];
+        f.render_widget(
+            Paragraph::new(banner).style(Style::default().bg(th.bg)),
+            layout[0],
+        );
+        draw_erd_schema_canvas(f, app, layout[1]);
+        return;
+    }
+
     // Vertical split. Fullscreen mode (`f`) gives the chart the
     // entire body so the user can actually read box labels; default
     // mode keeps the table list + per-table inspector below.
@@ -3656,7 +4014,7 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         ),
         Span::styled(
             format!(
-                "  {} table(s), {} edge(s)  j/k focus  Enter open  f fullscreen  y export .mmd  ",
+                "  {} table(s), {} edge(s)  j/k focus · Enter open · f fullscreen · v canvas · y .mmd  ",
                 tables.len(),
                 app.relationships.len(),
             ),
@@ -3682,6 +4040,56 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let selected = app.erd_selected.min(tables.len() - 1);
     draw_erd_table_list(f, app, &tables, selected, body[0]);
     draw_erd_inspector(f, app, &tables, selected, body[1]);
+}
+
+/// Paint the whole-schema canvas inside `area`. Frames it, clamps
+/// the viewport against the freshly computed virtual size, runs
+/// layout + render, and pushes the visible lines into the pane.
+fn draw_erd_schema_canvas(f: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let th = app.theme;
+    let block = Block::default()
+        .title(Span::styled(
+            "  Whole-schema canvas  (drag to pan · +/- zoom)  ",
+            Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .style(Style::default().bg(th.bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width < 16 || inner.height < 6 {
+        f.render_widget(muted_para("  pane too small for canvas", th), inner);
+        return;
+    }
+
+    let tables = erd_table_list(app);
+    let selected_name = tables.get(app.erd_selected).cloned();
+
+    // Clamp the viewport *before* rendering using the previous
+    // virtual size as a cheap proxy. Render output also updates the
+    // size so subsequent frames clamp tighter.
+    let (prev_w, prev_h) = app.erd_canvas_virt.get();
+    let mut vp = app.erd_canvas_vp;
+    vp.clamp(prev_w, prev_h, inner.width, inner.height);
+
+    let out = render_schema_canvas(ErdCanvasInput {
+        tables: &tables,
+        table_info: &app.erd_table_info,
+        edges: &app.relationships,
+        selected: selected_name.as_deref(),
+        viewport: &vp,
+        view_w: inner.width,
+        view_h: inner.height,
+        theme: th,
+    });
+    app.erd_canvas_virt.set((out.virtual_w, out.virtual_h));
+
+    f.render_widget(
+        Paragraph::new(out.lines).style(Style::default().bg(th.bg)),
+        inner,
+    );
 }
 
 /// Render a focused, pure-Rust schema graph centred on the selected
@@ -3750,463 +4158,13 @@ fn draw_erd_chart_pane(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         centre_info.as_ref(),
         &incoming,
         &outgoing,
+        app.erd_focus_scroll,
         th,
     );
     f.render_widget(
         Paragraph::new(canvas).style(Style::default().bg(th.bg)),
         inner,
     );
-}
-
-/// Single canvas cell. `bold` is the only modifier we need so far —
-/// we keep the type tiny so the grid stays cache-friendly.
-#[derive(Clone, Copy)]
-struct Cell2 {
-    ch: char,
-    fg: Color,
-    bold: bool,
-}
-
-impl Cell2 {
-    fn space(th: Theme) -> Self {
-        Self {
-            ch: ' ',
-            fg: th.fg,
-            bold: false,
-        }
-    }
-}
-
-/// Build the focused-graph canvas. Returns one styled `Line` per row.
-#[allow(clippy::too_many_arguments)]
-fn render_focus_canvas(
-    width: u16,
-    height: u16,
-    centre_name: &str,
-    centre_info: Option<&TableInfo>,
-    incoming: &[&RelationshipEdge],
-    outgoing: &[&RelationshipEdge],
-    th: Theme,
-) -> Vec<Line<'static>> {
-    let w = width as usize;
-    let h = height as usize;
-    let mut grid: Vec<Vec<Cell2>> = vec![vec![Cell2::space(th); w]; h];
-
-    // ── centre card ────────────────────────────────────────────────
-    // Build rows: header (table name) + horizontal rule + columns.
-    let mut centre_rows: Vec<(String, Color, bool)> = Vec::new();
-    centre_rows.push((centre_name.to_owned(), th.accent, true));
-    if let Some(info) = centre_info {
-        let pk_set: HashSet<&str> = info
-            .primary_key
-            .as_ref()
-            .map(|pk| pk.column_names.iter().map(String::as_str).collect())
-            .unwrap_or_default();
-        let fk_set: HashSet<&str> = info
-            .foreign_keys
-            .iter()
-            .flat_map(|fk| fk.column_names.iter().map(String::as_str))
-            .collect();
-        let name_w = info.columns.iter().map(|c| c.name.len()).max().unwrap_or(4);
-        for c in info.columns.iter().take(8) {
-            let (marker, color) = if pk_set.contains(c.name.as_str()) {
-                ('★', th.warning)
-            } else if fk_set.contains(c.name.as_str()) {
-                ('⚷', th.accent2)
-            } else {
-                (' ', th.fg)
-            };
-            let label = format!("{marker} {:<w$}  {}", c.name, c.data_type, w = name_w);
-            centre_rows.push((label, color, false));
-        }
-        if info.columns.len() > 8 {
-            centre_rows.push((
-                format!("… (+{} more)", info.columns.len() - 8),
-                th.muted,
-                false,
-            ));
-        }
-    } else {
-        centre_rows.push(("(loading…)".to_owned(), th.muted, false));
-    }
-
-    // Side card width scales with available width. We never go below
-    // 14 (room for ~10 chars of table name) since otherwise the box
-    // truncates short table names like `customers` mid-word.
-    let side_box_w: usize = if w < 80 {
-        14
-    } else if w < 110 {
-        16
-    } else {
-        18
-    };
-    let side_box_h: usize = 3;
-    let arrow_pad: usize = 4;
-
-    // Box width = max content + 2 padding. Cap so neighbours fit if at
-    // all possible — at narrow widths we'd rather truncate the centre
-    // card body than push neighbour cards off-screen.
-    let max_centre_w = centre_rows
-        .iter()
-        .map(|(s, _, _)| s.chars().count())
-        .max()
-        .unwrap_or(8);
-    // Reserve enough room for at least one side + arrow when w >= 50.
-    let reserved = if w >= 50 {
-        side_box_w + arrow_pad + 2
-    } else {
-        4
-    };
-    let centre_box_w = (max_centre_w + 4)
-        .min(w.saturating_sub(reserved))
-        .max(centre_name.chars().count() + 4);
-    let centre_box_h = (centre_rows.len() + 2).min(h);
-
-    // Decide how many neighbours we can show vertically with 1-row gap.
-    let stack_capacity = (h.saturating_sub(1) / (side_box_h + 1)).max(1);
-    let lefts: Vec<&&RelationshipEdge> = incoming.iter().take(stack_capacity).collect();
-    let rights: Vec<&&RelationshipEdge> = outgoing.iter().take(stack_capacity).collect();
-
-    // Lay out columns horizontally. If the pane is too narrow drop
-    // neighbours first; centre always renders.
-    let needed_w_both = side_box_w + arrow_pad + centre_box_w + arrow_pad + side_box_w;
-    let needed_w_one = side_box_w + arrow_pad + centre_box_w;
-    let (show_left, show_right) = if w >= needed_w_both {
-        (!lefts.is_empty(), !rights.is_empty())
-    } else if w >= needed_w_one {
-        // Only one side fits — prefer outgoing (what the table depends on).
-        if !rights.is_empty() {
-            (false, true)
-        } else {
-            (!lefts.is_empty(), false)
-        }
-    } else {
-        (false, false)
-    };
-
-    let centre_x = (w.saturating_sub(centre_box_w)) / 2;
-    let centre_y = (h.saturating_sub(centre_box_h)) / 2;
-    let left_x = 0usize;
-    let right_x = w.saturating_sub(side_box_w);
-
-    // Draw centre card.
-    draw_card(
-        &mut grid,
-        centre_x,
-        centre_y,
-        centre_box_w,
-        centre_box_h,
-        &centre_rows,
-        th.accent,
-        th.accent,
-        true,
-        th,
-    );
-
-    // Helper: distribute n boxes evenly across the available height.
-    let distribute = |n: usize| -> Vec<usize> {
-        if n == 0 {
-            return Vec::new();
-        }
-        let total_h = n * side_box_h + n.saturating_sub(1);
-        if total_h >= h {
-            (0..n).map(|i| i * (side_box_h + 1)).collect()
-        } else {
-            let start = (h - total_h) / 2;
-            (0..n).map(|i| start + i * (side_box_h + 1)).collect()
-        }
-    };
-
-    // Left side: incoming FKs ("X.fk_col → centre.pk").
-    if show_left {
-        let ys = distribute(lefts.len());
-        for (i, edge) in lefts.iter().enumerate() {
-            let y = ys[i];
-            let rows = vec![
-                (edge.from_table.clone(), th.accent, true),
-                (
-                    edge.from_columns
-                        .join(",")
-                        .chars()
-                        .take(side_box_w - 4)
-                        .collect::<String>(),
-                    th.accent2,
-                    false,
-                ),
-            ];
-            draw_card(
-                &mut grid, left_x, y, side_box_w, side_box_h, &rows, th.border, th.fg, false, th,
-            );
-            // Arrow from right edge of left box → left edge of centre,
-            // anchored to the vertical mid of the source box and the
-            // matching column row of the centre (or its header if we
-            // can't find one).
-            let src_y = y + side_box_h / 2;
-            let dst_y = centre_y + 1 + locate_centre_row(&centre_rows, &edge.to_columns);
-            let label = edge.from_columns.join(",");
-            draw_arrow(
-                &mut grid,
-                left_x + side_box_w - 1,
-                src_y,
-                centre_x,
-                dst_y,
-                &label,
-                th.accent2,
-                false, // ► points right
-                th,
-            );
-        }
-    }
-
-    // Right side: outgoing FKs ("centre.fk_col → Y.pk").
-    if show_right {
-        let ys = distribute(rights.len());
-        for (i, edge) in rights.iter().enumerate() {
-            let y = ys[i];
-            let rows = vec![
-                (edge.to_table.clone(), th.accent, true),
-                (
-                    edge.to_columns
-                        .join(",")
-                        .chars()
-                        .take(side_box_w - 4)
-                        .collect::<String>(),
-                    th.warning,
-                    false,
-                ),
-            ];
-            draw_card(
-                &mut grid, right_x, y, side_box_w, side_box_h, &rows, th.border, th.fg, false, th,
-            );
-            let src_y = centre_y + 1 + locate_centre_row(&centre_rows, &edge.from_columns);
-            let dst_y = y + side_box_h / 2;
-            let label = edge.from_columns.join(",");
-            draw_arrow(
-                &mut grid,
-                centre_x + centre_box_w - 1,
-                src_y,
-                right_x,
-                dst_y,
-                &label,
-                th.accent,
-                false,
-                th,
-            );
-        }
-    }
-
-    // ── footer hint ───────────────────────────────────────────────
-    let hint_y = h.saturating_sub(1);
-    let stats = format!(
-        "  ←{} incoming   {} outgoing→   {} neighbours hidden",
-        incoming.len(),
-        outgoing.len(),
-        incoming.len().saturating_sub(lefts.len()) + outgoing.len().saturating_sub(rights.len()),
-    );
-    put_text(&mut grid, 0, hint_y, &stats, th.muted, false);
-
-    // ── convert grid → ratatui Lines ──────────────────────────────
-    grid_to_lines(&grid, th)
-}
-
-/// Find the row offset in the centre card that matches the first
-/// referenced column name, so the connecting arrow lands on it. Falls
-/// back to the header row when no match is found.
-fn locate_centre_row(rows: &[(String, Color, bool)], cols: &[String]) -> usize {
-    if cols.is_empty() {
-        return 0;
-    }
-    let target = &cols[0];
-    for (i, (label, _, _)) in rows.iter().enumerate().skip(1) {
-        // Centre rows look like "★ name  type". Match on whitespace-
-        // delimited second token.
-        let mut parts = label.split_whitespace();
-        let _marker = parts.next();
-        if let Some(name) = parts.next() {
-            if name == target {
-                return i;
-            }
-        }
-    }
-    0
-}
-
-/// Draw a rounded card with a header row + body lines. `header_color`
-/// styles the title and (when `emphasise` is set) the border.
-#[allow(clippy::too_many_arguments)]
-fn draw_card(
-    grid: &mut [Vec<Cell2>],
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    rows: &[(String, Color, bool)],
-    border: Color,
-    _body_color: Color,
-    emphasise: bool,
-    th: Theme,
-) {
-    if w < 4 || h < 3 {
-        return;
-    }
-    let h_max = grid.len();
-    let w_max = grid.first().map(Vec::len).unwrap_or(0);
-    if y >= h_max || x >= w_max {
-        return;
-    }
-    let h = h.min(h_max - y);
-    let w = w.min(w_max - x);
-
-    let (tl, tr, bl, br, hch, vch) = if emphasise {
-        ('╭', '╮', '╰', '╯', '─', '│')
-    } else {
-        ('┌', '┐', '└', '┘', '─', '│')
-    };
-    // Top + bottom borders.
-    put(grid, x, y, tl, border, false);
-    put(grid, x + w - 1, y, tr, border, false);
-    put(grid, x, y + h - 1, bl, border, false);
-    put(grid, x + w - 1, y + h - 1, br, border, false);
-    for i in 1..w - 1 {
-        put(grid, x + i, y, hch, border, false);
-        put(grid, x + i, y + h - 1, hch, border, false);
-    }
-    for j in 1..h - 1 {
-        put(grid, x, y + j, vch, border, false);
-        put(grid, x + w - 1, y + j, vch, border, false);
-    }
-
-    // Inner rows.
-    for (i, (text, color, bold)) in rows.iter().enumerate() {
-        let row_y = y + 1 + i;
-        if row_y >= y + h - 1 {
-            break;
-        }
-        let inner_w = w - 2;
-        let truncated: String = text.chars().take(inner_w.saturating_sub(2)).collect();
-        put_text(grid, x + 2, row_y, &truncated, *color, *bold);
-        // Insert a horizontal rule under the header.
-        if i == 0 && rows.len() > 1 && row_y + 1 < y + h - 1 {
-            for k in 1..w - 1 {
-                put(grid, x + k, row_y + 1, '─', th.muted, false);
-            }
-        }
-    }
-}
-
-/// Draw a one-cell-thick orthogonal arrow from (x1,y1) to (x2,y2) with
-/// a centred label. Uses box-drawing chars so it composites cleanly
-/// over existing cells. `back_arrow` swaps the arrowhead direction.
-#[allow(clippy::too_many_arguments)]
-fn draw_arrow(
-    grid: &mut [Vec<Cell2>],
-    x1: usize,
-    y1: usize,
-    x2: usize,
-    y2: usize,
-    label: &str,
-    color: Color,
-    back_arrow: bool,
-    _th: Theme,
-) {
-    if x2 <= x1 || grid.is_empty() {
-        return;
-    }
-    let mid_x = x1 + (x2 - x1) / 2;
-    // First leg: horizontal from x1 to mid_x at y1.
-    for x in x1..=mid_x {
-        put(grid, x, y1, '─', color, false);
-    }
-    // Vertical: y1 -> y2 at mid_x.
-    if y1 != y2 {
-        let (lo, hi) = if y1 < y2 { (y1, y2) } else { (y2, y1) };
-        for y in lo..=hi {
-            // Don't overwrite the corners we'll set below.
-            if y != y1 && y != y2 {
-                put(grid, mid_x, y, '│', color, false);
-            }
-        }
-        // Corners.
-        let c1 = if y1 < y2 { '╮' } else { '╯' };
-        let c2 = if y1 < y2 { '╰' } else { '╭' };
-        put(grid, mid_x, y1, c1, color, false);
-        put(grid, mid_x, y2, c2, color, false);
-    }
-    // Second leg: horizontal from mid_x to x2 at y2.
-    for x in mid_x..=x2 {
-        put(grid, x, y2, '─', color, false);
-    }
-    // Arrowhead.
-    let head_x = if back_arrow { x1 } else { x2 };
-    let head_y = if back_arrow { y1 } else { y2 };
-    let head_ch = if back_arrow { '◀' } else { '▶' };
-    put(grid, head_x, head_y, head_ch, color, true);
-
-    // Label sits one row above the horizontal leg with the longest run.
-    if !label.is_empty() {
-        let label_chars: Vec<char> = label.chars().collect();
-        let lbl_y = if y1 == y2 {
-            y1.saturating_sub(1)
-        } else {
-            // Centre on the longer leg; pick the source leg.
-            y1.saturating_sub(1)
-        };
-        let lbl_x = x1 + 1;
-        for (i, ch) in label_chars.iter().enumerate() {
-            if lbl_x + i >= x2 {
-                break;
-            }
-            put(grid, lbl_x + i, lbl_y, *ch, color, false);
-        }
-    }
-}
-
-#[inline]
-fn put(grid: &mut [Vec<Cell2>], x: usize, y: usize, ch: char, fg: Color, bold: bool) {
-    if let Some(row) = grid.get_mut(y) {
-        if let Some(cell) = row.get_mut(x) {
-            *cell = Cell2 { ch, fg, bold };
-        }
-    }
-}
-
-fn put_text(grid: &mut [Vec<Cell2>], x: usize, y: usize, text: &str, fg: Color, bold: bool) {
-    for (i, ch) in text.chars().enumerate() {
-        put(grid, x + i, y, ch, fg, bold);
-    }
-}
-
-fn grid_to_lines(grid: &[Vec<Cell2>], th: Theme) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(grid.len());
-    for row in grid {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut buf = String::new();
-        let mut cur_fg = th.fg;
-        let mut cur_bold = false;
-        for cell in row {
-            if cell.fg != cur_fg || cell.bold != cur_bold {
-                if !buf.is_empty() {
-                    let mut style = Style::default().fg(cur_fg).bg(th.bg);
-                    if cur_bold {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    spans.push(Span::styled(std::mem::take(&mut buf), style));
-                }
-                cur_fg = cell.fg;
-                cur_bold = cell.bold;
-            }
-            buf.push(cell.ch);
-        }
-        if !buf.is_empty() {
-            let mut style = Style::default().fg(cur_fg).bg(th.bg);
-            if cur_bold {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            spans.push(Span::styled(buf, style));
-        }
-        out.push(Line::from(spans));
-    }
-    out
 }
 
 /// Alphabetical list of tables in the active schema. Sourced from the
@@ -4648,6 +4606,23 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         app.editor_scroll.set(scroll);
     }
 
+    // Active visual-mode selection, in global byte coordinates of
+    // `app.editor`. Normalised so `s <= e`. Used to repaint cells
+    // inside the range with the theme's selection background as we
+    // render each line below.
+    let selection: Option<(usize, usize)> =
+        if app.vim_mode == vim::VimMode::Visual && app.completion.is_none() {
+            app.vim_visual_anchor.map(|anchor| {
+                if anchor <= app.editor_cursor {
+                    (anchor, app.editor_cursor)
+                } else {
+                    (app.editor_cursor, anchor)
+                }
+            })
+        } else {
+            None
+        };
+
     let mut byte_offset = 0usize;
     let mut gutter_lines: Vec<Line> = Vec::new();
     let mut text_lines: Vec<Line> = Vec::new();
@@ -4690,7 +4665,13 @@ fn draw_editor(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         if spans.is_empty() {
             spans.push(Span::styled(" ", Style::default().bg(line_bg)));
         }
-        text_lines.push(Line::from(spans));
+        // Paint the visual selection on top of the syntax spans. The
+        // selection range may cover only part of this line; we slice
+        // the affected spans into (pre, selected, post) sub-spans and
+        // apply `th.sel_bg` to the middle.
+        let owned_spans: Vec<Span<'static>> =
+            apply_selection_to_spans(spans, line_start, selection, th.sel_bg);
+        text_lines.push(Line::from(owned_spans));
     }
 
     f.render_widget(
@@ -4759,6 +4740,76 @@ fn draw_status(f: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Overlay the visual-mode selection background on a line's already-
+/// classified spans. Splits any span that straddles the selection
+/// boundary into up to three sub-spans (`pre`, `selected`, `post`)
+/// so the highlight is byte-accurate within the line.
+///
+/// Returns owned `Span<'static>` because splitting forces an
+/// allocation per affected span; the unaffected ones are reformed
+/// into owned strings too so the result has a uniform lifetime
+/// (the editor's line collection requires that).
+fn apply_selection_to_spans(
+    spans: Vec<Span<'_>>,
+    line_start_byte: usize,
+    sel: Option<(usize, usize)>,
+    sel_bg: Color,
+) -> Vec<Span<'static>> {
+    let to_owned = |s: Span<'_>| Span::styled(s.content.into_owned(), s.style);
+    let Some((sel_s, sel_e)) = sel else {
+        return spans.into_iter().map(to_owned).collect();
+    };
+    let line_byte_len: usize = spans.iter().map(|s| s.content.as_ref().len()).sum();
+    let line_end_byte = line_start_byte + line_byte_len;
+    if sel_e <= line_start_byte || sel_s >= line_end_byte {
+        return spans.into_iter().map(to_owned).collect();
+    }
+    let local_s = sel_s.saturating_sub(line_start_byte);
+    let local_e = sel_e.saturating_sub(line_start_byte).min(line_byte_len);
+
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len() + 2);
+    let mut cursor = 0usize;
+    for span in spans {
+        let txt: &str = span.content.as_ref();
+        let len = txt.len();
+        let span_start = cursor;
+        let span_end = cursor + len;
+        cursor = span_end;
+        if span_end <= local_s || span_start >= local_e {
+            out.push(Span::styled(txt.to_owned(), span.style));
+            continue;
+        }
+        let split_a = local_s.saturating_sub(span_start);
+        let split_b = local_e.saturating_sub(span_start).min(len);
+        // Snap to UTF-8 boundaries — the classifier should never
+        // hand us mid-codepoint offsets, but cheap insurance.
+        let split_a = nearest_boundary_le(txt, split_a);
+        let split_b = nearest_boundary_le(txt, split_b);
+        if split_a > 0 {
+            out.push(Span::styled(txt[..split_a].to_owned(), span.style));
+        }
+        if split_b > split_a {
+            let mut sel_style = span.style;
+            sel_style.bg = Some(sel_bg);
+            out.push(Span::styled(txt[split_a..split_b].to_owned(), sel_style));
+        }
+        if split_b < len {
+            out.push(Span::styled(txt[split_b..].to_owned(), span.style));
+        }
+    }
+    out
+}
+
+fn nearest_boundary_le(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
 
 /// Render the autocomplete popup attached just below the cursor.
 /// Capped at 8 visible rows; the selected row is highlighted with
@@ -4862,6 +4913,10 @@ fn restore_terminal(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     disable_raw_mode()?;
+    // Defence in depth: if the user quit while the ERD canvas had
+    // mouse capture enabled, disabling it here keeps the parent
+    // shell from seeing escape-sequence noise.
+    let _ = erd_mouse::disable();
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
@@ -4874,11 +4929,14 @@ fn restore_terminal(
 #[cfg(test)]
 mod tests {
     use super::{
-        close_current_table, handle_paste, line_col, line_end, line_start, move_cursor_vertical,
+        apply_selection_to_spans, close_current_table, handle_paste, line_col, line_end,
+        line_start, move_cursor_vertical, move_word_backward, move_word_forward,
         next_char_boundary, prev_char_boundary, rebuild_sidebar, short_hash, truncate_for_status,
         unique_connection_name, yank_to_clipboard, AppMode, AppState, ConnectionConfig, DetailTab,
         DriverKind, SidebarEntry, StatementOutput, Theme, ALL_TABS,
     };
+    use ratatui::style::{Color, Style};
+    use ratatui::text::Span;
 
     #[test]
     fn catppuccin_mocha_name() {
@@ -5138,6 +5196,7 @@ mod tests {
             Some(&orders),
             &incoming,
             &outgoing,
+            0,
             Theme::catppuccin_mocha(),
         );
         let dump: String = lines
@@ -5208,6 +5267,7 @@ mod tests {
             Some(&orders),
             &incoming,
             &outgoing,
+            0,
             Theme::catppuccin_mocha(),
         );
         let dump: String = lines
@@ -5396,5 +5456,100 @@ mod tests {
         }
         assert_eq!(t.name, "catppuccin-mocha", "cycle returns to start");
         assert_eq!(seen.len(), Theme::all().len(), "every theme visited once");
+    }
+
+    fn span(s: &str) -> Span<'static> {
+        Span::styled(s.to_owned(), Style::default().fg(Color::White))
+    }
+
+    fn collect(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn selection_overlay_passes_through_when_no_selection() {
+        let in_spans = vec![span("hello "), span("world")];
+        let out = apply_selection_to_spans(in_spans, 0, None, Color::Red);
+        assert_eq!(out.len(), 2);
+        assert_eq!(collect(&out), "hello world");
+        assert!(out.iter().all(|s| s.style.bg.is_none()));
+    }
+
+    #[test]
+    fn selection_overlay_skips_lines_outside_selection() {
+        // Line starts at byte 100; selection covers 0..10. No overlap.
+        let in_spans = vec![span("aaa"), span("bbb")];
+        let out = apply_selection_to_spans(in_spans, 100, Some((0, 10)), Color::Red);
+        assert!(out.iter().all(|s| s.style.bg.is_none()));
+        assert_eq!(collect(&out), "aaabbb");
+    }
+
+    #[test]
+    fn selection_overlay_paints_only_overlapping_bytes_within_a_single_span() {
+        // Single span "abcdef", line starts at byte 0, selection covers
+        // global bytes 2..5 ("cde"). Expect three sub-spans: "ab", "cde"
+        // (with sel bg), "f".
+        let in_spans = vec![span("abcdef")];
+        let out = apply_selection_to_spans(in_spans, 0, Some((2, 5)), Color::Blue);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].content.as_ref(), "ab");
+        assert_eq!(out[0].style.bg, None);
+        assert_eq!(out[1].content.as_ref(), "cde");
+        assert_eq!(out[1].style.bg, Some(Color::Blue));
+        assert_eq!(out[2].content.as_ref(), "f");
+        assert_eq!(out[2].style.bg, None);
+    }
+
+    #[test]
+    fn selection_overlay_spans_multiple_input_spans() {
+        // Two input spans "hello"(0..5) + " world"(5..11). Selection
+        // covers 3..8 → ends of first + starts of second.
+        let in_spans = vec![span("hello"), span(" world")];
+        let out = apply_selection_to_spans(in_spans, 0, Some((3, 8)), Color::Yellow);
+        let total: String = collect(&out);
+        assert_eq!(total, "hello world", "no chars lost");
+        let selected: String = out
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Yellow))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(selected, "lo wo");
+    }
+
+    #[test]
+    fn selection_overlay_handles_selection_starting_inside_line_extending_past_end() {
+        // Line "abcdef" at bytes 0..6, selection 4..100 (well past end).
+        let in_spans = vec![span("abcdef")];
+        let out = apply_selection_to_spans(in_spans, 0, Some((4, 100)), Color::Magenta);
+        let selected: String = out
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Magenta))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(selected, "ef");
+    }
+
+    #[test]
+    fn move_word_forward_advances_through_word_then_gap() {
+        let s = "select foo from bar";
+        // From the start of "select" (idx 0) → start of "foo" (idx 7).
+        assert_eq!(move_word_forward(s, 0), 7);
+        // From the start of "foo" (idx 7) → start of "from" (idx 11).
+        assert_eq!(move_word_forward(s, 7), 11);
+        // From middle of "from" (idx 12) → start of "bar" (idx 16).
+        assert_eq!(move_word_forward(s, 12), 16);
+        // At end → stays at end.
+        assert_eq!(move_word_forward(s, s.len()), s.len());
+    }
+
+    #[test]
+    fn move_word_backward_lands_on_word_start() {
+        let s = "select foo from bar";
+        // From end-of-buffer → "bar" start.
+        assert_eq!(move_word_backward(s, s.len()), 16);
+        // From "bar" start → "from" start.
+        assert_eq!(move_word_backward(s, 16), 11);
+        // From idx 0 → 0.
+        assert_eq!(move_word_backward(s, 0), 0);
     }
 }
