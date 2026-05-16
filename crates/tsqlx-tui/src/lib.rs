@@ -6,11 +6,15 @@ use std::time::Duration;
 mod editor;
 mod erd;
 use editor::{append_history, highlight_line, history_path, load_history, statement_range_at};
-use erd::render_focus_canvas;
+use erd::{
+    canvas::CanvasInput as ErdCanvasInput, mouse as erd_mouse, render_focus_canvas,
+    render_schema_canvas, Viewport as ErdViewport,
+};
 
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -388,6 +392,21 @@ struct AppState {
     /// banner stays, but the table list + per-table inspector hide.
     /// Toggled with `f` while on the ERD tab.
     erd_chart_fullscreen: bool,
+    /// ERD sub-mode: focused-card view vs whole-schema canvas.
+    /// Toggled with `v`.
+    erd_view: ErdView,
+    /// Viewport over the whole-schema canvas (offset + zoom). Only
+    /// meaningful when `erd_view == Canvas`.
+    erd_canvas_vp: ErdViewport,
+    /// Last computed virtual canvas size, written by the immutable
+    /// draw path so the next event-handler tick clamps against an
+    /// up-to-date virtual bound. `Cell` because `draw_*` only takes
+    /// `&AppState`.
+    erd_canvas_virt: std::cell::Cell<(u16, u16)>,
+    /// True while the canvas has terminal mouse capture enabled.
+    /// We toggle on entering `Canvas`, off on leaving — so the rest
+    /// of the TUI keeps native terminal selection.
+    erd_mouse_on: bool,
     editor: String,
     /// Byte index of the cursor within `editor`. Always sits on a UTF-8
     /// char boundary.
@@ -444,6 +463,16 @@ enum FilterTarget {
     Records,
 }
 
+/// Sub-mode of the ERD tab. `Focused` keeps the legacy centre-card +
+/// neighbour-cards layout; `Canvas` swaps to the whole-schema layered
+/// canvas with pan / zoom / drag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ErdView {
+    #[default]
+    Focused,
+    Canvas,
+}
+
 impl AppState {
     fn new(driver: DriverKind, url: String) -> Self {
         let mut ls = ListState::default();
@@ -481,6 +510,10 @@ impl AppState {
             erd_selected: 0,
             erd_table_info: HashMap::new(),
             erd_chart_fullscreen: false,
+            erd_view: ErdView::default(),
+            erd_canvas_vp: ErdViewport::new(),
+            erd_canvas_virt: std::cell::Cell::new((0, 0)),
+            erd_mouse_on: false,
             editor: String::new(),
             editor_cursor: 0,
             editor_scroll: std::cell::Cell::new(0),
@@ -694,6 +727,7 @@ async fn run_loop(
         match event::read()? {
             Event::Key(key) if handle_key(app, key).await? => break,
             Event::Paste(text) => handle_paste(app, &text),
+            Event::Mouse(mev) => handle_mouse(app, mev),
             _ => {}
         }
     }
@@ -734,6 +768,34 @@ fn handle_paste(app: &mut AppState, text: &str) {
                 sync_filter(app, t);
             }
         }
+    }
+}
+
+/// Mouse-event router. Only the ERD canvas view consumes mouse
+/// events today; everywhere else we ignore them so terminal-native
+/// text selection stays unaffected (we never call `EnableMouseCapture`
+/// outside of canvas mode anyway, but defence in depth is cheap).
+fn handle_mouse(app: &mut AppState, mev: MouseEvent) {
+    if app.detail_tab != DetailTab::Erd || app.erd_view != ErdView::Canvas {
+        return;
+    }
+    match mev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.erd_canvas_vp.drag_begin(mev.column, mev.row);
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            app.erd_canvas_vp.drag_update(mev.column, mev.row);
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.erd_canvas_vp.drag_end();
+        }
+        MouseEventKind::ScrollUp => {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_in();
+        }
+        MouseEventKind::ScrollDown => {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_out();
+        }
+        _ => {}
     }
 }
 
@@ -1844,8 +1906,11 @@ async fn sidebar_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
 }
 
 async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
+    let in_erd_canvas = app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas;
     match key.code {
-        KeyCode::Char('l') | KeyCode::Right => {
+        // Tab navigation. Suppressed inside the ERD canvas so hjkl
+        // can pan the viewport instead of switching tabs.
+        KeyCode::Char('l') | KeyCode::Right if !in_erd_canvas => {
             app.detail_tab = app.detail_tab.next();
             if app.detail_tab == DetailTab::Erd
                 && app.relationships.is_empty()
@@ -1859,7 +1924,7 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 spawn_erd_prefetch(app);
             }
         }
-        KeyCode::Char('h') | KeyCode::Left => {
+        KeyCode::Char('h') | KeyCode::Left if !in_erd_canvas => {
             app.detail_tab = app.detail_tab.prev();
         }
         KeyCode::Char('j') | KeyCode::Down if app.detail_tab == DetailTab::Records => {
@@ -1888,14 +1953,98 @@ async fn detail_key(app: &mut AppState, key: KeyEvent) -> Result<bool> {
                 load_records_page(app, &s, &t);
             }
         }
-        // ERD navigation: move the highlight through the table list.
-        KeyCode::Char('j') | KeyCode::Down if app.detail_tab == DetailTab::Erd => {
+        // ── Whole-schema canvas pan / zoom (Canvas sub-mode) ────
+        // These match BEFORE the focused-view j/k handlers so canvas
+        // mode steals them. View toggle `v` is below.
+        KeyCode::Char('h') | KeyCode::Left
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(-3, 0);
+        }
+        KeyCode::Char('l') | KeyCode::Right
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(3, 0);
+        }
+        KeyCode::Char('j') | KeyCode::Down
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(0, 2);
+        }
+        KeyCode::Char('k') | KeyCode::Up
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(0, -2);
+        }
+        KeyCode::Char('H')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(-30, 0);
+        }
+        KeyCode::Char('L')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.pan(30, 0);
+        }
+        KeyCode::Char('+') | KeyCode::Char('=')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_in();
+            app.status = format!("ERD canvas zoom: {:?}", app.erd_canvas_vp.zoom);
+        }
+        KeyCode::Char('-') | KeyCode::Char('_')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            app.erd_canvas_vp.zoom = app.erd_canvas_vp.zoom.zoom_out();
+            app.status = format!("ERD canvas zoom: {:?}", app.erd_canvas_vp.zoom);
+        }
+        KeyCode::Char('c')
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Canvas =>
+        {
+            // Recentre on the selected card. Layout is recomputed
+            // every draw, so just reset the offset to 0 — the next
+            // render will clamp against the fresh virtual size and
+            // we hand back to clamp on draw via erd_canvas_virt.
+            // For a true centre-on, we'd need the placement here,
+            // which is only known mid-render. Cheap good-enough: jump
+            // to top-left and let `g` (future) do precise centring.
+            app.erd_canvas_vp.offset_x = 0;
+            app.erd_canvas_vp.offset_y = 0;
+            app.status = "ERD canvas: reset to top-left".to_owned();
+        }
+        KeyCode::Char('v') if app.detail_tab == DetailTab::Erd => {
+            app.erd_view = match app.erd_view {
+                ErdView::Focused => ErdView::Canvas,
+                ErdView::Canvas => ErdView::Focused,
+            };
+            if app.erd_view == ErdView::Canvas {
+                if !app.erd_mouse_on && erd_mouse::enable().is_ok() {
+                    app.erd_mouse_on = true;
+                }
+                spawn_erd_prefetch(app);
+                app.status = "ERD canvas: hjkl pan · +/- zoom · drag pan · v focused".to_owned();
+            } else {
+                if app.erd_mouse_on {
+                    let _ = erd_mouse::disable();
+                    app.erd_mouse_on = false;
+                }
+                app.status = "ERD focused view".to_owned();
+            }
+        }
+        // ERD focused-view navigation: move the highlight through the
+        // table list. Gated on Focused mode so the keys above can
+        // claim them in Canvas mode.
+        KeyCode::Char('j') | KeyCode::Down
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
             let len = erd_table_list(app).len();
             if len > 0 {
                 app.erd_selected = (app.erd_selected + 1).min(len - 1);
             }
         }
-        KeyCode::Char('k') | KeyCode::Up if app.detail_tab == DetailTab::Erd => {
+        KeyCode::Char('k') | KeyCode::Up
+            if app.detail_tab == DetailTab::Erd && app.erd_view == ErdView::Focused =>
+        {
             app.erd_selected = app.erd_selected.saturating_sub(1);
         }
         KeyCode::Enter if app.detail_tab == DetailTab::Erd => {
@@ -3077,6 +3226,38 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         return;
     }
 
+    // ── Whole-schema canvas view ────────────────────────────────
+    if app.erd_view == ErdView::Canvas {
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(0)])
+            .split(area);
+        let banner = vec![Line::from(vec![
+            Span::styled(
+                format!("  ERD ▸ canvas  schema: {schema}  "),
+                Style::default()
+                    .fg(th.bg)
+                    .bg(th.accent2)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  {} table(s)  {} edge(s)  zoom={:?}  hjkl pan · +/- zoom · drag · v focused  ",
+                    tables.len(),
+                    app.relationships.len(),
+                    app.erd_canvas_vp.zoom,
+                ),
+                Style::default().fg(th.muted),
+            ),
+        ])];
+        f.render_widget(
+            Paragraph::new(banner).style(Style::default().bg(th.bg)),
+            layout[0],
+        );
+        draw_erd_schema_canvas(f, app, layout[1]);
+        return;
+    }
+
     // Vertical split. Fullscreen mode (`f`) gives the chart the
     // entire body so the user can actually read box labels; default
     // mode keeps the table list + per-table inspector below.
@@ -3107,7 +3288,7 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
         ),
         Span::styled(
             format!(
-                "  {} table(s), {} edge(s)  j/k focus  Enter open  f fullscreen  y export .mmd  ",
+                "  {} table(s), {} edge(s)  j/k focus · Enter open · f fullscreen · v canvas · y .mmd  ",
                 tables.len(),
                 app.relationships.len(),
             ),
@@ -3133,6 +3314,56 @@ fn draw_erd(f: &mut Frame<'_>, app: &AppState, area: Rect) {
     let selected = app.erd_selected.min(tables.len() - 1);
     draw_erd_table_list(f, app, &tables, selected, body[0]);
     draw_erd_inspector(f, app, &tables, selected, body[1]);
+}
+
+/// Paint the whole-schema canvas inside `area`. Frames it, clamps
+/// the viewport against the freshly computed virtual size, runs
+/// layout + render, and pushes the visible lines into the pane.
+fn draw_erd_schema_canvas(f: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let th = app.theme;
+    let block = Block::default()
+        .title(Span::styled(
+            "  Whole-schema canvas  (drag to pan · +/- zoom)  ",
+            Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .style(Style::default().bg(th.bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width < 16 || inner.height < 6 {
+        f.render_widget(muted_para("  pane too small for canvas", th), inner);
+        return;
+    }
+
+    let tables = erd_table_list(app);
+    let selected_name = tables.get(app.erd_selected).cloned();
+
+    // Clamp the viewport *before* rendering using the previous
+    // virtual size as a cheap proxy. Render output also updates the
+    // size so subsequent frames clamp tighter.
+    let (prev_w, prev_h) = app.erd_canvas_virt.get();
+    let mut vp = app.erd_canvas_vp;
+    vp.clamp(prev_w, prev_h, inner.width, inner.height);
+
+    let out = render_schema_canvas(ErdCanvasInput {
+        tables: &tables,
+        table_info: &app.erd_table_info,
+        edges: &app.relationships,
+        selected: selected_name.as_deref(),
+        viewport: &vp,
+        view_w: inner.width,
+        view_h: inner.height,
+        theme: th,
+    });
+    app.erd_canvas_virt.set((out.virtual_w, out.virtual_h));
+
+    f.render_widget(
+        Paragraph::new(out.lines).style(Style::default().bg(th.bg)),
+        inner,
+    );
 }
 
 /// Render a focused, pure-Rust schema graph centred on the selected
@@ -3773,6 +4004,10 @@ fn restore_terminal(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     disable_raw_mode()?;
+    // Defence in depth: if the user quit while the ERD canvas had
+    // mouse capture enabled, disabling it here keeps the parent
+    // shell from seeing escape-sequence noise.
+    let _ = erd_mouse::disable();
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
